@@ -12,6 +12,20 @@
 
 ## 安装（给人看的三个入口）
 
+已发布版本：[v0.4.0](https://github.com/MYiYang/dsh-memory/releases/tag/v0.4.0)
+
+```powershell
+# A. CLI：直装 Release 里的 tarball（再把 dsh-memory 加进 profile 的 dsh.profile.bundles 后重启）
+dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.4.0/dsh-memory-0.4.0.tgz
+
+# B. GUI：侧栏「插件」→「添加插件」→ 粘上面这条 URL（自动选入 bundles，不用手改 JSON）
+
+# C. 离线：下 [dsh-memory-0.4.0.zip](https://github.com/MYiYang/dsh-memory/releases/download/v0.4.0/dsh-memory-0.4.0.zip)
+#    → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
+pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz
+pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz -Apply
+```
+
 | 场景 | 一句话 |
 | --- | --- |
 | GUI | 侧栏「插件」→「添加插件」→ 输包名 / tarball URL / 本地路径 → 重启 |
