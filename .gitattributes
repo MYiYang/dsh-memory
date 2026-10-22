@@ -1,0 +1,10 @@
+# 跨平台一致性：源码/文档用 LF，PowerShell 脚本用 CRLF（Windows 上双击/直接跑都正常）
+* text=auto
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.gitignore text eol=lf
+*.ps1     text eol=crlf

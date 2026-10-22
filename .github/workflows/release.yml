@@ -1,0 +1,83 @@
+name: release
+
+# 推 tag（v0.4.0 这种）就发一版：同步校验 → 全部测试 → 构建 → 校验和比对 → 挂 Release 附件。
+# 手工重跑：Actions 页面 → release → Re-run all jobs（会用同一个 tag 覆盖附件）。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # 只在 Windows 上构建：install.ps1 与离线 zip（bsdtar / junction）只在这里实测过。
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Node / npm versions
+        shell: pwsh
+        run: |
+          node -v
+          npm -v
+
+      - name: Skills mirror is in sync
+        shell: pwsh
+        run: node scripts/sync-skills.mjs --check
+
+      - name: Plugin tests
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem dsh-memory/test -Filter *.test.js | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            node $_.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $_.Name }
+          }
+          if ($failed.Count -gt 0) { throw "test files failed: $($failed -join ', ')" }
+
+      - name: Build release artifacts
+        shell: pwsh
+        run: node scripts/build-release.mjs
+
+      - name: Verify checksums
+        shell: pwsh
+        run: |
+          $bad = @()
+          foreach ($line in Get-Content dist/SHA256SUMS.txt) {
+            if ($line -notmatch '^([0-9a-f]{64})\s+(.+)$') { continue }
+            $expected = $Matches[1]
+            $file = $Matches[2].Trim()
+            $actual = (Get-FileHash (Join-Path dist $file) -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) { $bad += $file } else { Write-Host "ok  $file" }
+          }
+          if ($bad.Count -gt 0) { throw "checksum mismatch: $($bad -join ', ')" }
+
+      - name: Show what will be attached
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+          Get-Content dist/manifest.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dsh-memory-*.tgz
+            dist/dsh-memory-*.zip
+            dist/SHA256SUMS.txt
+            dist/manifest.json
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,565 @@
+# dsh-memory v2 设计：L0 → L3 分层记忆
+
+> 目标：把现在「episode + 人工 fact + FTS 召回」的轻量记忆，升级成腾讯 TencentDB-Agent-Memory 那套
+> **L0 原文 → L1 原子事实 → L2 场景 → L3 画像** 的分层管线，同时保留 dsh 插件的约束：
+> 零外部依赖、失败不拖垮会话、成本可控、数据留在本地。
+>
+> 参考：`TencentDB-Agent-Memory-分析报告.md` 第 3–4 章、`notes/A-core.md` 第 2–4 节。
+> 本文是实施前的设计决策记录；代码落地后以 README 为准。
+
+---
+
+## 1. 范围
+
+### 做
+
+- **L0**：原始轮次落库（用户/助手全文 + 工具名 + 游标），不可变追加。
+- **L1**：按阈值批量调用 LLM，抽取「原子事实」；与既有事实做冲突消解（store / update / merge / skip）；带 priority、version、superseded 审计。
+- **L2**：按场景归并 L1 事实成 Markdown 场景块（summary + heat），提供「场景导航」注入。
+- **L3**：项目/全局画像（persona）重写，由 JEV-lite 判决门控。
+- **召回**：稳定段（persona + 场景导航）+ 动态段（本轮命中的 L1 事实）两段注入。
+- **工具**：`memory_search` 支持层过滤；新增 `memory_extract`（手动触发）与 `memory_scene`（读场景正文）。
+
+### 不做（v2 明确排除）
+
+- **语义 embedding**：dsh 没有 embedding 服务，v2 先用本地 **384 维词法向量（feature hashing）** 做混合召回；
+  真正的语义向量留给后续（见 §18/§19）。
+- 多租户团队共享（Team/Agent ACL）：单机单用户。
+- 腾讯的 Offload（上下文压缩）、Skill、Wiki、CodeGraph：不在本插件范围。
+- 原文级 L0 全量消息（含 tool 输出）：只存 user/assistant 文本 + 工具名，避免 tool 输出撑爆库。
+
+---
+
+## 2. 现状与差距
+
+| 层 | 现状（v1） | 差距 |
+| --- | --- | --- |
+| L0 | 只把一轮压缩成 2.4k 字 episode | 无原文、无游标、无法重放抽取 |
+| L1 | 只有 `memory_save` 人工 fact | 无 LLM 抽取、无冲突消解、无 priority/version |
+| L2 | 无 | 无场景、无热度、无导航 |
+| L3 | 无 | 无画像/信条 |
+| 调度 | 每轮都落一条 episode | 无 warm-up、无 idle、无串行队列 |
+| 注入 | 动态段（命中事实） | 无稳定段（persona/scene nav） |
+
+v1 已有的资产保留：SQLite + FTS5 trigram、打分函数、`<memory_context>` 注入约定、
+`source.kind='plugin:dsh-memory'`、28 个单测、bundle 安装方式。
+
+---
+
+## 3. 总体架构
+
+```text
+session/event
+  ├─ turn/start…turn/end → L0: appendTurn(不裁剪) + cursor 计数
+  └─ scheduler.notifyTurn(session)
+        ├─ warm-up 阈值：1 → 2 → 4 → 8 → everyN(默认 5)
+        ├─ idle 兜底：60s
+        └─ 入队 L1 job（全局串行，异步，不阻塞会话）
+              ├─ 取 pending L0 turns
+              ├─ 一次 llm.stream：场景切分 + 事实抽取（JSON）
+              ├─ 解析容错 → 候选召回(FTS) → 二次 LLM 冲突消解
+              ├─ 落 L1：store/update/merge/skip + version + history
+              ├─ L2：新事实按 scene 聚合 → LLM 归并场景块 + heat
+              └─ L3：JEV-lite 判决 → 触发时重写 persona.md
+
+agent/pre-step（每轮首 step）
+  ├─ 稳定段（每会话一次）：persona（global+project）+ 场景导航
+  └─ 动态段（每轮）：L1 事实召回（priority/heat/recency 加权）
+  两段合并成一条 source.kind='plugin:dsh-memory' 的消息注入
+```
+
+关键原则（沿用腾讯的设计判断）：
+
+1. **L0 先落盘，再提炼**：任何上层失败都不丢原文。
+2. **不是每轮都调 LLM**：阈值 + idle 把成本摊薄；失败不重试到死。
+3. **单串行队列**：同一时刻最多一个抽取任务，避免并发写库与 token 飙升。
+4. **记忆是上下文不是指令**：注入块继续标注「可能过时、不要复述」。
+5. **可解释**：每条 L1 有 kind/priority/version/source，`memory_stats` 能看 token 花费。
+
+---
+
+## 4. 数据模型（SQLite，schema v3）
+
+### 4.1 L0
+
+```sql
+CREATE TABLE l0_turns (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id       TEXT NOT NULL,
+  turn             INTEGER NOT NULL,
+  project          TEXT,
+  user_text        TEXT NOT NULL DEFAULT '',
+  assistant_text   TEXT NOT NULL DEFAULT '',
+  tool_names       TEXT NOT NULL DEFAULT '[]',   -- JSON array
+  seq_from         INTEGER,                      -- 会话日志 seq 范围（可追溯）
+  seq_to           INTEGER,
+  created_at       INTEGER NOT NULL,
+  extracted_at     INTEGER,                      -- NULL = 待抽取
+  extract_attempts INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(session_id, turn)
+);
+CREATE INDEX l0_pending_idx ON l0_turns(extracted_at, id);
+
+CREATE TABLE l0_cursor (
+  session_id                  TEXT PRIMARY KEY,
+  last_turn                   INTEGER NOT NULL DEFAULT 0,
+  conversations_since_extract INTEGER NOT NULL DEFAULT 0,
+  threshold                   INTEGER NOT NULL DEFAULT 1,  -- 1,2,4,8,…,everyN
+  pending_since               INTEGER,                     -- idle 计时起点
+  updated_at                  INTEGER NOT NULL
+);
+```
+
+- 保留策略：`l0KeepTurns`（默认 5000/会话）+ 90 天，超出按 id 从旧删。
+- 去重：`UNIQUE(session_id, turn)`，重启/重放幂等。
+
+### 4.2 L1（复用 `memory` 表，加列）
+
+```sql
+ALTER TABLE memory ADD COLUMN priority      INTEGER NOT NULL DEFAULT 50;
+ALTER TABLE memory ADD COLUMN version       INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE memory ADD COLUMN superseded_by INTEGER;      -- 被哪条取代（NULL=有效）
+ALTER TABLE memory ADD COLUMN scene         TEXT;         -- 场景名（L2 聚合键）
+ALTER TABLE memory ADD COLUMN source_seqs   TEXT;         -- JSON: [l0_turn_id,…] 溯源
+-- v3：本地 384 维词法向量（见 §19）
+ALTER TABLE memory ADD COLUMN vec           BLOB;         -- Float32Array(384)，L2 归一化
+ALTER TABLE memory ADD COLUMN vec_model     TEXT;         -- 'hash-ngram-v1-384'
+
+CREATE TABLE memory_history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id  INTEGER NOT NULL,
+  version    INTEGER NOT NULL,
+  op         TEXT NOT NULL,          -- store|update|merge|skip
+  text       TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+```
+
+kind 集合扩展（保留 v1 的 fact/note/episode 兼容）：
+
+| kind | 含义 | 默认 kind 权重 |
+| --- | --- | --- |
+| `persona` | 用户/团队长期偏好 | 1.0 |
+| `instruction` | 明确要求模型遵守的规则 | 1.0 |
+| `work_fact` | 项目事实（技术栈、路径、约定） | 0.9 |
+| `work_method` | 跑通过的方法/流程 | 0.8 |
+| `work_task` | 进行中的任务状态 | 0.6 |
+| `work_artifact` | 产物位置（文件/表/服务） | 0.7 |
+| `episodic` | 一次性事件 | 0.4 |
+| `fact`/`note`/`episode` | v1 兼容 | 0.9 / 0.8 / 0.5 |
+
+### 4.3 L2 / L3
+
+```sql
+CREATE TABLE l2_scenes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope      TEXT NOT NULL DEFAULT 'project',   -- project|global
+  project    TEXT,
+  name       TEXT NOT NULL,
+  summary    TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL DEFAULT '',          -- Markdown
+  heat       REAL NOT NULL DEFAULT 1,
+  fact_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(scope, project, name)
+);
+
+CREATE TABLE l3_persona (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope      TEXT NOT NULL,          -- project|global
+  project    TEXT,
+  body       TEXT NOT NULL,
+  version    INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(scope, project)
+);
+```
+
+- 单一真相在 SQLite；**不**另写 md 文件再回读（腾讯 rowfs 的教训：两份真相必然漂移）。
+  需要人读时用 `memory_scene` / `memory_stats` 导出即可（后续可加 `-Export` 脚本，只导出不读回）。
+
+### 4.4 迁移
+
+- `SCHEMA_VERSION = 2`；`migrate()` 先建 v1 表，再 `ensureColumn()` 逐列补（幂等），最后写版本。
+- v1 → v2 不删任何数据；旧 fact/episode 继续可召回（`superseded_by IS NULL`）。
+
+---
+
+## 5. 调度器（warm-up + idle + 串行）
+
+> 状态：`l0_cursor.conversations_since_extract` / `threshold` / `pending_since`。
+
+```
+turn/end:
+  cursor.conversations_since_extract += 1
+  cursor.pending_since ??= now
+  if conversations_since_extract >= threshold:
+      enqueueExtraction(session)
+  else:
+      armIdleTimer(session, idleMs=60s)
+
+enqueueExtraction:
+  timer 取消; conversations_since_extract = 0
+  threshold = min(threshold * 2, everyN)          # 1→2→4→8→5
+  queue.push(job)                                  # 串行
+
+idle 到期: enqueueExtraction(session)（有待抽取时）
+手动: memory_extract 工具直接 enqueue
+```
+
+- 抽取成功后 `sinceExtract` 归零、`pending_since` 清空；`threshold` 保持在 warm-up 阶梯上继续翻倍（1→2→4→8→everyN），不回到 1——否则每个会话的第一轮都会重新抽取。失败时游标不前进，由下一轮/ idle 重试；同一批连续失败 `maxAttempts(3)` 次后丢弃并记录原因，防止毒批死循环。
+- 队列并发 = 1；job 内 `try/catch`，失败最多重试 1 次（指数退避 2s），仍失败则
+  `extract_attempts += 1` 且本轮跳过（游标不前进，下个阈值重试；`attempts >= 3` 才丢弃该批并记 `l1-empty reason=...`）。
+- 插件 dispose：abort 在途请求、清定时器、队列清空。
+- **绝不在 pre-step / turn 事件里 await LLM**。
+
+---
+
+## 6. LLM 集成
+
+```js
+const llm = ctx.get('llm')                          // 可选服务
+const selection = ctx.get('agentDefaultModel')?.currentSelection()  // {provider,model,…}
+const provider = config.extraction.provider || selection?.provider
+const model    = config.extraction.model    || selection?.model
+```
+
+- 调用：`llm.stream({ provider, model, system, messages:[{role:'user',content:[{type:'text',text}]}], maxTokens, signal })`；
+  逐 chunk 收 `text-delta`，`finish` 结束；`usage` 记入 `meta`（`l1_tokens_total`、`l1_calls_total`）。
+- `purpose` 字段只允许 `compaction|session-title`，**不传**。
+- 超时：默认 60s（AbortController）；失败不抛出到会话。
+- 无 `llm` 服务 / 无 model → 抽取整体降级为关闭，只 log 一次 warn（人工 fact 仍可用）。
+- 成本护栏：`maxInputChars=8000`、`maxMemories=10`、`maxTokens=1500`；每轮注入预算独立。
+
+---
+
+## 7. L1 抽取
+
+### 7.1 输入
+
+- `pendingTurns(sessionId, limit)`：最多 20 轮 / 8000 字（从旧到新，超限截断最早轮次）。
+- 每轮格式：`#<turn> [tool: a,b]\n用户: …\n助手: …`。
+
+### 7.2 输出契约（JSON）
+
+```json
+{
+  "memories": [
+    {
+      "kind": "work_fact",
+      "text": "项目用 pnpm 而非 npm",
+      "priority": 70,
+      "scene": "构建与工具链",
+      "op": "store",
+      "target_id": null
+    }
+  ]
+}
+```
+
+- `op` 由第二次冲突消解调用决定；首次抽取只输出 kind/text/priority/scene。
+- 约束：`text` ≤ 400 字、单批 ≤ 10 条、kind 必须在枚举内、priority 0–100（缺省 50）。
+
+### 7.3 容错解析（照抄腾讯经验）
+
+1. 剥 `<think>…</think>`；
+2. 去 ```json 围栏；
+3. 贪心取第一个 `[...]` 或 `{…}`；
+4. 单引号/裸标识符修复（`priority: 70` → `"priority": 70`）；
+5. 校验后逐条 `try`，坏条丢弃并计数；
+6. 空结果记录封闭原因：`parse|empty|timeout|llm_error|filtered`，写 `meta` 便于 grep。
+
+### 7.4 冲突消解
+
+1. 对每条新事实：`findFactCandidates(text, top=3)`（FTS + LIKE，排除 superseded、episode）。
+2. 无候选 → `store`。
+3. 有候选 → **一次批量** LLM 调用，输入「新事实 + 候选(id/text/kind)」，
+   输出 `[{index, op: store|update|merge|skip, target_id}]`；失败则走本地启发式：
+   - 同 hash → skip；
+   - 文本相似度（trigram Jaccard）> 0.75 → update；
+   - 否则 store。
+4. `update/merge`：`memory_history` 留旧版，`version = max(version)+1`，
+   `updated_at=now`，被合并的行 `superseded_by=目标 id`。
+5. 任何决策写 `meta`/日志：`l1 op=store n=3 update=1 merge=1 skip=2`。
+
+---
+
+## 8. L2 场景
+
+- 触发：L1 批次落库后，按 `scene` 聚合；某场景新增事实 ≥ `minFacts(3)` 或
+  summary 过期 > 1 天 → 一次 LLM 归并：输入该场景全部有效事实（≤ 30 条），
+  输出 `{summary, body}`（body ≤ 1200 字 Markdown，分「要点/约定/坑」）。
+- heat：`heat = heat * 0.5^(Δdays/halfLife=14) + 1`（每次更新/被召回命中 +1）。
+- 场景数量上限 `maxScenes=20`：超出按 heat 淘汰最低的（保留 persona 引用的除外）。
+- 导航：按 heat 取 top 8，渲染
+  `- 场景名（heat, N 条）: 一句话摘要`，总长 ≤ 600 字。
+- 失败：LLM 失败时保留旧 body，只更新 fact_count/heat。
+
+---
+
+## 9. L3 画像
+
+- 内容：Markdown，固定小标题（用户偏好 / 项目约定 / 关键决策 / 环境与工具）。
+- 触发：
+  - 首次有 ≥ 5 条有效事实 → 生成；
+  - 之后每 `triggerEveryN(10)` 个 L1 批次，或 JEV-lite 判定为 `conflict|boundary_change|new_rule`。
+- JEV-lite（一次小调用）：输入「当前 persona + 最近 10 条事实变化」，
+  输出五分类之一：`conflict | boundary_change | new_rule | reinforcement | none`。
+  只有前三类才真正重写；`reinforcement/none` → 记录 deferred，省一次大调用。
+- 长度上限 `maxChars=1200`；超限截断并保留小标题结构。
+- 注入：稳定段（global + project 各一段）。
+
+---
+
+## 10. 召回与注入
+
+- 候选：`memory` 表（`superseded_by IS NULL`），FTS + LIKE；v3 起再加一路本地词法向量（§19）。
+- 打分（v3）：
+  `text 1.0 + vector*0.1 + recency 0.20 + usage 0.15 + project 0.15 + priority/100*0.20 + kindWeight 0.20 + pinned(0.35)`；
+  其中 vector 只对 `vec_model='hash-ngram-v1-384'` 的行计算；无 bm25 的候选（LIKE/纯向量）统一拿 0.15 中性 text 分。
+- 向量候选生成：词法候选不足 `maxItems*2` 时，扫描最多 `vector.scanLimit` 条向量，余弦 ≥0.15 的补进候选。
+- 稳定段（每会话首轮一次）：
+  `<memory_context type="stable">` persona + 场景导航 `</memory_context>`，≤ 900 字。
+- 动态段（每轮）：
+  `<memory_context type="dynamic">` 命中事实 `</memory_context>`，≤ 1400 字。
+- 两段同一条消息发送（`source.kind='plugin:dsh-memory'`）；预算独立、互不挤占。
+- 同一 turn 只注入一次；子 agent / 定时任务跳过。
+
+---
+
+## 11. 工具
+
+| 工具 | 变化 |
+| --- | --- |
+| `memory_search` | 新增 `layer?: 'all'|'fact'|'episode'|'scene'|'persona'`（默认 all） |
+| `memory_save` | 不变；kind 枚举扩展到新类型 |
+| `memory_forget` | 支持 `layer` 过滤删除 |
+| `memory_stats` | 增加 l0 未抽取数、facts by kind、scenes、persona version、token 花费 |
+| `memory_extract` | 手动触发一次抽取（调试/补跑），返回 op 统计 |
+| `memory_scene` | 读场景正文（name 或 top N） |
+
+工具数 6 个，仍然轻量；`memory_extract` 不自动暴露给普通对话（description 写明「调试用」）。
+
+> v0.2.0 实际落地：`memory_extract` 已实现；`memory_search` 的 `layer` 过滤与 `memory_scene` 顺延（见 §18）。
+
+---
+
+## 12. 配置（patch 的 config 整行替换）
+
+```yaml
+- id: memory
+  name: 'dsh-memory'
+  config:
+    dbPath: '~/.dsh/memory/memory.db'
+    maxItems: 6
+    maxChars: 1400
+    minScore: 0.2
+    capture: true
+    injectGlobalFacts: true
+    scope: project
+    layers: { l0: true, l1: true, l2: true, l3: true }
+    extraction:
+      enabled: true
+      provider: ''        # 空 = 跟随 agentDefaultModel
+      model: ''
+      everyN: 5           # warm-up 毕业阈值
+      idleMs: 60000
+      maxInputChars: 8000
+      maxMemories: 10
+      timeoutMs: 60000
+      retries: 1
+    scenes:
+      enabled: true
+      minFacts: 3
+      maxScenes: 20
+      halfLifeDays: 14
+    persona:
+      enabled: true
+      triggerEveryN: 10
+      maxChars: 1200
+    vector:
+      enabled: true
+      weight: 0.1         # 向量分权重（实测 0.2+ 掉点，默认 0.1）
+      scanLimit: 2000     # 词法候选不足时的向量扫描上限
+    debug: false
+```
+
+---
+
+## 13. 失败模式与降级
+
+| 失败 | 行为 |
+| --- | --- |
+| 无 `llm` 服务/无模型 | L1–L3 关闭（warn 一次），人工 fact + FTS 召回照常 |
+| LLM 超时/报错 | 重试 1 次；仍失败则本批跳过、游标不前进；attempts≥3 丢弃并记录原因 |
+| JSON 解析失败 | 修复尝试 → 仍失败丢弃本批；记录 `l1-empty reason=parse` |
+| DB busy | `busy_timeout=3000` + 串行队列 |
+| 抽取出坏事实 | priority 截断、text 截断、kind 白名单、同 hash 去重 |
+| 插件 dispose | abort 在途、清 timer、关闭 db 句柄 |
+| 上下文爆炸 | 注入预算固定；抽取输入截断；场景/画像长度上限 |
+
+---
+
+## 14. 安全与隐私
+
+- 抽取会把对话文本发给**当前会话配置的同一个模型 provider**；README 明确写出，
+  并给 `extraction.enabled: false` 开关。
+- 数据全部本地（`~/.dsh/memory/memory.db`），不引入第三方服务。
+- 工具入参做长度/枚举校验；不执行 LLM 返回的任何命令。
+
+---
+
+## 15. 测试策略（零依赖，node:test）
+
+- `store`：v1→v3 迁移幂等；l0 append/游标/幂等；L1 ops（store/update/merge/skip）与 version/history；superseded 过滤；场景 upsert/heat；persona put/get；向量写入与 backfill。
+- `vector`：确定性、L2 归一化、相似/不相似、2 字中文重叠、pack/unpack 宽度、FNV-1a 稳定性。
+- `recall`：FTS/LIKE 候选、priority/kind 打分、向量加分与扫描补候选、stable/dynamic 注入块预算。
+- `extract`：prompt 构造；JSON 容错（think/围栏/裸 priority/坏条）；op 决策启发式；输出白名单。
+- `scheduler`：阈值 1→2→4→8→5；idle；失败重试；dispose 取消。用注入的 `now` + 假定时器，不 sleep。
+- `llm`：假 llm 服务（脚本化响应）+ 超时/错误分支。
+- `plugin`：模拟多轮 → L0 入库 → 触发抽取 → 注入 stable+dynamic；注入 source kind 仍为 `plugin:dsh-memory`。
+- 回归：93 个测试全绿（v0.3.0）。
+
+---
+
+## 16. 实施顺序（里程碑）
+
+| # | 内容 | 验收 |
+| --- | --- | --- |
+| M1 | store v2：schema/迁移/l0/l1 ops/scenes/persona + 单测 | 旧库升级不丢数据；新表单测绿 |
+| M2 | extract 模块：prompt、解析容错、冲突消解（含启发式） + 单测 | 假 LLM 下产出正确 op |
+| M3 | scheduler + llm client + index.js 接线 | 模拟 6 轮只触发 2–3 次抽取；失败不影响 turn |
+| M4 | 召回 v2：stable/dynamic 两段、priority 打分、layer 过滤 | 注入块结构/预算单测 |
+| M5 | L2/L3：场景归并、heat、导航、persona + JEV-lite | 场景/画像单测 |
+| M6 | 工具面 + README + 配置 + 真机验证（临时 DSH_HOME + headless） | 重启后 active，抽取真实发生，token 记账可见 |
+
+每完成一个里程碑：`node test/*.test.js` 全绿 + 更新 README 对应章节。
+
+---
+
+## 17. 待定/开放问题
+
+1. **抽取模型**：默认跟随会话模型（贵但质量好）；是否默认降级到便宜模型？→ 先跟随，配置可改。
+2. **L3 的 scope**：先做 project，global persona 只在明确跨项目偏好时生成（默认也生成，但事实池是 global facts）。
+3. **episode 是否保留**：v2 之后 episode 仅作 v1 兼容与「原文近邻」兜底，默认仍捕获（`capture` 开关）。
+4. **场景命名一致性**：LLM 每次命名可能漂移 → 用「已有场景名清单 + 相似度匹配」约束，超阈值才新建。
+5. **多会话并发抽取**：串行队列下按 session 轮转，饥饿保护（每 session 最多 pending 1 个 job）。
+
+---
+
+## 18. 实施状态（v0.3.0，2026-10-22）
+
+### 已完成
+
+| 里程碑 | 状态 | 证据 |
+| --- | --- | --- |
+| M1 store v2 | ✅ | `test/layers.test.js`（迁移/l0/l1）；`store` 8 项回归全绿 |
+| M2 extract | ✅ | `test/extract.test.js` 10 项（think/围栏/裸 priority/坏条/去重决策） |
+| M3 scheduler + llm + 接线 | ✅ | `test/scheduler.test.js` 5、`test/llm.test.js` 5、`test/pipeline.test.js` 7、`test/wiring.test.js` 3 |
+| M4 召回 v2（stable/dynamic + priority） | ✅ | `test/recall.test.js`；注入块 `type="stable|dynamic"` |
+| M5 L2/L3（场景、画像、JEV-lite） | ✅ | `test/profile.test.js` 6、`test/consolidate.test.js` 5；wiring 的 L2/L3 端到端 |
+| M6 文档 + 真机验证 | ✅ | 见下；README 配置/工具/排错已更新 |
+| M7 本地词法向量 + 混合召回 | ✅ | `test/vector.test.js` 7、`test/recall.test.js` 向量 3 项、`test/layers.test.js` 向量写入/回填 1 项；schema v3 |
+
+真机验证（临时 DSH_HOME + headless + 真实 workbuddy 模型）：
+
+1. 第一轮落 L0；`memory_extract` 触发真实抽取 → `l1-last-reason=ok`，4 条事实
+  （`work_method` pnpm build / pnpm deploy、`work_fact` MySQL 8.0、`instruction` 不自动 git push），
+   token 累计 1027；项目画像 v1 生成。
+2. 同一会话再问「构建用什么命令？」→ 注入 stable（画像，1065 字）+ dynamic（事实，509 字），
+   模型回答 `pnpm build`。
+
+### 与设计的偏差（有意/顺延）
+
+- `memory_search` 的 `layer` 过滤、`memory_scene` 工具：顺延（当前 5 个工具，README 为准）。
+- `maxScenes` 淘汰策略：未实现（当前只限制单批场景更新数）。
+- L3 只写**项目画像**（事实池含 global 事实）；独立 global persona 顺延。
+- L2 场景需要同一场景 ≥ `minFacts(3)` 条事实才会生成；真机测试里每个场景 1 条，故 scenes 为空（符合预期）。
+- 向量是**词法**向量（feature hashing），不是语义 embedding；语义向量仍列为后续（§19）。
+- L0 只存 user/assistant 文本与工具名，不存 tool 输出。
+
+### 回归
+
+`dsh-memory` 全量测试 **93 项，0 失败**（13 个测试文件）。
+
+---
+
+## 19. 本地词法向量（v0.3.0）
+
+> 背景：dsh 没有 embedding 服务，用户提出「用算法自己实现 300 多维度向量」。结论：**可以，但它是词法向量，不是语义向量**。
+
+### 算法
+
+- 特征：英文词（≥2 字符）+ 词内 3-gram；CJK 连续段的 2/3/4-gram；单字 CJK 单独成特征。
+- 映射：FNV-1a 32-bit → `index = hash % 384`，符号位 `sign = (hash >> 31) & 1 ? -1 : +1`（signed hashing 降碰撞偏差）。
+- 权重：sublinear TF `1 + ln(count)`；向量 L2 归一化 → `cosine = dot`。
+- 存储：`Float32Array(384)` → BLOB ≈ 1.5 KB/行；`vec_model='hash-ngram-v1-384'` 标记代数，换代时自动回填。
+- 写入：`saveMemory` / L1 `insertFact` / `applyDecision(update)` 都重算；`openDatabase` 分批回填旧行（每次最多 500）。
+
+### 检索
+
+- 先跑 FTS（trigram bm25）+ LIKE；对候选算余弦，作为第 8 个信号进入 `scoreRow`（权重 `vector.weight`，默认 0.1）。
+- 词法候选 < `maxItems*2` 时（典型：2 字中文查询、词序变化），扫描最多 `vector.scanLimit` 条向量补齐候选。
+- 纯向量/LIKE-only 候选没有 bm25，统一拿 0.15 的中性基础分——**不能因为启用了向量就惩罚另一条召回腿**（评测时发现并修复的真实 bug）。
+- `strategy` 会带 `+vec` 便于诊断。
+
+### 实测（2026-10-22，真实库副本 28 条 / 17 条查询，脚本 `notes/vector-eval.mjs`）
+
+| 配置 | hit@1 | hit@3 | hit@5 | MRR | 平均召回 |
+| --- | --- | --- | --- | --- | --- |
+| 向量关闭 | 82.4% | 94.1% | 94.1% | 0.882 | 2.5 ms |
+| weight 0.1 | 82.4% | 94.1% | 94.1% | 0.882 | 2.8 ms |
+| weight 0.2 | 82.4% | 94.1% | 94.1% | 0.873 | 3.3 ms |
+| weight 0.35 | 82.4% | 94.1% | 94.1% | 0.873 | 2.7 ms |
+
+结论：**词法向量在该语料上是中性**，权重 ≥0.2 会轻微掉 MRR；它补不了语义（`编译构建流程` 仍 miss）。
+保留价值：大语料/短查询时补候选；默认权重降到 0.1，存储 +1.5 KB/行。
+
+### 为什么不做「随机投影/SVD」
+
+- 随机投影只是另一种 hashing，无法凭空产生语义；SVD 需要训练语料与矩阵分解，收益不确定。
+- 真正的语义召回要么接 embedding API（dsh 无此服务），要么用 LLM 做查询扩展；后者可作为后续增量（一次小调用生成同义词/别名）。
+
+## 20. 包内技能与发布形态（v0.4.0，2026-10-22）
+
+目标：**一个 npm 包装完插件 + 技能**，别人用 GUI 或 `pnpm add` 安装、重启后既有记忆能力又有 4 个技能，不需要手工拷目录。
+
+### 为什么不做 `postinstall` 拷贝
+
+| 方案 | 问题 |
+| --- | --- |
+| `postinstall` 把 `skills/` 拷进 `~/.dsh/skills` | pnpm ≥10 默认拦依赖的 build 脚本，要用户显式批准（dsh 插件管理器会报 `pendingBuilds`）；拷贝型安装还会制造"目录丢了插件静默消失"的老坑 |
+| profile patch 里配 `customSkillDirs` | 需要**绝对路径**，包自己算不出来；用户还得手改 patch |
+| 插件包内注册（采用） | 内存注册、随插件释放、rank 可被用户覆盖、零文件写入 |
+
+### 机制
+
+```text
+dsh-memory/apply()
+  └─ ctx.inject(['skills'], scope => {                 // 等 skills 服务就绪，随插件 fiber 释放
+       scope.skills.registerProvider(() => provider)   // provider.name = 'dsh-memory'
+     })
+provider.list()  → 4 个 candidate：rank 600 / source 'bundled' / resourceBase = 技能目录
+provider.get(c)  → 该技能的 SKILL.md 正文（frontmatter 已剥离）
+```
+
+- **rank 600** = `dsh-skill-filesystem` 的最低位（bundled 带）。项目 `.dsh/skills`(100)、`customSkillDirs`(300)、用户 `~/.dsh/skills`(400) 的同名技能一律优先；重复时宿主只打一行 warn。
+- **资源基址**：`resourceBase.kind='directory'` 指向技能自己的目录，SKILL.md 里写的相对路径照旧可解析。
+- **frontmatter 解析**：只认 `key: value` 标量与 `>` / `|` 折叠块；名字必须匹配 `^[a-z0-9]+(?:-[a-z0-9]+)*$`、描述与正文非空，否则该目录被跳过并记 warn（不会让插件加载失败）。
+- **降级**：没有 `ctx.inject`（老宿主）、没有 `skills.registerProvider`（未装 skill 包）、`skills/` 目录缺失 → 只写一行日志，记忆功能照常。
+- **配置**：`skills.enabled`（默认 true）、`skills.dir`（默认包内 `skills/`）。
+
+### 测试
+
+- `test/skills.test.js`（9 项）：frontmatter 解析（LF/CRLF/引号/折叠块/无头）、坏目录跳过、4 个真实技能的 name/description/body、provider 的 rank/source/invocation、`get()` 命中与未知名字、有/无 registry 两种宿主下的注册结果、`apply()` 端到端接线。
+- 真实宿主冒烟：`notes/skills-smoke.mjs` 直接 import 安装包里的 `@deepseek-ai/dsh-skill` → `new Context()` → `ctx.plugin(SkillRegistry)` → 注册本 provider → `list()` 出 4 个、`get('memory-curator')` 取到正文。
+
+### 发布形态
+
+- npm 包 `dsh-memory`：`index.js` + `src/*.js` + `skills/*/SKILL.md` + `cordis.patch.yml` + README/INSTALL/LICENSE + DESIGN。
+- `package.json` 刻意**不声明** `@deepseek-ai/*` peerDependencies 与 `engines.dsh`：声明后 dsh 会在安装前做版本兼容门（不满足直接拒装，要 `dsh plugin allow-version` 豁免），而本插件对 DSH 包零 import，没必要挡用户。
+- 离线包：`scripts/build-release.mjs` 产 `dist/dsh-memory-<ver>.tgz` + `-bundle.zip` + `SHA256SUMS.txt` + `manifest.json`；`install.ps1 -From <tgz|zip|目录>` 负责无网安装。
+- 后续可选：`skills.rank` 配置化、按 profile 白名单只注册部分技能。
+
+

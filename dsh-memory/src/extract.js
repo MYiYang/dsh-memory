@@ -1,0 +1,332 @@
+/**
+ * L1 extraction: prompt contracts, tolerant JSON parsing, and the mapping from
+ * model output to store decisions.
+ *
+ * This module is pure (no cordis, no network) so every branch is unit-testable
+ * with canned model output. The LLM call itself lives in `llm.js`; wiring lives
+ * in `index.js` / `pipeline.js`.
+ *
+ * @module dsh-memory/extract
+ */
+import { applyDecision, decideHeuristically, findCandidates, normalizeKind, clampPriority } from './l1.js'
+
+/** Hard caps for one extraction batch. */
+export const EXTRACT_LIMITS = { memories: 10, text: 400, scene: 40, candidates: 4 }
+
+/** Closed set recorded in `meta['l1-last-reason']` for grepping. */
+export const EXTRACT_REASONS = /** @type {const} */ (['ok', 'empty', 'parse', 'timeout', 'llm_error', 'filtered'])
+
+/** System prompt: fixed contract, no conversation content. */
+export const EXTRACTION_SYSTEM = [
+  '你是记忆整理器。只输出 JSON，不要解释、不要 markdown 围栏。',
+  '任务：从一段对话里抽取值得长期记住的原子事实，每条不超过 200 字。',
+  'kind 只能是：',
+  '- persona：用户/团队的长期偏好或身份（如「偏好 pwsh」「中文交流」）',
+  '- instruction：明确要求以后遵守的规则（如「不要自动 git push」）',
+  '- work_fact：项目事实（技术栈、目录、端口、数据源）',
+  '- work_method：跑通过的方法/流程（命令、步骤、坑）',
+  '- work_task：进行中的任务状态（做到哪、下一步）',
+  '- work_artifact：产物位置（文件、表、服务、URL）',
+  '- episodic：一次性事件（某天做了什么）',
+  'priority 0-100：长期偏好/硬规则 80+；项目事实 60-79；任务状态 40-59；一次性事件 10-39。',
+  'scene 是 2-6 个字的场景名（如「构建与工具链」「数据库」「部署」）。',
+  '不要抽取：寒暄、临时调试输出、模型推理过程、重复内容。',
+  '输出格式：{"memories":[{"kind":"work_fact","text":"…","priority":60,"scene":"数据库"}]}',
+  '没有值得记住的内容时输出：{"memories":[]}',
+].join('\n')
+
+/** System prompt for the dedupe/conflict pass. */
+export const DEDUPE_SYSTEM = [
+  '你是记忆去重器。只输出 JSON 数组，不要解释。',
+  '输入是若干「新事实」及每个新事实的「已有候选」。对每条新事实决定：',
+  '- store：与候选都不等价，新增',
+  '- update：新事实修正/补充了某个候选，target_id 指向它',
+  '- merge：新事实是多个候选的合并结果，target_id 为主，merge_ids 列出被吸收的',
+  '- skip：候选里已有等价事实',
+  'text 输出合并/修正后的最终文本（不超过 200 字）。',
+  '输出格式：[{"i":0,"op":"update","target_id":12,"merge_ids":[],"text":"最终文本"}]',
+].join('\n')
+
+/**
+ * Clip text to a limit (head kept).
+ * @param {unknown} value
+ * @param {number} limit
+ * @returns {string}
+ */
+function clip(value, limit) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length <= limit ? text : text.slice(0, Math.max(0, limit - 1)) + '…'
+}
+
+/**
+ * Strip reasoning wrappers (`<think>…</think>`, ` reasoning…`) and markdown fences.
+ * @param {string} raw
+ * @returns {string}
+ */
+export function stripNoise(raw) {
+  let text = String(raw ?? '')
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '')
+  text = text.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
+  text = text.replace(/```(?:json)?\s*([\s\S]*?)```/gi, '$1')
+  return text.trim()
+}
+
+/**
+ * Light JSON repair for the usual model slips: trailing commas, bare keys,
+ * single-quoted strings, unquoted numeric priority.
+ * @param {string} text
+ * @returns {string}
+ */
+export function repairJson(text) {
+  let value = String(text ?? '')
+  value = value.replace(/,\s*([}\]])/g, '$1')
+  value = value.replace(/([{,]\s*)'([^'\\]+)'(\s*:)/g, '$1"$2"$3')
+  value = value.replace(/(:\s*)'([^'\\]*)'/g, '$1"$2"')
+  // {"priority": 60} is fine; `priority: 60` (bare key) is not
+  value = value.replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
+  return value
+}
+
+/**
+ * Find the first balanced JSON value (object or array) in `text`.
+ * String-aware so braces inside strings do not end the scan early.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function extractJsonSlice(text) {
+  const source = String(text ?? '')
+  let start = -1
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i]
+    if (ch === '{' || ch === '[') {
+      start = i
+      break
+    }
+  }
+  if (start < 0) return null
+  const open = source[start]
+  const close = open === '{' ? '}' : ']'
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === open) depth += 1
+    else if (ch === close) {
+      depth -= 1
+      if (depth === 0) return source.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+/**
+ * Parse one JSON value with repair fallbacks.
+ * @param {string} text
+ * @returns {unknown|null}
+ */
+export function parseJsonLoose(text) {
+  const slice = extractJsonSlice(stripNoise(text))
+  if (slice === null) return null
+  try {
+    return JSON.parse(slice)
+  } catch {
+    try {
+      return JSON.parse(repairJson(slice))
+    } catch {
+      return null
+    }
+  }
+}
+
+/**
+ * Validate and normalize one extracted memory. Returns null when unusable.
+ * @param {unknown} item
+ * @returns {{ kind: string, text: string, priority: number, scene: string|null } | null}
+ */
+export function normalizeMemoryItem(item) {
+  if (item === null || typeof item !== 'object') return null
+  const record = /** @type {Record<string, unknown>} */ (item)
+  const text = clip(record.text, EXTRACT_LIMITS.text)
+  if (text === '') return null
+  const sceneRaw = clip(record.scene, EXTRACT_LIMITS.scene)
+  return {
+    kind: normalizeKind(record.kind),
+    text,
+    priority: clampPriority(record.priority),
+    scene: sceneRaw === '' ? null : sceneRaw,
+  }
+}
+
+/**
+ * Parse one extraction response.
+ * @param {string} raw
+ * @param {{ maxMemories?: number }} [options]
+ * @returns {{ memories: Array<{ kind: string, text: string, priority: number, scene: string|null }>, reason: string }}
+ */
+export function parseExtraction(raw, options = {}) {
+  const maxMemories = Math.max(1, Math.min(50, options.maxMemories ?? EXTRACT_LIMITS.memories))
+  const value = parseJsonLoose(raw)
+  if (value === null) return { memories: [], reason: 'parse' }
+  const list = Array.isArray(value)
+    ? value
+    : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).memories)
+      ? /** @type {any} */ (value).memories
+      : null
+  if (list === null) return { memories: [], reason: 'parse' }
+  /** @type {Array<{ kind: string, text: string, priority: number, scene: string|null }>} */
+  const memories = []
+  for (const item of list) {
+    const normalized = normalizeMemoryItem(item)
+    if (normalized === null) continue
+    if (memories.some((entry) => entry.text === normalized.text)) continue
+    memories.push(normalized)
+    if (memories.length >= maxMemories) break
+  }
+  if (memories.length === 0) return { memories: [], reason: list.length === 0 ? 'empty' : 'filtered' }
+  return { memories, reason: 'ok' }
+}
+
+/**
+ * Build the extraction request messages.
+ * @param {string} transcript
+ * @param {{ maxMemories?: number }} [options]
+ * @returns {{ system: string, user: string }}
+ */
+export function buildExtractionPrompt(transcript, options = {}) {
+  const maxMemories = Math.max(1, Math.min(50, options.maxMemories ?? EXTRACT_LIMITS.memories))
+  const user = [
+    `下面是待整理的对话记录（按时间顺序）：`,
+    '<conversation>',
+    String(transcript ?? '').trim(),
+    '</conversation>',
+    `最多抽取 ${maxMemories} 条。只输出约定的 JSON。`,
+  ].join('\n')
+  return { system: EXTRACTION_SYSTEM, user }
+}
+
+/**
+ * Build the dedupe request from new memories and their candidates.
+ * @param {Array<{ fact: { kind: string, text: string, priority: number, scene: string|null }, candidates: Array<Record<string, any>> }>} plan
+ * @returns {{ system: string, user: string }}
+ */
+export function buildDedupePrompt(plan) {
+  const relevant = plan.filter((entry) => entry.candidates.length > 0)
+  const payload = relevant.map((entry) => ({
+    i: Number.isInteger(entry.index) ? entry.index : plan.indexOf(entry),
+    new_fact: {
+      kind: entry.fact.kind,
+      text: entry.fact.text,
+      priority: entry.fact.priority,
+      scene: entry.fact.scene,
+    },
+    candidates: entry.candidates.map((row) => ({
+      id: Number(row.id),
+      kind: row.kind,
+      text: String(row.text ?? '').slice(0, 200),
+    })),
+  }))
+  return {
+    system: DEDUPE_SYSTEM,
+    user: ['<dedupe_input>', JSON.stringify(payload, null, 0), '</dedupe_input>', '只输出约定的 JSON 数组。'].join('\n'),
+  }
+}
+
+/**
+ * Parse the dedupe response into decisions keyed by fact index.
+ * Invalid entries are dropped; missing indices fall back to the heuristic.
+ *
+ * @param {string} raw
+ * @param {number} count
+ * @returns {Array<{ index: number, op: 'store'|'update'|'merge'|'skip', targetId: number|null, mergeIds: number[], text: string|null }>}
+ */
+export function parseDedupe(raw, count) {
+  const value = parseJsonLoose(raw)
+  const list = Array.isArray(value)
+    ? value
+    : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).decisions)
+      ? /** @type {any} */ (value).decisions
+      : null
+  if (list === null) return []
+  const ops = new Set(['store', 'update', 'merge', 'skip'])
+  /** @type {Array<any>} */
+  const decisions = []
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    const record = /** @type {Record<string, unknown>} */ (item)
+    const index = Number(record.i ?? record.index)
+    if (!Number.isInteger(index) || index < 0 || index >= count) continue
+    const op = String(record.op ?? '').trim()
+    if (!ops.has(op)) continue
+    const targetId = Number(record.target_id ?? record.targetId ?? 0)
+    const mergeIds = Array.isArray(record.merge_ids)
+      ? record.merge_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0)
+      : []
+    const text = typeof record.text === 'string' && record.text.trim() !== '' ? clip(record.text, EXTRACT_LIMITS.text) : null
+    decisions.push({ index, op, targetId: targetId > 0 ? targetId : null, mergeIds, text })
+    if (decisions.length >= count) break
+  }
+  return decisions
+}
+
+/**
+ * Pair each extracted fact with its existing candidates, so the dedupe call
+ * only receives facts that actually have overlap.
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<{ kind: string, text: string, priority: number, scene: string|null }>} memories
+ * @param {{ project?: string|null }} [options]
+ * @returns {Array<{ fact: any, candidates: Array<Record<string, any>> }>}
+ */
+export function withCandidates(db, memories, options = {}) {
+  return memories.map((fact, index) => ({
+    index,
+    fact,
+    candidates: findCandidates(db, fact.text, { project: options.project ?? null, limit: EXTRACT_LIMITS.candidates }),
+  }))
+}
+
+/**
+ * Apply parsed decisions (or the deterministic fallback) to the store.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<{ fact: any, candidates: Array<Record<string, any>> }>} plan
+ * @param {Array<{ index: number, op: string, targetId: number|null, mergeIds: number[], text: string|null }>} decisions
+ * @param {{ project?: string|null, sessionId?: string|null, sourceSeqs?: number[], now?: number }} [ctx]
+ * @returns {{ store: number, update: number, merge: number, skip: number, ids: number[] }}
+ */
+export function applyDecisions(db, plan, decisions, ctx = {}) {
+  const summary = { store: 0, update: 0, merge: 0, skip: 0, ids: [] }
+  const byIndex = new Map(decisions.map((decision) => [decision.index, decision]))
+  for (let index = 0; index < plan.length; index++) {
+    const entry = plan[index]
+    const decision = byIndex.get(index) ?? { ...decideHeuristically(entry.fact, entry.candidates), text: null }
+    const targetId = decision.targetId ?? null
+    const text = decision.text ?? entry.fact.text
+    let op = decision.op
+    if ((op === 'update' || op === 'merge') && targetId === null) op = 'store'
+    const result = applyDecision(
+      db,
+      {
+        op: /** @type {any} */ (op),
+        kind: entry.fact.kind,
+        text,
+        priority: entry.fact.priority,
+        scene: entry.fact.scene,
+        targetId,
+        mergeIds: decision.mergeIds ?? [],
+      },
+      { ...ctx, now: ctx.now },
+    )
+    const key = /** @type {'store'|'update'|'merge'|'skip'} */ (result.op)
+    summary[key] += 1
+    if (result.id !== null) summary.ids.push(result.id)
+  }
+  return summary
+}

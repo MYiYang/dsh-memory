@@ -1,0 +1,68 @@
+{
+  "name": "dsh-memory",
+  "version": "0.4.0",
+  "description": "Layered cross-session memory for DeepSeek Harness: L0 raw turns, L1 LLM-extracted facts with conflict resolution, L2 scenes, L3 persona, hybrid FTS + local 384-dim lexical vectors, plus recall injection and memory_search / memory_save / memory_extract tools",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./store": "./src/store.js",
+    "./recall": "./src/recall.js",
+    "./capture": "./src/capture.js",
+    "./l0": "./src/l0.js",
+    "./l1": "./src/l1.js",
+    "./extract": "./src/extract.js",
+    "./llm": "./src/llm.js",
+    "./scheduler": "./src/scheduler.js",
+    "./pipeline": "./src/pipeline.js",
+    "./profile": "./src/profile.js",
+    "./consolidate": "./src/consolidate.js",
+    "./vector": "./src/vector.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "src/*.js",
+    "skills/**/SKILL.md",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE",
+    "DESIGN-v2.md"
+  ],
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "sync-skills": "node ../scripts/sync-skills.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "memory",
+    "long-term-memory",
+    "layered-memory",
+    "sqlite",
+    "fts5",
+    "agent-skills"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MYiYang/dsh-memory.git"
+  },
+  "homepage": "https://github.com/MYiYang/dsh-memory#readme",
+  "bugs": {
+    "url": "https://github.com/MYiYang/dsh-memory/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

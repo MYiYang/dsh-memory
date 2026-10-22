@@ -1,0 +1,20 @@
+# dsh-memory bundle patch: mount the host half as one loader row.
+#
+# The `name:` under `insert:` is the loader's module specifier and MUST equal
+# this package's `package.json.name` (a scoped name has to match too).
+# `scripts/build-release.mjs` rewrites that one line from package.json before
+# packaging, so renaming the package needs no hand edit here.
+#
+# Config knobs (all optional) can be overridden from the profile patch layer.
+# The override is a bare patch entry keyed by this row's id (do NOT wrap it in
+# `insert:` — the same id twice fails at startup with "duplicate loader entry
+# id"), and its `config` replaces the whole row config (no deep merge):
+#
+#   - id: memory
+#     config:
+#       maxItems: 6
+#       maxChars: 1400
+#       capture: true
+- insert:
+    - id: memory
+      name: 'dsh-memory'

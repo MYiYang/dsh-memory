@@ -1,0 +1,24 @@
+# build output — rebuilt by `node scripts/build-release.mjs`
+/dist/
+
+# backups written by install.ps1 / profile-plugin.mjs
+*.bak-*
+
+# upstream research snapshot (cloned Tencent MemoryCore, 11.8 MB) — not ours to publish
+/repo/
+
+# scratch: asar reverse-engineering probes, session dumps, extracted package docs
+/notes/
+
+# one-off probe scripts that only make sense next to `repo/`
+/probe*.mjs
+/fetch_*.mjs
+/branch_*.mjs
+/digest.mjs
+/issues_digest.mjs
+/layout.mjs
+/loc.mjs
+/counts.mjs
+/dbg.mjs
+/tests_scan*.mjs
+/TencentDB-Agent-Memory-分析报告.md
