@@ -152,12 +152,13 @@ export function buildPersonaCompressPrompt(body, limit) {
 }
 
 /**
- * Trim a persona body down to `limit` chars at a line boundary.
+ * Trim a persona body down to `limit` chars.
  *
  * The model treats "about N chars" as advice: asked for ~700 it happily wrote
- * 2600. Cutting at maxChars then chops a sentence in half and, worse, still
- * overflows the stable block. So the generator's answer is trimmed here, at the
- * last whole line that fits, with an ellipsis marking the cut.
+ * 2_600. A tail cut would drop whole sections (the operations rules sit last),
+ * so the trim is section-aware: keep every `## ` heading and its first lines,
+ * widening line by line until the budget is used up. Only when even one line
+ * per section does not fit does it fall back to a line-boundary head cut.
  *
  * @param {string} body
  * @param {number} limit
@@ -167,6 +168,28 @@ export function trimPersonaBody(body, limit) {
   const text = String(body ?? '').trim()
   const max = Math.max(1, Math.floor(limit))
   if (text.length <= max) return { text, trimmed: false }
+
+  /** @type {Array<{ header: string, lines: string[] }>} */
+  const sections = []
+  for (const line of text.split('\n')) {
+    if (line.startsWith('## ') || sections.length === 0) {
+      if (line.startsWith('## ') || line.trim() !== '') sections.push({ header: line, lines: [] })
+      continue
+    }
+    sections[sections.length - 1].lines.push(line)
+  }
+  const maxLines = Math.max(0, ...sections.map((section) => section.lines.length))
+  for (let perSection = maxLines; perSection >= 1; perSection--) {
+    const rendered = sections
+      .map((section) => [section.header, ...section.lines.slice(0, perSection)].join('\n'))
+      .join('\n')
+      .trim()
+    if (rendered.length + 1 <= max) {
+      return { text: `${rendered}…`, trimmed: true }
+    }
+  }
+
+  // Even one line per section is too long: fall back to a head cut at a line end.
   const kept = []
   let used = 0
   for (const line of text.split('\n')) {
@@ -556,21 +579,42 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   // 2_600). One dedicated compression pass keeps the important sections, and a
   // line-boundary trim is the last-resort guard so the stored body always fits.
   if (body.length > targetChars) {
-    const compressed = await askJson(llm, buildPersonaCompressPrompt(body, targetChars), {
-      maxTokens: Math.min(4_000, personaTokens),
-      reasoningEffort: effort,
-      timeoutMs: personaTimeoutMs,
-      sessionId: ctx.sessionId,
-      signal: ctx.signal,
-    })
-    if (compressed.usage) {
-      usage = usage === null
-        ? compressed.usage
-        : { inputTokens: Number(usage.inputTokens ?? 0) + Number(compressed.usage.inputTokens ?? 0), outputTokens: Number(usage.outputTokens ?? 0) + Number(compressed.usage.outputTokens ?? 0) }
+    const compressPrompt = buildPersonaCompressPrompt(body, targetChars)
+    // The compression call hits the same reason-wall as the generation call, so
+    // it escalates the same way instead of giving up on the first max-tokens.
+    const compressPlans = [
+      { reasoningEffort: effort, maxTokens: Math.min(4_000, personaTokens) },
+      { reasoningEffort: effort, maxTokens: Math.min(16_000, Math.max(8_000, personaTokens)) },
+      { reasoningEffort: undefined, maxTokens: Math.min(16_000, Math.max(8_000, personaTokens)) },
+    ]
+    for (const plan of compressPlans) {
+      const compressed = await askJson(llm, compressPrompt, {
+        maxTokens: plan.maxTokens,
+        reasoningEffort: plan.reasoningEffort,
+        timeoutMs: personaTimeoutMs,
+        sessionId: ctx.sessionId,
+        signal: ctx.signal,
+      })
+      if (compressed.usage) {
+        usage = usage === null
+          ? compressed.usage
+          : { inputTokens: Number(usage.inputTokens ?? 0) + Number(compressed.usage.inputTokens ?? 0), outputTokens: Number(usage.outputTokens ?? 0) + Number(compressed.usage.outputTokens ?? 0) }
+      }
+      const shorter = compressed.value && typeof compressed.value.body === 'string' ? compressed.value.body.trim() : ''
+      tried.push({
+        stage: 'compress',
+        tokens: plan.maxTokens,
+        effort: plan.reasoningEffort ?? 'default',
+        ok: compressed.ok,
+        finish: compressed.reason,
+        chars: compressed.chars,
+        bodyChars: shorter.length,
+      })
+      if (shorter !== '' && shorter.length < body.length) {
+        body = shorter
+        break
+      }
     }
-    const shorter = compressed.value && typeof compressed.value.body === 'string' ? compressed.value.body.trim() : ''
-    tried.push({ stage: 'compress', ok: compressed.ok, finish: compressed.reason, chars: compressed.chars, bodyChars: shorter.length })
-    if (shorter !== '' && shorter.length < body.length) body = shorter
   }
   track(db, usage)
   const trimmed = trimPersonaBody(body, Math.min(maxChars, targetChars))

@@ -384,6 +384,22 @@ test('trimPersonaBody cuts at a line boundary and marks the cut', () => {
   assert.equal(trimPersonaBody('   ', 10).text, '')
 })
 
+test('trimPersonaBody keeps every section instead of cutting the tail off', () => {
+  const body = [
+    '## 项目定位',
+    '- 定位一', '- 定位二', '- 定位三',
+    '## 架构',
+    '- 架构一', '- 架构二',
+    '## 操作约定',
+    '- 约定一', '- 约定二',
+  ].join('\n')
+  const cut = trimPersonaBody(body, 45)
+  assert.equal(cut.trimmed, true)
+  assert.ok(cut.text.length <= 45)
+  // Sections that sit at the end must survive: they carry the operational rules.
+  for (const header of ['## 项目定位', '## 架构', '## 操作约定']) assert.ok(cut.text.includes(header))
+})
+
 test('an over-long persona answer is trimmed to the target before it is stored', async () => {
   const db = setup()
   fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
