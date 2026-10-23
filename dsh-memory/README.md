@@ -1,4 +1,6 @@
-# dsh-memory
+# dsh-memory-layered
+
+> npm 包名：`dsh-memory-layered`（`npm i dsh-memory-layered` / `dsh plugin add dsh-memory-layered`）；GitHub 仓库仍叫 `MYiYang/dsh-memory`。插件内部的注入命名空间 `plugin:dsh-memory`、日志标签 `[dsh-memory]`、技能与工具名都跟包名无关，不受影响。
 
 给 **DeepSeek Harness (dsh)** 加**分层跨会话记忆**的本地插件，并**随包带 4 个 dsh 技能**（`dsh-plugin-dev` / `memory-curator` / `repo-audit` / `windows-pwsh-ops`：插件启动时用 `ctx.skills.registerProvider` 以 rank 600 注册，装插件即装技能，不用拷 `~/.dsh/skills`）：
 
@@ -33,9 +35,9 @@
 | --- | --- | --- |
 | **A. GUI** | 侧栏「插件」→「添加插件」→ 输包名 → 重启 | 自动写依赖 + 选入 `dsh.profile.bundles`，不用手改 JSON |
 | **B. CLI** | `dsh plugin --profile web add <包名>`，再把包名加进 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` → 重启 | **只 add 不激活**，漏了这一步重启也不会加载 |
-| **C. 离线** | 解压 `dsh-memory-<ver>.zip` → `pwsh -File .\install.ps1 -From .\dsh-memory-<ver>.tgz`（默认 dry-run，加 `-Apply` 才写盘）→ 重启 | 内网/无 registry；脚本也能直接对源码目录用（`link:` + 拷技能） |
+| **C. 离线** | 解压 `dsh-memory-layered-<ver>.zip` → `pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz`（默认 dry-run，加 `-Apply` 才写盘）→ 重启 | 内网/无 registry；脚本也能直接对源码目录用（`link:` + 拷技能） |
 
-> 本文命令里的 `@yourscope/dsh-memory` / `<包名>` 是占位，换成你实际安装的包名（scoped 或 `dsh-memory-layered` 之类都一样）。
+> 本文命令里的 `<包名>` 就是 npm 上的 **`dsh-memory-layered`**；`@yourscope/dsh-memory` 只是「若你改发 scoped 名」的占位写法。两种写法除了安装 spec 不同，别处完全一样。
 
 三种方式的结果相同：profile 的 `package.json` 里有依赖、`dsh.profile.bundles` 里有它（写在数组末尾，顺序影响优先级）、`node_modules` 里是指向实际目录的链接。插件自带的 `cordis.patch.yml` 负责插入 `memory` 行——**不要**再在 profile patch 里手写同 id 的 insert，否则 duplicate entry id。
 
@@ -56,7 +58,7 @@
 
 ```yaml
 - id: memory
-  name: 'dsh-memory'
+  name: 'dsh-memory-layered'      # loader 模块说明符，必须等于安装后的包名
   config:
     dbPath: '~/.dsh/memory/memory.db'
     maxItems: 6                 # 动态段最多几条事实
@@ -204,7 +206,7 @@ agent/pre-step（每轮首 step）
 
 ## 验证是否真的加载了
 
-1. **插件列表**：侧栏「插件」页里应出现 `dsh-memory`（来自 `dsh.profile.bundles`），状态为启用/active。
+1. **插件列表**：侧栏「插件」页里应出现 `dsh-memory-layered`（来自 `dsh.profile.bundles`），状态为启用/active。
 2. **工具层**：新会话里说「看下你的记忆库」→ 模型应调用 `memory_stats`，输出含 `l0=`、`scenes=`、`vec=`、`feat=`、`tokens=`。
 3. **抽取层**：聊几轮后 `memory_stats` 的 `l0=0/N`（待抽取为 0）且 `kinds={...}` 出现 `work_fact` 等；
    或直接让模型调 `memory_extract` 看 `reason=ok`。
@@ -218,8 +220,8 @@ agent/pre-step（每轮首 step）
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| 插件列表里看不到 `dsh-memory` | 只写了 patch insert，没注册成 bundle | `pwsh -File .\install.ps1 -Apply` → 重启 |
-| 条目 `enabled: true` 但 `fiberPhase: null`，工具消失 | `node_modules/dsh-memory` 断链或目录丢失 | 同上（脚本会重建 link） |
+| 插件列表里看不到 `dsh-memory-layered` | 只写了 patch insert，没注册成 bundle | `pwsh -File .\install.ps1 -Apply` → 重启 |
+| 条目 `enabled: true` 但 `fiberPhase: null`，工具消失 | `node_modules/dsh-memory-layered` 断链或目录丢失 | 同上（脚本会重建 link） |
 | 本轮失败：`format v4 message requires a producer-owned source kind` | 注入消息用了旧 source 形状 | 本版已用 `{ kind: 'plugin:dsh-memory' }` |
 | `memory_stats` 里 `l0` 一直不降 | 没有 llm 服务/模型，或抽取一直失败；重启后旧会话不会自动重试 | 看日志 `[dsh-memory]`；`l1-last-reason` 会写 `llm_error/parse/timeout`；调 `memory_extract` 传 `{all:true}` 补抽积压 |
 | 抽取 `reason=parse` | 模型把 Windows 路径写成单反斜杠（`\U`/`\m` 非法转义），或前面带示例 JSON | 本版 `repairStringEscapes` 修非法转义与裸控制字符，并在多个 JSON 片段中选 `memories` 最多的一个；仍失败可用 `all:true` 重跑 |

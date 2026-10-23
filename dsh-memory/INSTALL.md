@@ -1,4 +1,4 @@
-# 安装 dsh-memory
+# 安装 dsh-memory-layered
 
 给 **DeepSeek Harness (dsh)** 加分层跨会话记忆的本地插件。一个包同时带 **4 个 dsh 技能**（`dsh-plugin-dev`、`memory-curator`、`repo-audit`、`windows-pwsh-ops`），装一次两样都有。
 
@@ -7,7 +7,7 @@
 - 插件做什么、参数与评测数据：见 [README.md](README.md)
 - 设计细节：见 [DESIGN-v2.md](DESIGN-v2.md)
 
-> **关于包名**：本文命令里的 `@yourscope/dsh-memory` 是占位，换成你实际拿到的包名（scoped 名、`dsh-memory-layered` 之类都可以）。插件身份、`memory_*` 工具名、4 个技能名都跟包名无关，不受影响。
+> **关于包名**：npm 上的正式包名是 **`dsh-memory-layered`**（本文命令直接照抄即可）。若你改发 scoped 名（形如 `@yourscope/dsh-memory`），把命令里的包名换掉就行。插件身份、`memory_*` 工具名、4 个技能名都跟包名无关，不受影响。
 
 ## 0. 装完你会得到什么
 
@@ -35,7 +35,7 @@
 
 1. 打开 dsh Web，左侧边栏 →「**插件**」；
 2. 页头按钮「**添加插件**」（或箭头「选择添加插件方式」→「安装第三方插件」），打开安装对话框；
-3. 输入包名 `@yourscope/dsh-memory`（要指定版本写 `@yourscope/dsh-memory@0.4.0`），回车；
+3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.6.0`），回车；
    - 对话框也接受 **Git 地址、压缩包 URL、本地绝对路径**；
    - 安装进度对话框里可以「查看安装任务」「取消安装」；
 4. 等它跑完 → **重启 DSH**。
@@ -49,22 +49,22 @@
 ### 路径 B：CLI（脚本化 / 远程机器 / 只装了 CLI）
 
 ```powershell
-dsh plugin --profile web add @yourscope/dsh-memory
+dsh plugin --profile web add dsh-memory-layered
 ```
 
 `dsh plugin` 做的事就是「在 profile 目录里跑 pnpm」，所以 spec 可以是：
 
 | spec 形式 | 例子 |
 | --- | --- |
-| registry 包名（可带版本/标签） | `@yourscope/dsh-memory@0.4.0` |
+| registry 包名（可带版本/标签） | `dsh-memory-layered@0.6.0` |
 | git https 地址 | `https://github.com/<you>/<repo>` |
-| tarball URL | `https://github.com/<you>/<repo>/releases/download/v0.4.0/dsh-memory-0.4.0.tgz` |
+| tarball URL | `https://github.com/<you>/<repo>/releases/download/v0.6.0/dsh-memory-layered-0.6.0.tgz` |
 | 本地目录 | `file:F:\path\to\dsh-memory` 或 `link:F:\path\to\dsh-memory` |
 
 没装桌面版、只有 CLI 的话，用 npx 跑同一个命令（共用同一个 `~/.dsh`，profile 也是同一个）：
 
 ```powershell
-npx -y @deepseek-ai/dsh plugin --profile web add @yourscope/dsh-memory
+npx -y @deepseek-ai/dsh plugin --profile web add dsh-memory-layered
 npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一行进了组合后的配置
 ```
 
@@ -75,14 +75,14 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "@yourscope/dsh-memory": "^0.4.0"
+    "dsh-memory-layered": "^0.6.0"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "@yourscope/dsh-memory"
+        "dsh-memory-layered"
       ]
     }
   }
@@ -97,18 +97,18 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
 
 ### 路径 C：离线包（内网 / 没有 registry / 不想动 pnpm）
 
-从 Release 下载 `dsh-memory-0.4.0.zip`，解压后在该目录执行：
+从 Release 下载 `dsh-memory-layered-0.6.0.zip`，解压后在该目录执行：
 
 ```powershell
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz            # 1) dry-run：只打印要做什么，不写任何文件
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz -Apply     # 2) 真装
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz            # 1) dry-run：只打印要做什么，不写任何文件
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz -Apply     # 2) 真装
 ```
 
 > 离线目录里**必须带 `-From`**：不带时脚本按「从源码仓库安装」处理，会去找同目录的 `dsh-memory\` 源码而报错。
 
 `-From` 接受 `.tgz`、`.zip` 或解压后的目录（目录里只有 tgz 也行，脚本会自己找；传仓库根目录也行，会自动下探到 `dsh-memory\`）。脚本做四件事：
 
-1. 把包解到 `$DSH_HOME\plugins\dsh-memory-<版本>`（tgz 直接解包并把里面的 `package\*` 提上一层，没有多余嵌套；zip 先解到 `<zip 名>.unpacked\`，再用里面的 tgz 走同样流程；目标目录已有同版本则直接复用）；
+1. 把包解到 `$DSH_HOME\plugins\dsh-memory-layered-<版本>`（tgz 直接解包并把里面的 `package\*` 提上一层，没有多余嵌套；zip 先解到 `<zip 名>.unpacked\`，再用里面的 tgz 走同样流程；目标目录已有同版本则直接复用）；
 2. 在该 profile 的 `package.json` 写 `"<包名>": "link:<插件目录>"`，并把包名追加进 `dsh.profile.bundles`；
 3. 建 `profiles\<名字>\node_modules\<包名>` → 插件目录的 **junction**（scoped 包名会落到 `node_modules\@scope\name`）；
 4. 兼容行为：`$DSH_HOME\skills` 里没有同名技能时，额外拷一份（用 `-SkipSkills` 关掉。插件本来就注册包内技能，这步只是给老习惯留的退路）。
@@ -144,7 +144,7 @@ pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz -Apply     # 2) 真装
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
 - id: memory
-  name: 'dsh-memory'          # 用来定位这一行；包改名/加 scope 后写实际包名（entry id 仍是 memory）
+  name: 'dsh-memory-layered'          # 用来定位这一行；包改名/加 scope 后写实际包名（entry id 仍是 memory）
   config:
     maxItems: 8               # 动态段最多注入几条事实
     extraction:
@@ -172,7 +172,7 @@ pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz -Apply     # 2) 真装
 | 升级 | GUI 里重装同名；或 `dsh plugin --profile web add <包名>@latest`；离线用新 zip 重跑 `-From`。`bundles` 里已有它，不用再动。**升级后重启** |
 | 回滚 | 从 profile 的 `package.json` 删两处：`dependencies` 里的包名、`dsh.profile.bundles` 里的同名项 → 重启。记忆库不动 |
 | 卸载 | 插件页卸载，或 `dsh plugin --profile web remove <包名>`（若 `bundles` 里还留着名字，手删那一项）→ 重启 |
-| 清数据 | 删 `~/.dsh/memory\`（**不可恢复**）；离线装的再删 `$DSH_HOME\plugins\dsh-memory-<ver>` |
+| 清数据 | 删 `~/.dsh/memory\`（**不可恢复**）；离线装的再删 `$DSH_HOME\plugins\dsh-memory-layered-<ver>` |
 
 > 卸载**不会**删 `~/.dsh/skills\<技能名>` 里你自己拷过的副本——那是你的文件，要清得自己删。同理，插件随包注册的技能在卸载/停用后会自动消失，不需要手工清理。
 

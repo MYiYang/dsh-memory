@@ -75,8 +75,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/dsh-memory-*.tgz
-            dist/dsh-memory-*.zip
+            dist/*.tgz
+            dist/*.zip
             dist/SHA256SUMS.txt
             dist/manifest.json
           generate_release_notes: true

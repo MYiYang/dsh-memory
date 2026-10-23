@@ -225,15 +225,18 @@ function Install-ZipRelease([string]$zip) {
   $entries = @(& tar -tf $zip 2>$null)
   if ($LASTEXITCODE -ne 0) { throw "cannot list archive: $zip" }
   $tgzEntry = $entries | Where-Object { $_ -match '^[^/]+\.tgz$' } | Select-Object -First 1
-  if (-not $tgzEntry) { throw "zip does not contain a dsh-memory-*.tgz at its root: $zip" }
+  if (-not $tgzEntry) { throw "zip does not contain a plugin .tgz at its root: $zip" }
 
   $unzipDir = Join-Path (Split-Path -Parent $zip) (([System.IO.Path]::GetFileNameWithoutExtension($zip)) + '.unpacked')
   if (-not $Apply) {
     $version = $null
     if ($tgzEntry -match '-(?<v>\d+\.\d+\.\d+[^/]*)\.tgz$') { $version = $Matches['v'] }
-    $pluginDir = if ($version) { Join-Path (Join-Path $dshHome 'plugins') "dsh-memory-$version" } else { Join-Path (Join-Path $dshHome 'plugins') 'dsh-memory-<version>' }
+    # Package name is whatever precedes -<version> in the tgz name (npm pack strips the scope),
+    # so a renamed/scoped package still previews the right target directory.
+    $pkgFromTgz = $tgzEntry -replace '-\d+(\.\d+)*[^/]*\.tgz$', ''
+    $pluginDir = if ($version) { Join-Path (Join-Path $dshHome 'plugins') "$pkgFromTgz-$version" } else { Join-Path (Join-Path $dshHome 'plugins') "$pkgFromTgz-<version>" }
     Say "      zip: would expand $zip -> $unzipDir, then install $tgzEntry -> $pluginDir"
-    return [pscustomobject]@{ Dir = $pluginDir; Name = $null; Version = $version; Reused = $false }
+    return [pscustomobject]@{ Dir = $pluginDir; Name = $pkgFromTgz; Version = $version; Reused = $false }
   }
 
   Say "      zip: expanding -> $unzipDir" 'Yellow'
