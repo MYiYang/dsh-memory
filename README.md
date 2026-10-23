@@ -9,29 +9,30 @@
 - **安装（三种路径）**：[dsh-memory/INSTALL.md](dsh-memory/INSTALL.md)
 - 设计与实现细节：[dsh-memory/DESIGN-v2.md](dsh-memory/DESIGN-v2.md)
 - **全局记忆失效审计**（为什么「标了全局」还会忘）：[dsh-memory/AUDIT-global-recall.md](dsh-memory/AUDIT-global-recall.md)
-- **发版指南**：[PUBLISH.md](PUBLISH.md)
+- 发版流程属维护者内账，本地保存、不入库。
 
 ## 安装（给人看的三个入口）
 
-已发布版本：[v0.4.2](https://github.com/MYiYang/dsh-memory/releases/tag/v0.4.2)
+已发布版本：npm [`dsh-memory-layered@0.6.0`](https://www.npmjs.com/package/dsh-memory-layered) · GitHub [v0.6.0](https://github.com/MYiYang/dsh-memory/releases/tag/v0.6.0)
 
 ```powershell
-# A. CLI：直装 Release 里的 tarball（再把 dsh-memory 加进 profile 的 dsh.profile.bundles 后重启）
-dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.4.2/dsh-memory-0.4.2.tgz
+# A. npm（推荐）：GUI 侧栏「插件」→「添加插件」→ 输包名；或
+dsh plugin --profile web add dsh-memory-layered
+# 再把 dsh-memory-layered 加进 profile 的 dsh.profile.bundles，重启
 
-# B. GUI：侧栏「插件」→「添加插件」→ 粘上面这条 URL（自动选入 bundles，不用手改 JSON）
+# B. GitHub Release 里的 tarball（粘进 GUI 也行）
+dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.6.0/dsh-memory-layered-0.6.0.tgz
 
-# C. 离线：下 [dsh-memory-0.4.2.zip](https://github.com/MYiYang/dsh-memory/releases/download/v0.4.2/dsh-memory-0.4.2.zip)
-#    → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.2.tgz
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.2.tgz -Apply
+# C. 离线：下 dsh-memory-layered-0.6.0.zip → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz -Apply
 ```
 
 | 场景 | 一句话 |
 | --- | --- |
 | GUI | 侧栏「插件」→「添加插件」→ 输包名 / tarball URL / 本地路径 → 重启 |
 | CLI | `dsh plugin --profile web add <spec>`，再把包名加进 `~/.dsh/profiles/<p>/package.json` 的 `dsh.profile.bundles` → 重启（**只 add 不激活**） |
-| 离线 | 下载 Release 里的 `dsh-memory-<ver>.zip` → `pwsh -File .\install.ps1 -From .\dsh-memory-<ver>.tgz -Apply` → 重启 |
+| 离线 | 下载 Release 里的 `dsh-memory-layered-<ver>.zip` → `pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz -Apply` → 重启 |
 
 技能由插件在 `apply()` 里用 `ctx.skills.registerProvider` 以 **rank 600** 注册，**不需要**手工拷 `~/.dsh/skills`；
 如果你自己 `~/.dsh/skills` 里有同名技能（rank 400），那是你那份赢——见 INSTALL.md 的故障表。
@@ -57,7 +58,7 @@ git push origin main --tags                   # 触发 .github/workflows/release
 
 没有 gh CLI、想手工挂附件也行：`dist\` 里的 `.tgz` / `.zip` / `SHA256SUMS.txt` / `manifest.json` 四个文件传上去即可。
 本地一把梭：`pwsh -File .\scripts\release-github.ps1`（默认只构建+打印清单，加 `-Create` 才打 tag 并尝试 `gh release create`）。
-细节见 [PUBLISH.md](PUBLISH.md) §4.2。
+发版细节由维护者在本地留档，不入库。
 
 ## 仓库结构
 
@@ -70,7 +71,6 @@ scripts/
   profile-plugin.mjs # 把包注册成某个 profile 的 bundle（包名无关，支持 scoped）
   release-github.ps1 # 本地发版助手（构建 + 校验 + tag/gh release）
 install.ps1          # 安装器：源码 / -From <tgz|zip|目录> 离线安装，幂等 + 备份
-PUBLISH.md           # 发布指南（npm / GitHub Release / 私服 三条通道）
 ```
 
 ## 许可

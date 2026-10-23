@@ -23,5 +23,8 @@
 /tests_scan*.mjs
 /TencentDB-Agent-Memory-分析报告.md
 
+# 维护者内部账：发版口令、账号、绕坑路径 —— 只在本地，不入库、不上云
+/PUBLISH.md
+
 # scratch: local db backups and replay artifacts
 /.tmp/

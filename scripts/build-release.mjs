@@ -21,7 +21,7 @@
  * `--name` only labels the build (console output + manifest.json) for the case
  * where the package is renamed/scoped before publishing; it never rewrites
  * `dsh-memory/package.json`, so it cannot collide with the docs/lead edits.
- * Rename the package in package.json yourself (see PUBLISH.md), then rebuild.
+ * Rename the package in package.json yourself (the maintainer's release notes stay local, not committed), then rebuild.
  */
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
