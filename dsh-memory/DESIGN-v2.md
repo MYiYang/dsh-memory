@@ -906,3 +906,31 @@ pipeline（L1 `reason=ok`，store 9；L2 三个场景 11:23:05 正常改写）�
 
 **未验证项（需加载 0.5.4）**：`reasoningEffort:'low'` 是否被 workbuddy 适配器接受、以及 4000 预算 + low 档是否足以产出
 700 字画像。若仍失败，`l3-last-detail.attempts` 会逐条给出 ok/finish/chars，下一步按实际值再调。
+
+### 23.11 低推理档生效，但模型写超长：压缩回合 + 行边界裁剪（2026-10-23 11:36）
+
+**0.5.4 实测（重启后直接 `memory_compact {scope:'project'}`）**：
+
+```json
+{ "reason": "written", "chars": 2624, "rawChars": 2624, "attempts": [
+  { "tokens": 4000, "effort": "low", "ok": true, "finish": "stop", "chars": 2671 } ] }
+```
+
+- `effort:"low"` **被接受**，`finish:"stop"`、产出 2671 字 → **0.5.4 之前那次「chars=0 / max-tokens」的死结解开了**；
+- 但模型把「长度硬性上限 700 字」当耳旁风，实际写了 2624 字，被 `maxChars=1200` 硬切，长度超预算 →
+  场景导航又被挤出去（`has 场景导航: false`）。
+
+**0.5.5 改法（两层兜底，先质量后确定性）**：
+
+1. **压缩回合**：首轮 `body` 超过 `targetChars` 时，追加一次专门的压缩调用
+   （`buildPersonaCompressPrompt`：保留小标题结构、优先命令/路径/约束、删重复），成功则用压缩结果；
+2. **行边界裁剪**：压缩仍超长（或压缩调用失败）时，`trimPersonaBody()` 按整行回退到 `targetChars`，
+   末尾加 `…`，绝不切断句子；结果与 `rawChars/trimmed` 一起记进 `l3-last-detail`；
+3. prompt 措辞从「约 N 字（硬上限 M 字）」改成「**长度硬性上限：N 字（超出部分会被直接截断丢弃）**」，
+   让模型先按硬约束写。
+
+**回归**：160 → **163** 项全绿（新增「压缩回合先于裁剪」「行边界裁剪」「超长画像落库前被收敛」三条）。
+
+**实测残留已清**：0.5.4 写出的 v7（1200 字）已恢复成整理好的 `v8/650`，场景导航回到注入里
+（cores 2 + 650 + 203 + 524 ≈ 1700 / 1800）。0.5.5 加载后再跑一次 `memory_compact` 即可看到
+「压缩回合 → 落库 ≈700 字」的完整闭环。

@@ -120,13 +120,64 @@ export function buildPersonaPrompt(facts, existing = {}, limits = 1200, scope = 
       existing.body ? `现有画像：\n${clip(existing.body, 900)}` : '现有画像：无',
       targetChars === null
         ? `目标长度：不超过 ${maxChars} 字。`
-        : `目标长度：约 ${targetChars} 字（硬上限 ${maxChars} 字）。写不下就删次要内容，不要为凑长度灌水。`,
+        : `长度硬性上限：${targetChars} 字（超出部分会被直接截断丢弃，只保留前几个小标题）。写不下就删次要内容，不要为凑长度灌水。`,
       '压缩要求：与「长期约定」或其他层重复的内容不要写；同一个意思只写一次；优先保留命令、路径、约束这类可执行信息。',
       '事实：',
       ...lines,
       '只输出约定的 JSON。',
     ].join('\n'),
   }
+}
+
+/**
+ * Build the "compress this persona" prompt used when the model overshoots the
+ * length target. A dedicated pass keeps the section structure and the
+ * executable details; a blind slice would cut the last sections off.
+ *
+ * @param {string} body
+ * @param {number} limit
+ * @returns {{ system: string, user: string }}
+ */
+export function buildPersonaCompressPrompt(body, limit) {
+  return {
+    system: PERSONA_SYSTEM,
+    user: [
+      `把下面这份画像压缩到不超过 ${limit} 字。`,
+      '要求：保留 Markdown 小标题结构；优先保留命令、路径、约束、硬规则这类可执行信息；删除重复、次要、过时内容；同一意思只写一次。',
+      '现有画像：',
+      clip(body, 4_000),
+      '只输出约定的 JSON。',
+    ].join('\n'),
+  }
+}
+
+/**
+ * Trim a persona body down to `limit` chars at a line boundary.
+ *
+ * The model treats "about N chars" as advice: asked for ~700 it happily wrote
+ * 2600. Cutting at maxChars then chops a sentence in half and, worse, still
+ * overflows the stable block. So the generator's answer is trimmed here, at the
+ * last whole line that fits, with an ellipsis marking the cut.
+ *
+ * @param {string} body
+ * @param {number} limit
+ * @returns {{ text: string, trimmed: boolean }}
+ */
+export function trimPersonaBody(body, limit) {
+  const text = String(body ?? '').trim()
+  const max = Math.max(1, Math.floor(limit))
+  if (text.length <= max) return { text, trimmed: false }
+  const kept = []
+  let used = 0
+  for (const line of text.split('\n')) {
+    const cost = line.length + 1
+    if (used + cost > max - 1) break
+    kept.push(line)
+    used += cost
+  }
+  let out = kept.join('\n').trim()
+  if (out === '') out = text.slice(0, Math.max(0, max - 1)).trim()
+  return { text: `${out}…`, trimmed: true }
 }
 
 /**
@@ -495,22 +546,54 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
     tried.push({ tokens: plan.maxTokens, effort: plan.reasoningEffort ?? 'default', ok: last.ok, finish: last.reason, chars: last.chars })
     if (body !== '') break
   }
-  track(db, usage)
   if (body === '') {
+    track(db, usage)
     const detail = { attempts: tried, error: last?.error ?? null, head: last?.head ?? '' }
     log('warn', `l3 persona rewrite produced nothing usable (${scope}): ${JSON.stringify(tried)}`)
     return finish('empty', detail)
   }
+  // The generator treats "about N chars" as advice (asked for ~700 it wrote
+  // 2_600). One dedicated compression pass keeps the important sections, and a
+  // line-boundary trim is the last-resort guard so the stored body always fits.
+  if (body.length > targetChars) {
+    const compressed = await askJson(llm, buildPersonaCompressPrompt(body, targetChars), {
+      maxTokens: Math.min(4_000, personaTokens),
+      reasoningEffort: effort,
+      timeoutMs: personaTimeoutMs,
+      sessionId: ctx.sessionId,
+      signal: ctx.signal,
+    })
+    if (compressed.usage) {
+      usage = usage === null
+        ? compressed.usage
+        : { inputTokens: Number(usage.inputTokens ?? 0) + Number(compressed.usage.inputTokens ?? 0), outputTokens: Number(usage.outputTokens ?? 0) + Number(compressed.usage.outputTokens ?? 0) }
+    }
+    const shorter = compressed.value && typeof compressed.value.body === 'string' ? compressed.value.body.trim() : ''
+    tried.push({ stage: 'compress', ok: compressed.ok, finish: compressed.reason, chars: compressed.chars, bodyChars: shorter.length })
+    if (shorter !== '' && shorter.length < body.length) body = shorter
+  }
+  track(db, usage)
+  const trimmed = trimPersonaBody(body, Math.min(maxChars, targetChars))
   const result = putPersona(db, {
     scope,
     project,
-    body: body.slice(0, maxChars),
+    body: trimmed.text,
     now,
   })
   setMeta(db, batchKey, 0)
   setMeta(db, 'l3-last-at', String(now))
   setMeta(db, 'l3-last-reason', `${label}:written`)
-  setMeta(db, 'l3-last-detail', JSON.stringify({ at: now, scope, project, reason: 'written', chars: body.length, forced: force, attempts: tried }))
-  log('info', `l3 persona rewritten (${scope} v${result.version}${force ? ', forced' : ''})`)
+  setMeta(db, 'l3-last-detail', JSON.stringify({
+    at: now,
+    scope,
+    project,
+    reason: 'written',
+    chars: trimmed.text.length,
+    rawChars: body.length,
+    trimmed: trimmed.trimmed,
+    forced: force,
+    attempts: tried,
+  }))
+  log('info', `l3 persona rewritten (${scope} v${result.version}${force ? ', forced' : ''}, ${trimmed.text.length}/${body.length} chars)`)
   return { rewritten: true, version: result.version, reason: 'written' }
 }

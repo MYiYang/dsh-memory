@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { migrate, getMeta, setMeta } from '../src/store.js'
 import { applyDecision } from '../src/l1.js'
 import { getPersona, listScenes, putPersona, upsertScene } from '../src/profile.js'
-import { buildPersonaPrompt, buildScenePrompt, runPersona, runScenes } from '../src/consolidate.js'
+import { buildPersonaPrompt, buildScenePrompt, runPersona, runScenes, trimPersonaBody } from '../src/consolidate.js'
 
 function setup() {
   const db = new DatabaseSync(':memory:')
@@ -287,8 +287,7 @@ test('an oversized persona is compacted on the spot, without asking the gate', a
   assert.equal(result.rewritten, true)
   assert.equal(result.version, 2)
   assert.equal(llm.calls.length, 1) // rewrite only: no gate call
-  assert.match(llm.calls[0].user, /约 120 字/)
-  assert.match(llm.calls[0].user, /硬上限 600 字/)
+  assert.match(llm.calls[0].user, /长度硬性上限：120 字/)
   assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).body, '## 用户偏好\n- 中文')
 
   // A persona inside the bloat band still goes through the normal gate path.
@@ -299,8 +298,7 @@ test('an oversized persona is compacted on the spot, without asking the gate', a
 
 test('the persona prompt asks for the target length and forbids duplication', () => {
   const prompt = buildPersonaPrompt([{ kind: 'work_fact', text: '用 pnpm' }], { body: '旧画像' }, { maxChars: 900, targetChars: 400 })
-  assert.match(prompt.user, /约 400 字/)
-  assert.match(prompt.user, /硬上限 900 字/)
+  assert.match(prompt.user, /长度硬性上限：400 字/)
   assert.match(prompt.user, /压缩要求/)
   // Without a target the old contract still holds.
   assert.match(buildPersonaPrompt([], {}, 800).user, /不超过 800 字/)
@@ -355,4 +353,49 @@ test('an empty max-tokens answer is retried with a bigger budget', async () => {
   assert.equal(detail.attempts[0].finish, 'max-tokens')
   // Retry accounting: both calls' usage landed on the shared counter.
   assert.equal(getMeta(db, 'l1_tokens_total'), '19')
+})
+
+test('an over-long persona is compressed by a second call before any trimming', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  const long = ['## 项目定位', ...Array.from({ length: 20 }, (_, i) => `- 很长的背景说明 ${i}`)].join('\n')
+  const short = '## 项目定位\n- 短内容'
+  const llm = fakeLlm([JSON.stringify({ body: long }), JSON.stringify({ body: short })])
+  const result = await runPersona(db, llm, { force: true, targetChars: 60, maxChars: 400 }, { project: 'menm', now: 2 })
+  assert.equal(result.reason, 'written')
+  assert.equal(llm.calls.length, 2) // generate + compress
+  assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).body, short)
+  const detail = JSON.parse(getMeta(db, 'l3-last-detail'))
+  assert.equal(detail.trimmed, false)
+  assert.equal(detail.attempts[detail.attempts.length - 1].stage, 'compress')
+})
+
+test('trimPersonaBody cuts at a line boundary and marks the cut', () => {
+  const body = ['## 用户偏好', '- 第一条偏好', '- 第二条偏好', '- 第三条偏好'].join('\n')
+  const full = trimPersonaBody(body, 200)
+  assert.deepEqual(full, { text: body, trimmed: false })
+  const cut = trimPersonaBody(body, 22)
+  assert.equal(cut.trimmed, true)
+  assert.ok(cut.text.length <= 22)
+  assert.ok(cut.text.startsWith('## 用户偏好'))
+  assert.ok(cut.text.endsWith('…'))
+  // A single line longer than the limit still yields something bounded.
+  assert.ok(trimPersonaBody('长'.repeat(50), 10).text.length <= 10)
+  assert.equal(trimPersonaBody('   ', 10).text, '')
+})
+
+test('an over-long persona answer is trimmed to the target before it is stored', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  // The live model wrote 2600 chars when asked for ~700; the stored row must not.
+  const long = ['## 用户偏好', ...Array.from({ length: 40 }, (_, i) => `- 第 ${i + 1} 条偏好说明`)].join('\n')
+  const llm = fakeLlm([JSON.stringify({ body: long })])
+  const result = await runPersona(db, llm, { force: true, targetChars: 120, maxChars: 600 }, { project: 'menm', now: 2 })
+  assert.equal(result.reason, 'written')
+  const stored = getPersona(db, { scope: 'project', project: 'menm' })
+  assert.ok(stored.body.length <= 120, `stored ${stored.body.length} chars`)
+  assert.ok(stored.body.startsWith('## 用户偏好'))
+  const detail = JSON.parse(getMeta(db, 'l3-last-detail'))
+  assert.equal(detail.trimmed, true)
+  assert.ok(detail.rawChars > detail.chars)
 })
