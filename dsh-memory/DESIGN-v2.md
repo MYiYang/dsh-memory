@@ -880,3 +880,29 @@ pipeline（L1 `reason=ok`，store 9；L2 三个场景 11:23:05 正常改写）�
 
 **自检残留已清**：测试用的 1448 字画像已改回 `v6/650`；备份在 `.tmp/memory-backup-20261023-112230/`。
 加载 0.5.3 后，用 `memory_compact` 直接重跑一次自检即可定论。
+
+### 23.10 画像重写失败的真正原因：输出预算被 reasoning 吃光（2026-10-23 11:31）
+
+**0.5.3 的观测第一次把失败讲清楚了**。重启后直接调 `memory_compact {scope:'project'}`，`l3-last-detail` 记录：
+
+```json
+{ "ok": false, "error": null, "finish": "max-tokens", "chars": 0, "head": "" }
+```
+
+`finish=max-tokens` + `chars=0`：模型把 3000 token 的预算全花在 reasoning 上，**可见文本一个字符都没产出**，
+所以 `parseJsonLoose('')` 为 null → `body` 空 → `empty`。这不是解析问题，是「预算全部被思考吃掉」。
+根因是 `agent-default-model` 里配的是 `reasoningEffort: max`，而插件调用 `llm.stream()` 时没有覆盖它。
+
+**0.5.4 改法**：
+
+1. `llm.complete()` 支持 `reasoningEffort` / `purpose` 透传（`GenerateOptions` 本来就有这两个字段）。
+2. 画像重写走**三段式**：① `personaReasoningEffort`（默认 `low`）+ `personaMaxTokens`（默认 4000）；
+   ② 同档推理、预算 ×4（上限 32000）；③ **去掉 effort**、预算 ×4（给不接受该 effort 的 provider 兜底）。
+   任一段拿到可用 `body` 即停，所有尝试都记进 `l3-last-detail.attempts`。
+3. `askJson` 的 consolidation 调用带 `purpose:'compaction'`，让适配器按「辅助调用」对待。
+4. 失败日志改为 `warn` 并输出整组 attempts，不再只有一句 reason。
+
+**回归**：159 → **160** 项全绿（新增「空答案 max-tokens 会加大预算重试」；「不可用答案留诊断」改为校验三段式记录）。
+
+**未验证项（需加载 0.5.4）**：`reasoningEffort:'low'` 是否被 workbuddy 适配器接受、以及 4000 预算 + low 档是否足以产出
+700 字画像。若仍失败，`l3-last-detail.attempts` 会逐条给出 ok/finish/chars，下一步按实际值再调。

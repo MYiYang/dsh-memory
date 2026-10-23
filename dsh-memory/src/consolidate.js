@@ -156,6 +156,8 @@ async function askJson(llm, prompt, options = {}) {
     user: prompt.user,
     maxTokens: options.maxTokens ?? 800,
     timeoutMs: options.timeoutMs,
+    reasoningEffort: options.reasoningEffort,
+    purpose: options.purpose ?? 'compaction',
     signal: options.signal,
     sessionId: options.sessionId,
   })
@@ -403,9 +405,21 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
     ),
   )
   // Reasoning models spend output budget before the JSON answer; a persona body
-  // is the longest thing this plugin asks for, so it needs the most headroom.
-  const personaTokens = Math.max(400, config.personaMaxTokens ?? 3_000)
+  // is the longest thing this plugin asks for. Measured live: at the model's
+  // configured `max effort` the whole 3000-token budget went to reasoning and
+  // the answer came back as `finish=max-tokens, chars=0`. So: ask for low effort
+  // first, then retry with a bigger budget, and finally fall back to the model
+  // default effort (a provider that rejects the id still gets a chance).
+  const personaTokens = Math.max(400, config.personaMaxTokens ?? 4_000)
   const personaTimeoutMs = Math.max(5_000, config.personaTimeoutMs ?? 120_000)
+  const effort = typeof config.personaReasoningEffort === 'string' && config.personaReasoningEffort !== ''
+    ? config.personaReasoningEffort
+    : 'low'
+  const personaAttempts = [
+    { reasoningEffort: effort, maxTokens: personaTokens },
+    { reasoningEffort: effort, maxTokens: Math.min(32_000, personaTokens * 4) },
+    { reasoningEffort: undefined, maxTokens: Math.min(32_000, personaTokens * 4) },
+  ]
   // Keep `l3-batches:<project>` unchanged for projects (existing installs have
   // it); the global persona gets its own key so the two never reset each other.
   const batchKey = scope === 'global' ? 'l3-batches:@global' : `l3-batches:${project}`
@@ -459,17 +473,32 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   }
 
   const prompt = buildPersonaPrompt(facts, current ?? {}, { maxChars, targetChars }, scope)
-  const answer = await askJson(llm, prompt, {
-    maxTokens: personaTokens,
-    timeoutMs: personaTimeoutMs,
-    sessionId: ctx.sessionId,
-    signal: ctx.signal,
-  })
-  track(db, answer.usage)
-  const body = answer.value && typeof answer.value.body === 'string' ? answer.value.body.trim() : ''
+  let body = ''
+  let usage = null
+  /** @type {Array<Record<string, unknown>>} */
+  const tried = []
+  let last = null
+  for (const plan of personaAttempts) {
+    last = await askJson(llm, prompt, {
+      maxTokens: plan.maxTokens,
+      reasoningEffort: plan.reasoningEffort,
+      timeoutMs: personaTimeoutMs,
+      sessionId: ctx.sessionId,
+      signal: ctx.signal,
+    })
+    if (last.usage) {
+      usage = usage === null
+        ? last.usage
+        : { inputTokens: Number(usage.inputTokens ?? 0) + Number(last.usage.inputTokens ?? 0), outputTokens: Number(usage.outputTokens ?? 0) + Number(last.usage.outputTokens ?? 0) }
+    }
+    body = last.value && typeof last.value.body === 'string' ? last.value.body.trim() : ''
+    tried.push({ tokens: plan.maxTokens, effort: plan.reasoningEffort ?? 'default', ok: last.ok, finish: last.reason, chars: last.chars })
+    if (body !== '') break
+  }
+  track(db, usage)
   if (body === '') {
-    const detail = { ok: answer.ok, error: answer.error, finish: answer.reason, chars: answer.chars, head: answer.head }
-    log('warn', `l3 persona rewrite produced nothing usable (${scope}): ok=${answer.ok} error=${answer.error ?? '-'} chars=${answer.chars}`)
+    const detail = { attempts: tried, error: last?.error ?? null, head: last?.head ?? '' }
+    log('warn', `l3 persona rewrite produced nothing usable (${scope}): ${JSON.stringify(tried)}`)
     return finish('empty', detail)
   }
   const result = putPersona(db, {
@@ -481,7 +510,7 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   setMeta(db, batchKey, 0)
   setMeta(db, 'l3-last-at', String(now))
   setMeta(db, 'l3-last-reason', `${label}:written`)
-  setMeta(db, 'l3-last-detail', JSON.stringify({ at: now, scope, project, reason: 'written', chars: body.length, forced: force }))
+  setMeta(db, 'l3-last-detail', JSON.stringify({ at: now, scope, project, reason: 'written', chars: body.length, forced: force, attempts: tried }))
   log('info', `l3 persona rewritten (${scope} v${result.version}${force ? ', forced' : ''})`)
   return { rewritten: true, version: result.version, reason: 'written' }
 }

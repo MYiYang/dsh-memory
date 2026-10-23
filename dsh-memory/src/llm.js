@@ -71,6 +71,8 @@ export function createLlmClient(ctx, config = {}, log = () => {}) {
    *   user: string,
    *   maxTokens?: number,
    *   timeoutMs?: number,
+   *   reasoningEffort?: string,
+   *   purpose?: 'compaction' | 'session-title',
    *   signal?: AbortSignal,
    *   sessionId?: string,
    * }} request
@@ -104,6 +106,8 @@ export function createLlmClient(ctx, config = {}, log = () => {}) {
         maxTokens,
         signal: controller.signal,
       }
+      if (request.reasoningEffort !== undefined) options.reasoningEffort = request.reasoningEffort
+      if (request.purpose !== undefined) options.purpose = request.purpose
       if (request.sessionId !== undefined) options.sessionId = request.sessionId
       const stream = service.stream(options)
       for await (const chunk of stream) {

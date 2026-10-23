@@ -25,6 +25,20 @@ function fakeLlm(texts) {
   }
 }
 
+/** A fake whose answers are whole response objects (for ok:false / max-tokens cases). */
+function fakeLlmSeq(responses) {
+  const calls = []
+  return {
+    available: true,
+    calls,
+    async complete(request) {
+      calls.push(request)
+      const next = responses.shift() ?? { ok: true, text: '{}', usage: null }
+      return { ok: false, text: '', reason: null, error: null, usage: null, ...next }
+    },
+  }
+}
+
 function fact(db, text, { kind = 'work_fact', scene = null, priority = 60, project = 'menm', scope, now = 1 } = {}) {
   return applyDecision(db, { op: 'store', kind, text, priority, scene }, { project, now, scope })
 }
@@ -314,9 +328,31 @@ test('an unusable persona answer is recorded instead of failing silently', async
   assert.equal(result.reason, 'empty')
   assert.equal(getMeta(db, 'l3-last-reason'), 'menm:empty')
   const detail = JSON.parse(getMeta(db, 'l3-last-detail'))
-  assert.equal(detail.ok, true)
-  assert.equal(detail.chars, '这段不是 JSON'.length)
+  // Three escalating attempts, all recorded: the diagnosis must survive the call.
+  assert.equal(detail.attempts.length, 3)
+  assert.equal(detail.attempts[0].effort, 'low')
+  assert.ok(detail.attempts[1].tokens > detail.attempts[0].tokens)
+  assert.equal(detail.attempts[2].effort, 'default')
   // The old persona must survive a failed rewrite untouched.
   assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).body, '## 用户偏好\n- 中文')
   assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).version, 1)
+})
+
+test('an empty max-tokens answer is retried with a bigger budget', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  const llm = fakeLlmSeq([
+    { ok: false, text: '', reason: 'max-tokens', error: null, usage: { inputTokens: 7, outputTokens: 0 } },
+    { ok: true, text: JSON.stringify({ body: '## 用户偏好\n- 中文' }), usage: { inputTokens: 7, outputTokens: 5 } },
+  ])
+  const result = await runPersona(db, llm, { force: true, personaMaxTokens: 400 }, { project: 'menm', now: 2 })
+  assert.equal(result.reason, 'written')
+  assert.equal(llm.calls.length, 2)
+  assert.equal(llm.calls[0].reasoningEffort, 'low')
+  assert.ok(llm.calls[1].maxTokens > llm.calls[0].maxTokens)
+  const detail = JSON.parse(getMeta(db, 'l3-last-detail'))
+  assert.equal(detail.attempts.length, 2)
+  assert.equal(detail.attempts[0].finish, 'max-tokens')
+  // Retry accounting: both calls' usage landed on the shared counter.
+  assert.equal(getMeta(db, 'l1_tokens_total'), '19')
 })

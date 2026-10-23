@@ -112,9 +112,14 @@ function resolveConfig(raw) {
       targetChars: number(persona.targetChars, 700, 120, 8000),
       globalTargetChars: number(persona.globalTargetChars, 240, 120, 8000),
       // The persona rewrite is the longest JSON answer this plugin asks for;
-      // reasoning tokens eat the budget first, so it gets its own (bigger) caps.
-      personaMaxTokens: number(persona.personaMaxTokens, 3000, 400, 16000),
+      // reasoning tokens eat the budget first, so it gets its own (bigger) caps
+      // and asks for low effort before falling back to the model default.
+      personaMaxTokens: number(persona.personaMaxTokens, 4000, 400, 16000),
       personaTimeoutMs: number(persona.personaTimeoutMs, 120000, 5000, 600000),
+      personaReasoningEffort:
+        typeof persona.personaReasoningEffort === 'string' && persona.personaReasoningEffort !== ''
+          ? persona.personaReasoningEffort
+          : 'low',
       // L3 also maintains a cross-project profile built from global facts.
       // It has its own batch counter and gate, so it never starves the project one.
       global: persona.global !== false,
