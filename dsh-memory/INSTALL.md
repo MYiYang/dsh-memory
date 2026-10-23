@@ -35,7 +35,7 @@
 
 1. 打开 dsh Web，左侧边栏 →「**插件**」；
 2. 页头按钮「**添加插件**」（或箭头「选择添加插件方式」→「安装第三方插件」），打开安装对话框；
-3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.6.0`），回车；
+3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.6.1`），回车；
    - 对话框也接受 **Git 地址、压缩包 URL、本地绝对路径**；
    - 安装进度对话框里可以「查看安装任务」「取消安装」；
 4. 等它跑完 → **重启 DSH**。
@@ -56,9 +56,9 @@ dsh plugin --profile web add dsh-memory-layered
 
 | spec 形式 | 例子 |
 | --- | --- |
-| registry 包名（可带版本/标签） | `dsh-memory-layered@0.6.0` |
+| registry 包名（可带版本/标签） | `dsh-memory-layered@0.6.1` |
 | git https 地址 | `https://github.com/<you>/<repo>` |
-| tarball URL | `https://github.com/<you>/<repo>/releases/download/v0.6.0/dsh-memory-layered-0.6.0.tgz` |
+| tarball URL | `https://github.com/<you>/<repo>/releases/download/v0.6.1/dsh-memory-layered-0.6.1.tgz` |
 | 本地目录 | `file:F:\path\to\dsh-memory` 或 `link:F:\path\to\dsh-memory` |
 
 没装桌面版、只有 CLI 的话，用 npx 跑同一个命令（共用同一个 `~/.dsh`，profile 也是同一个）：
@@ -75,7 +75,7 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "dsh-memory-layered": "^0.6.0"
+    "dsh-memory-layered": "^0.6.1"
   },
   "dsh": {
     "profile": {
@@ -97,11 +97,11 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
 
 ### 路径 C：离线包（内网 / 没有 registry / 不想动 pnpm）
 
-从 Release 下载 `dsh-memory-layered-0.6.0.zip`，解压后在该目录执行：
+从 Release 下载 `dsh-memory-layered-0.6.1.zip`，解压后在该目录执行：
 
 ```powershell
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz            # 1) dry-run：只打印要做什么，不写任何文件
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz -Apply     # 2) 真装
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz            # 1) dry-run：只打印要做什么，不写任何文件
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply     # 2) 真装
 ```
 
 > 离线目录里**必须带 `-From`**：不带时脚本按「从源码仓库安装」处理，会去找同目录的 `dsh-memory\` 源码而报错。

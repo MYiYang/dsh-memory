@@ -13,7 +13,7 @@
 
 ## 安装（给人看的三个入口）
 
-已发布版本：npm [`dsh-memory-layered@0.6.0`](https://www.npmjs.com/package/dsh-memory-layered) · GitHub [v0.6.0](https://github.com/MYiYang/dsh-memory/releases/tag/v0.6.0)
+已发布版本：npm [`dsh-memory-layered@0.6.1`](https://www.npmjs.com/package/dsh-memory-layered) · GitHub [v0.6.1](https://github.com/MYiYang/dsh-memory/releases/tag/v0.6.1)
 
 ```powershell
 # A. npm（推荐）：GUI 侧栏「插件」→「添加插件」→ 输包名；或
@@ -21,11 +21,11 @@ dsh plugin --profile web add dsh-memory-layered
 # 再把 dsh-memory-layered 加进 profile 的 dsh.profile.bundles，重启
 
 # B. GitHub Release 里的 tarball（粘进 GUI 也行）
-dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.6.0/dsh-memory-layered-0.6.0.tgz
+dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.6.1/dsh-memory-layered-0.6.1.tgz
 
-# C. 离线：下 dsh-memory-layered-0.6.0.zip → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.0.tgz -Apply
+# C. 离线：下 dsh-memory-layered-0.6.1.zip → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply
 ```
 
 | 场景 | 一句话 |

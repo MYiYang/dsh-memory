@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-layered",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Layered cross-session memory for DeepSeek Harness: L0 raw turns, L1 LLM-extracted facts with conflict resolution, L2 scenes with maxScenes eviction, L3 project + global persona, hybrid FTS + local 384-dim lexical vectors with an inverted pre-filter, plus recall injection and memory_search / memory_save / memory_extract tools",
   "type": "module",
   "main": "index.js",
