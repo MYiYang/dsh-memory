@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { apply } from '../index.js'
 import { openDatabase, saveMemory } from '../src/store.js'
 import { appendTurn, pendingCount } from '../src/l0.js'
@@ -80,6 +80,7 @@ test('turn/end writes L0 and a threshold trigger extracts facts end to end', asy
   ])
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 1, idleMs: 60_000, provider: 'fake', model: 'fake' },
     scenes: { enabled: false },
@@ -115,6 +116,7 @@ test('memory_extract tool forces a run and reports status', async () => {
   const { ctx, handlers, tools } = fakeCtx([[{ kind: 'work_fact', text: '数据库是 MySQL', priority: 60 }]])
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 100, idleMs: 60_000, provider: 'fake', model: 'fake' },
     scenes: { enabled: false },
@@ -132,6 +134,7 @@ test('memory_compact rewrites the persona on demand, bypassing the gate', async 
   const { ctx, tools, calls } = fakeCtx([], { persona: '## 用户偏好\n- 中文（刷新手）' })
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 100, idleMs: 60_000, provider: 'fake', model: 'fake' },
     scenes: { enabled: false },
@@ -170,6 +173,7 @@ test('memory_extract all drains the backlog of inactive sessions after a restart
   ])
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 100, idleMs: 60_000, provider: 'fake', model: 'fake' },
     scenes: { enabled: false },
@@ -199,6 +203,7 @@ test('enabled L2/L3 turns facts into a scene block and a persona', async () => {
   )
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 1, idleMs: 60_000, provider: 'fake', model: 'fake', maxMemories: 5 },
     scenes: { enabled: true, minFacts: 2 },
@@ -235,6 +240,7 @@ test('enabled L3 also maintains the global persona next to the project one', asy
   )
   apply(ctx, {
     dbPath,
+    settingsPath: join(dirname(dbPath), 'settings.json'),
     capture: false,
     extraction: { everyN: 1, idleMs: 60_000, provider: 'fake', model: 'fake' },
     scenes: { enabled: false },

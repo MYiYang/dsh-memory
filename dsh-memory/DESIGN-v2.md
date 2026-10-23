@@ -961,3 +961,244 @@ pipeline（L1 `reason=ok`，store 9；L2 三个场景 11:23:05 正常改写）�
 
 **部署说明**：0.5.6 不是修 bug，只是质量优化；当前 live 画像已恢复成整理版 `v10/650`，
 **不需要为它专门重启**——下次重启自然生效，届时下一次画像重写会先走压缩回合、必要时再按小节裁剪。
+
+## 24. 动态配置与设置页（2026-10-23）
+
+> 这节回答四件事：为什么这些参数**能不重启就改**、设置写在哪、怎么校验与合并、路由对外暴露时怎么防跨站。
+
+### 24.1 问题
+
+| # | 事实 | 后果 |
+| --- | --- | --- |
+| 1 | 所有参数只能写在 profile 的 `cordis.patch.yml` / bundle 行 config 里 | 改一个 `maxItems` 也要改文件 + 重启 DSH |
+| 2 | 46 个参数分散在 8 个嵌套段，没有校验与反馈 | 写错只是静默回落默认值，用户以为改生效了 |
+| 3 | 只有 `memory_stats` 的文本输出末尾带 `path=` | 用户不知道记忆库/设置文件到底在哪、有多大 |
+| 4 | 没有 UI，`settings.section` 里没有记忆这一栏 | 「临时关掉捕获/召回」只能改配置重启或卸载插件 |
+| 5 | 参数只存在 YAML 一处 | 用户改过的值与「profile 基线」无法区分，也没有「恢复默认」的入口 |
+
+### 24.2 三层配置：默认 < YAML < 设置页
+
+```text
+resolveConfig 内置默认值        （src/settings.js：46 个字段各一份）
+  < loader 行 config            （cordis.patch.yml / bundle insert config）
+    < $DSH_HOME/memory/settings.json   （设置页写的，只含显式改过的 key）
+```
+
+- **默认值单源**：`resolveConfig` 从 `index.js` 搬到 `src/settings.js`，字段目录里的 `default` 由 `resolveConfig({})` 推导，所以「设置页显示的默认值」与「插件启动时真正用的值」不可能漂移。
+- **设置文件与 `dbPath` 解耦**：固定 `$DSH_HOME/memory/settings.json`。若跟着 `dbPath` 走，把库挪到别处会让「挪库」这条设置本身丢失。需要重定向时用 loader 行 config 的 `settingsPath`（测试/打包口子，不暴露给 UI）。
+- **合并顺序**：`deepMerge(loaderRaw, storedSettings)` 得到原始合并对象，再交给 `resolveConfig` 归一化。深合并意味着 YAML 里写全的 `extraction` 段与设置页只改的 `extraction.everyN` 可以共存；标量/数组整体覆盖，后者赢。
+- **来源判定**（`collectSources`）：settings 层里出现过该 key → `settings`；否则 YAML 里出现过 → `config`；否则 `default`。UI 的「来源徽标」就是它。注意「填一个和默认值相同的数」同样算 `settings` —— 想回默认必须 `unset`。
+
+### 24.3 为什么能原地生效
+
+`apply()` 里的 `config` 是 `resolveConfig(...)` 返回的普通对象，召回（`agent/pre-step`）、捕获（`session/event`）、工具都在闭包里反复读它的**属性**，所以改属性就等于改行为：
+
+| 读取点 | 每次何时读 | 改完何时生效 |
+| --- | --- | --- |
+| `config.maxItems/maxChars/minScore/scope/injectGlobalFacts/stableMaxChars`、`core.*`、`layers.*`、`scenes.halfLifeDays` | 每个 `agent/pre-step` | 下一轮 |
+| `config.capture`、`layers.l0` | 每个 `session/event` | 下一轮 |
+| `config.vector.*` | 每次 `recall()` | 下一次召回 |
+| `config.persona.*`、`scenes.*` | 每批 L2/L3 任务 | 下一批 |
+
+两个**构造时拷贝**的例外，保存后由宿主显式推一把：
+
+- `pipeline` 在 `createPipeline` 里 `cfg = { ...PIPELINE_DEFAULTS, ...config.extraction }` → 新增 `pipeline.refresh()` 重新从 `options.config.extraction` 同步（`src/pipeline.js`）。
+- `scheduler` 构造时复制 `everyN/idleMs` → 新增 `scheduler.configure({ everyN, idleMs })`（`src/scheduler.js`）。**已 armed 的 idle 定时器保留原延迟**：保存时清掉它会丢掉这次兜底触发，下一轮结束自然按新值重排。
+
+写入用 `writePath`（`src/settings.js`）逐字段赋值，并且**保留中间对象的引用**：把整个 `config.extraction` 换成新对象，`pipeline` 里已经拿到的引用就与后续更新脱钩了。
+
+**五个字段不能热改**（`live:false`）：
+
+| key | 为什么 |
+| --- | --- |
+| `storage.dbPath` | 数据库句柄在 `apply()` 打开，换路径=换库 |
+| `skills.enabled` / `skills.dir` | 技能在 `apply()` 注册进宿主技能表，生命周期与插件 fiber 绑定 |
+| `extraction.provider` / `extraction.model` | LLM 客户端在 `apply()` 解析一次模型路由 |
+
+它们的 `state` 里同时给 `value`（合并后、下次启动会用）与 `active`（运行中实例实际在用），两者不同 = 改了但还没重启；保存响应把它们列进 `restartRequired`，不假装生效。
+
+一条**只在启动时成立的前置条件**：抽取管线（`pipeline`/`scheduler`/LLM 客户端）只有在 `apply()` 时满足 `layers.l1 && extraction.enabled && 能解析到 provider/model` 才会创建。启动时就是关的，设置页把开关打开也不会凭空造出管线（`pipeline === null`，`pipeline?.refresh()` 是空操作），只有保存后的字段值变了；要真的开始抽取得重启。`state.runtime.extraction.{available,scheduled}` 就是把这个事实摊开，页面暂未渲染它。
+
+不采用「保存后 dispose + 重新 apply」：那会丢会话级注入状态（`stableInjected`/`globalIds`）、可能中途关库、还会让工具注册表短暂消失；为了 5 个字段不值得，重启是更诚实的语义。
+
+### 24.4 设置文件
+
+```json
+{
+  "version": 1,
+  "updatedAt": "2026-10-23T08:00:00.000Z",
+  "settings": {
+    "maxItems": 8,
+    "core": { "enabled": false },
+    "extraction": { "everyN": 10 },
+    "dbPath": "D:\\dsh\\memory.db"
+  }
+}
+```
+
+- `settings` 的形状 = **loader 行 config 的形状**，不是 UI 分组名：`recall.maxItems` → 顶层 `maxItems`，`storage.dbPath` → 顶层 `dbPath`。这样同一段 JSON 可以直接粘进 `cordis.patch.yml` 的 `config:`，也让 `deepMerge` 与 `resolveConfig` 直接复用启动时的同一套代码。
+- 写入 `writeSettingsFile`：`mkdir -p` → 写 `settings.json.tmp` → `rename` 原子替换；失败时尽力删掉临时文件，并把错误交给上层（→ 500 `io-error`）。
+- 读取 `readSettingsFile`：文件不存在 → `exists:false, settings:{}`；不是合法 JSON / 顶层不是对象 / 超过 1 MB → `settings:{}` + `error`（**不抛**，插件照常启动，原因显示在设置页 `storage.error`）。读回时剔除 `version`/`updatedAt`，避免它们混进配置合并。
+- 兼容手写：顶层没有 `settings` 包装时，整个对象当作 settings 层。
+- 删除文件 / 点「恢复 YAML 基线」= 清空这一层，回到 YAML + 默认（`clearSettingsFile`）。
+
+### 24.5 校验与合并算法
+
+`POST /memory/api/save` 一次请求走完下面 6 步，任一步失败都**不落盘、不动内存**：
+
+| # | 步骤 | 实现 | 失败语义 |
+| --- | --- | --- | --- |
+| 1 | 校验 `patch` | `validatePatch`：逐个 key 查 `FIELDS`；`number` 非数字才报错、越界**夹到 [min,max]**；`text` trim + ≤500 字；`enum` 白名单；`boolean` 严格 | 收集**全部**错误后一次性 400，`message` 是 `key: message` 用 `; ` 连接 |
+| 2 | 校验 `unset` | `validateUnset`：必须是字符串数组且 key 在 `FIELDS` 里 | 同上 400 |
+| 3 | 转成 config 形状 | `toNested(flat)` 用字段的 `path` 写嵌套对象 | — |
+| 4 | 合并到 settings 层 | `deepMerge(storedSettings, toNested(...))`，再按 `unset` 逐个 `deletePath`（顺带清掉空对象） | — |
+| 5 | 重新归一化 | `resolveConfig(mergeRaw(loaderRaw, nextStored))` | 归一化不会抛（`number` 有 fallback） |
+| 6 | **先落盘，再应用** | `writeSettingsFile` → `applyLiveConfig(config, next)` → `pipeline.refresh()` → `scheduler.configure()` | 落盘失败 → 500 `io-error`，内存与磁盘都不变 |
+
+为什么先落盘：页面、`state` 与下次启动必须一致。先改内存再写盘，一旦写失败，运行中的行为与下次启动就会分叉（页面显示已生效、重启又变回去）。
+
+为什么数字越界夹取而不是报错：控件本来就是滑块/步进，正常操作不可能越界；粘贴一个 `999` 时夹到上限比拒绝更符合预期。但**未知 key / 类型错 / 枚举外**必须报错——那是客户端或人手写 YAML 的错误，静默接受只会更难查。
+
+`reset` 复用同一套尾部逻辑：`keys` 为空 → `clearSettingsFile`；给了 keys → 从 settings 层删除这些 `path`，删空也清文件；随后同样 `applyLiveConfig + refresh + configure`。
+
+### 24.6 路由：POST-only + 惰性挂载 + 连接信任
+
+`src/api.js` 只做「一个前缀路由 + 方法表」，业务在 `index.js`：
+
+| 检查顺序 | 行为 | 为什么是这个顺序 |
+| --- | --- | --- |
+| 1. 连接信任 `admits(req)` | 不通过 → 403 `forbidden` | 未受信任的调用方连「有哪些方法」都不该知道 |
+| 2. `req.method !== 'POST'` | → 405 `method-not-allowed` | 跨站 `<form>`/`<img>` 只能发 GET/form-urlencoded，发 `application/json` 会触发 CORS 预检；同源页面 `fetch` 不受影响 |
+| 3. 路径前缀 `/memory/api/` | 不匹配 → 404 `not-found` | 前缀路由被宿主交给本插件时才可能进来 |
+| 4. 方法名在方法表里 | 否 → 404 `not-found` | 避免把「方法不存在」与「参数错」混成一个码 |
+| 5. 读 body | 非 JSON / 非 object / > 64 KB → 400 `bad-request` | 这里的 payload 都是几百字节的小对象 |
+| 6. 执行 handler | 业务错 → 对应 code；`TypeError`/`RangeError` → 500 `internal` + 稳定文案 | 编程错误不该把堆栈泄露给页面，细节只进日志 |
+
+- **惰性挂载**：插件主 `inject` 只有 `['tools','agents','sessions']`，路由在 `ctx.effect` 里用 `ctx.inject(['webServer'], webCtx => webCtx.effect(() => webCtx.webServer.register(apiRoute)))` 单独等 `webServer`，返回的 fiber 随插件释放时 dispose。纯 CLI / headless profile 没有 `webServer` 时路由根本不挂载，记忆、工具、注入全部照常——插件不会因为「没有 GUI」而加载失败；宿主没有 `ctx.inject`（很老的版本）时同样跳过挂载，挂载过程抛错只 warn 一行。
+- **连接信任**：`admits` 读 `ctx.get('connection')?.requestRejection(req)`，`undefined` 才算可信；没有 `connection` 服务（自托管/测试宿主）时放行。拒绝时返回 403 且**不解释**原因。
+- **响应**：`content-type: application/json; charset=utf-8`、`cache-control: no-store`；成功 `{ok:true,value}`，失败 `{ok:false,error:{code,message}}`，`code` 稳定、`message` 可展示给用户。
+- **不挂 CORS 头**：页面与路由同源，允许跨源只会扩大攻击面。
+
+### 24.7 前端契约（`client.js`）
+
+- 单文件、无构建：`window.__ModuleLoader__.load({ id: 'dsh-memory-layered', factory(require) })`，`require('react')` + `React.createElement`（无 JSX）；数据弹窗额外尝试 `require('react-dom')` 的 `createPortal`（解析不到就退化为内联 fixed 定位）。
+- 注册一个 `settings.section` occupant（id `memory`），只调 `/memory/api/{state,save,reset,reveal}`，**不读 DOM、不碰别家状态、不自己决定默认值**。
+- host 是唯一真相：保存/重置后直接用响应里的 `state` 重渲染；页头「刷新」重新拉 `state`，别处改的 YAML 也能看到。
+- 文案中英双语，字段标签/说明按 **host 的 field key** 索引；新增一个字段 = `src/settings.js` 加一行 + 字典加两条，页面自动出现。
+- 请求 15 秒超时（挂死的请求不能冻住设置页）；样式只用 `--dsw-alias-*` 主题 token（带回退），单 `<style data-plugin-css="dsh-memory/section">`。
+
+### 24.8 失败降级
+
+| 失败 | 行为 |
+| --- | --- |
+| `settings.json` 损坏 / 超大 / 顶层不是对象 | 读回 `{}`，warn 一行，插件照常启动，页面 `storage.error` 显示原因 |
+| 写 `settings.json` 失败（只读、占用、杀软） | 500 `io-error`，内存配置保持原样；页面提示保存失败 |
+| 没有 `webServer`（headless） | 路由不挂载，其余功能照常 |
+| 没有 `connection` 服务 | 信任校验放行（本地/测试宿主） |
+| `reveal` 调不起文件管理器 | spawn 抛错 → `{opened:false,error}`；文件管理器异步启动失败只记 warn（`opened` 仍为 true）。页面提示「已打开存储目录」不代表窗口一定出现，路径始终可复制 |
+| 数据库打不开 | `dbReady=false`；`state.stats` 返回全 0，设置页仍可读可写参数 |
+| 设置页请求失败/超时 | 页面显示错误 + 「重试」，已渲染的内容保留 |
+
+### 24.9 手工核对
+
+```powershell
+# 读全量状态（桌面版启用连接信任时，未带浏览器会话的请求会被 403 —— 这是预期）
+$state = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:<port>/memory/api/state -ContentType 'application/json' -Body '{}'
+$state.value.storage.dir
+$state.value.groups | ForEach-Object { $_.id + ': ' + $_.fields.Count }
+
+# 改一个立即生效的参数，再读回来
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:<port>/memory/api/save -ContentType 'application/json' -Body '{"patch":{"recall.maxItems":8}}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:<port>/memory/api/reset -ContentType 'application/json' -Body '{}'
+```
+
+> 设置页是 dsh Web 界面的一部分，端口随本次启动而变（桌面版窗口里跑的就是它）；插件不额外提供 CLI。
+
+### 24.10 行为用例
+
+两个测试文件覆盖这一层的可判定行为，全部在 `mkdtempSync` 的临时目录里跑，不碰真实 `~/.dsh`、不监听端口、不 spawn 真实进程（`revealDirectory` 注入 fake spawn，`/memory/api/reveal` 不在测试里调用）：
+
+**`test/settings.test.js`**（纯函数 + 文件层）
+
+| 分组 | 覆盖点 |
+| --- | --- |
+| 字段目录 | 每个 `default` 都等于 `resolveConfig({})` 在同一 `path` 上的值；key 唯一、group 存在、类型元数据完整；重启项恰好那 5 个 |
+| 校验 | 数字钳位（`100 → 20`、`-5 → 0`）、数字字符串接受、`text` 裁剪与 ≤500、enum 空串合法；错误类型/未知 key/非对象 `patch` 被拒且不进 `flat` |
+| 合并 | `mergeRaw` 的 settings > loader > 默认、深合并嵌套段、不改入参；`collectSources` 三态来源；`undefined` 不算「设置过」 |
+| 原地生效 | `applyLiveConfig` 只写 live 字段、`config.extraction/core/layers` 引用不变、`applied` 只列真正变化的 key、重启项只报告不应用 |
+| 设置文件 | 缺失/损坏/非对象/超 1 MB 的读回降级；`{settings}` 包装与裸对象；原子写可读回、不残留 `.tmp`、覆盖写不残留旧 key；删除语义 |
+| 存储目录 | `describeStorage` 的文件列表/体积/`settingsExists`、缺目录不算错误 |
+| 打开目录 | 三平台命令（`explorer.exe`/`open`/`xdg-open`）、同步抛错 → `opened:false`、异步 ENOENT 只记 warn |
+
+**`test/settings-route.test.js`**（stub cordis context 跑真实 `apply()`，再让真实 POST 请求穿过 handler）
+
+| 分组 | 覆盖点 |
+| --- | --- |
+| 挂载与 state | `ctx.inject(['webServer'])` 注册 prefix 路由；`state` 的 `plugin/storage/stats/runtime/groups` 结构；分组顺序；字段元数据；空请求体可用 |
+| 启动期优先级 | settings 层盖过 YAML（`source=settings`）、YAML 盖过默认（`source=config`）、坏设置文件照常启动并在 `storage.error` 报错 |
+| save | 动态字段立即生效（关掉 `capture` 后下一轮真的不落库）、只落盘改过的 key、重复保存 `applied=[]`、`unset` 回默认并剪掉空分组 |
+| 重启项 | `storage.dbPath` 的 `applied=[]` / `restartRequired` / `value` vs `active` / 运行中存储卡片仍指旧库 / 照样落盘 |
+| reset | 全量：删文件、回到 YAML/默认；`keys`：只退指定字段，其余覆盖保留 |
+| 错误码 | 校验失败 400 且不落盘、未知方法 404（含 `state/extra`）、非 POST 405、非法 JSON 与非对象 400、超 64 KB 400、`requestRejection` 拒绝时 403 且先于方法校验 |
+
+## 25. 记忆数据弹窗：设置页里的行级 CRUD（源码，2026-10-23）
+
+### 25.1 问题
+
+设置页只能改参数，看得到「共 N 条」却看不到 N 是什么，更删不掉一条记错的记忆。此前唯一的行级入口是模型工具
+（`memory_search` / `memory_forget`），用户得让模型代劳；`memory_save` 还只允许 `fact`/`note`，无法修正类型或置顶。
+
+### 25.2 形态
+
+「记忆数据」卡片（统计卡下面）→「管理数据」→ 覆盖视口的弹窗：
+
+- **查**：标题/正文/标签子串搜索（LIKE，2 字中文可命中）；类型/范围/项目三个下拉的选项与计数来自 `facets`；「含已取代」开关；每页 20 条，服务端分页。
+- **增/改**：同一个表单（正文必填、标题、类型、范围、项目、标签、优先级、常驻），编辑时额外显示最近 10 条旧正文。
+- **删**：行上删除 + `window.confirm` 二次确认。
+- 所有请求走 `POST /memory/api/{memories,memory,memoryCreate,memoryUpdate,memoryDelete}`；成功/失败提示都在弹窗内，不打断设置页的参数编辑状态。
+
+### 25.3 为什么 CRUD 落在 `src/data.js` 而不是 `index.js`
+
+- 页面只认 camelCase JSON，schema（`superseded_by` / `vec_model` / `memory_features`）不外泄；
+- 手工编辑必须复用抽取管线的全部不变量，不能另开一条「只 UPDATE 文本」的捷径；
+- 纯函数 `(db, payload) => result` 才能用 `mkdtempSync` 的临时库单测，不需要 cordis context。
+
+### 25.4 不变量
+
+| 动作 | 必须发生什么 |
+| --- | --- |
+| 新增 | 写 `memory` 行 → FTS 触发器建索引 → 写 `vec/vec_model` → `indexMemoryFeatures`；文本命中已有 `hash` 时不插新行，改为更新那行的属性并回 `inserted:false` |
+| 改正文 | 旧正文写 `memory_history` → `version+1` → 重算 `hash` → 重算向量 → 重写特征索引；新正文若被另一行占用 → 409 `conflict`，两行都不动 |
+| 改属性（标题/标签/优先级/置顶/类型/范围） | 只更新列与 `updated_at`；**不**涨 `version`、**不**写历史（版本号表示正文版本） |
+| 删除 | `DELETE memory`；FTS 与 `memory_features` 由既有触发器清理；`memory_history` 保留（与 `memory_forget` 一致） |
+
+校验边界：正文 ≤ 20000 字；标签 ≤ 20 个、每个 ≤ 64 字；`priority` 夹到 0–100；`kind` 必须在 `KINDS` 内；
+`scope='project'` 必须带 `project`（否则该行在所有读路径上都不可见）；`ids` 一次最多 100 个。
+
+### 25.5 路由与错误码
+
+新增 5 个方法（全部 POST）与 2 个稳定错误码：`conflict`(409)、`not-ready`(503)。数据库没打开时参数页照常可用，
+只有数据接口回 `not-ready`；未知 id 回 `not-found`；正文冲突回 `conflict` 并给出占用的行号。
+
+### 25.6 前端实现要点
+
+- 弹窗是独立组件 `MemoryDataBrowser`（`createSection` 只负责开关），每次打开重新拉第一页，不在关闭时保留旧列表。
+- `react-dom` 在宿主静态模块表里，因此用 `createPortal(overlay, document.body)`：设置面板可能位于滚动/变换容器中，
+  fixed 定位会被祖先建立包含块；解析不到 `react-dom` 时退回内联渲染（CSS 仍是 fixed）。
+- 筛选变化在**同一次调用**里带上新值（`fetchPage(1, {kind})`），不依赖 setState 后的闭包；删除最后一页唯一一行时自动退一页。
+- 每次写成功调 `onChanged()`（父级重拉 `state`），统计卡立即更新；列表按当前筛选/页码重读。
+- 表单不自己造默认值：`kind` 默认 `work_fact`、`priority` 50、`scope` global，与 `src/data.js` 的 host 默认一致；
+  真正的校验以 host 的 400/409 为准，前端只挡「正文为空 / 超长 / 项目缺名」。
+
+### 25.7 验证证据（2026-10-23）
+
+| 层 | 手段 | 结果 |
+| --- | --- | --- |
+| 单元 | `test/data.test.js`（13 例：插入/幂等/校验/分页/2 字中文搜索/失效行过滤/facets/历史/改正文/只改属性/冲突/删除/FTS+特征清理） | pass |
+| 路由 | `test/data-route.test.js`（5 例：完整增查改删 + `state.stats` 跟随 + 400/404/409/503/403） | pass |
+| 全量回归 | `node --test --test-isolation=none <test/*.test.js>` | **214/214 pass** |
+| 真实浏览器渲染 | `.tmp/ui-check`：真实 `client.js` + React 18 UMD + Edge headless（`--dump-dom` / `--screenshot`），宿主响应由页内 mock 按同一契约提供 | 列表/表单/暗色截图；14 项交互断言全绿（打开→搜索→含已取代→清空→编辑带历史→保存→新增→删除→关闭） |
+| 既有页面 | `.tmp/client-render-check.mjs`（迷你 hook runtime 渲染真实 state） | 仍通过；字典 260 键、zh/en 对称 |
+
+> 已知限制：会话里没有浏览器控制能力，无法替用户点击真实 GUI；真实宿主的路由受连接信任闸门保护（CLI 无 cookie → 403），
+> 因此端到端证据由「真实 apply() + 真实 POST 穿过 handler」的路由测试承担，客户端由真实 React 的浏览器渲染承担。

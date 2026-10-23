@@ -15,6 +15,7 @@
 - 每轮自动把原文落库（L0），按阈值异步抽取事实（L1）→ 场景（L2）→ 项目画像（L3）；
 - 新会话自动注入 `<memory_context type="stable|dynamic" source="dsh-memory">`；
 - 技能目录里多出上面 4 个技能（来源 `bundled`，随插件加载/卸载）；
+- **设置 → 记忆** 页面：参数、记忆库/设置文件的目录、统计都在里面改和看（见 [README.md 的设置页一节](README.md#设置页记忆)）；
 - 数据在 `~/.dsh/memory/memory.db`（WAL）。
 
 ## 1. 前置条件
@@ -35,7 +36,7 @@
 
 1. 打开 dsh Web，左侧边栏 →「**插件**」；
 2. 页头按钮「**添加插件**」（或箭头「选择添加插件方式」→「安装第三方插件」），打开安装对话框；
-3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.6.1`），回车；
+3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.7.0`），回车；
    - 对话框也接受 **Git 地址、压缩包 URL、本地绝对路径**；
    - 安装进度对话框里可以「查看安装任务」「取消安装」；
 4. 等它跑完 → **重启 DSH**。
@@ -56,9 +57,9 @@ dsh plugin --profile web add dsh-memory-layered
 
 | spec 形式 | 例子 |
 | --- | --- |
-| registry 包名（可带版本/标签） | `dsh-memory-layered@0.6.1` |
+| registry 包名（可带版本/标签） | `dsh-memory-layered@0.7.0` |
 | git https 地址 | `https://github.com/<you>/<repo>` |
-| tarball URL | `https://github.com/<you>/<repo>/releases/download/v0.6.1/dsh-memory-layered-0.6.1.tgz` |
+| tarball URL | `https://github.com/<you>/<repo>/releases/download/v<ver>/dsh-memory-layered-<ver>.tgz` |
 | 本地目录 | `file:F:\path\to\dsh-memory` 或 `link:F:\path\to\dsh-memory` |
 
 没装桌面版、只有 CLI 的话，用 npx 跑同一个命令（共用同一个 `~/.dsh`，profile 也是同一个）：
@@ -75,7 +76,7 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "dsh-memory-layered": "^0.6.1"
+    "dsh-memory-layered": "^0.7.0"
   },
   "dsh": {
     "profile": {
@@ -97,11 +98,11 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
 
 ### 路径 C：离线包（内网 / 没有 registry / 不想动 pnpm）
 
-从 Release 下载 `dsh-memory-layered-0.6.1.zip`，解压后在该目录执行：
+从 Release 下载 `dsh-memory-layered-<ver>.zip`（`<ver>` 换成版本号），解压后在该目录执行：
 
 ```powershell
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz            # 1) dry-run：只打印要做什么，不写任何文件
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply     # 2) 真装
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz            # 1) dry-run：只打印要做什么，不写任何文件
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz -Apply     # 2) 真装
 ```
 
 > 离线目录里**必须带 `-From`**：不带时脚本按「从源码仓库安装」处理，会去找同目录的 `dsh-memory\` 源码而报错。
@@ -126,18 +127,24 @@ pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply     # 2) �
 
 然后**重启 DSH**。
 
-## 3. 装完验证（四步）
+## 3. 装完验证（五步）
 
 1. **插件已加载**：侧栏「插件」页能看到它（来源是已安装依赖，状态启用）。
 2. **工具在**：新会话里说「看下你的记忆库」→ 模型应调用 `memory_stats`，输出含 `l0=`、`scenes=`、`vec=`、`tokens=`。
 3. **注入生效**：再开一个新会话，问「我之前的偏好是什么」→ 会话里出现 `<memory_context type="stable|dynamic" source="dsh-memory">`（**第一次是空的**，聊几轮、抽取出事实后才有内容）。
 4. **技能在**：问「你有哪些技能」，或直接 `/memory-curator` → 目录里应有 `dsh-plugin-dev`、`memory-curator`、`repo-audit`、`windows-pwsh-ops`。
+5. **设置页在**：打开 **设置 → 记忆**，「存储位置」卡片里的目录路径显示出真实路径（缺省 `…\.dsh\memory`），说明 host 路由和页面都通了 —— 这一眼就是安装成功的判据。看不到这一栏先**刷新页面**；纯 CLI（headless）profile 没有 Web 设置面板，看不到属正常，插件其余功能不受影响。
 
 只要第 1、2 步出现，插件就装对了；第 3 步需要先积累事实（默认 1→2→4→8→每 5 轮触发一次抽取，idle 60s 兜底）。
 
 ## 4. 配置（可选）
 
 在 profile 的 `cordis.patch.yml` 里按行 id 覆盖。**patch 的 `config` 是整行替换、不深合并**：同一个 `- id: memory` 在多个 patch 层出现时，后一层的 `config` 会整体盖掉前一层，不要指望合并。本插件对每个字段都有内置默认值，所以只写想改的字段通常也能工作；但覆盖 `extraction` 这类嵌套段时，建议把该段写全。
+
+> **不想改 YAML 也行**：装好后打开 **设置 → 记忆**，同一批参数都能在 GUI 里改，保存即生效（只有 `storage.dbPath`、`skills.enabled`/`skills.dir`、`extraction.provider`/`extraction.model` 要重启）。
+> 设置页只把**你改过的 key** 写进 `$DSH_HOME\memory\settings.json`（`DSH_HOME` 缺省 `%USERPROFILE%\.dsh`；默认与数据库同目录，位置不随 `dbPath` 变），优先级 **内置默认 < profile YAML < 设置页**。
+> 注意两种合并不是一回事：**YAML 各层之间**仍是整行替换（上一段说的）；**设置页与 YAML 之间**是深合并，只覆盖你改过的字段。YAML 里留着的值仍然是「恢复 YAML 基线」回落的目标。
+> 字段分组、HTTP 端点、重置方式见 [README.md 的设置页一节](README.md#设置页记忆)。
 
 最小示例（关心隐私就关掉 LLM）：
 
@@ -165,6 +172,8 @@ pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply     # 2) �
 
 停掉 DSH，删 `~/.dsh/memory/` 下的 `memory.db`、`memory.db-wal`、`memory.db-shm` → 重启即空库。
 
+**只重置参数（不动记忆）**：删 `$DSH_HOME\memory\settings.json`（缺省 `%USERPROFILE%\.dsh\memory\settings.json`），或在页面底部点「恢复 YAML 基线」——两者等价，都回到「YAML + 内置默认」。单个字段回默认用该行上的「恢复默认」。注意这里恢复的是**基线**，不是出厂值：YAML 里写过的值会继续生效。
+
 ## 5. 升级 / 回滚 / 卸载
 
 | 操作 | 做法 |
@@ -188,6 +197,10 @@ pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply     # 2) �
 | 4 个技能没出现 | 插件没加载（技能随插件注册）；或 dsh 版本太老没有 skills 注册表；或包里 `skills/` 丢了 | 先按第 1 条排查插件；看日志里有没有 `bundled skill` 相关 warn |
 | 技能出现了，但你改过的那份没生效 | 你 `~/.dsh/skills` 里有同名技能：它的优先级（400）高于包内注册（600），日志会写 `from bundled ignored because a higher-priority skill already exists` | 想用包内版：删掉或改名 `~/.dsh/skills\<技能名>`；想安静：配 `skills.enabled: false` |
 | 改了配置/升级了但没变化 | host 插件不热更 | 重启 |
+| 设置面板里没有「记忆」一栏 | ①装完没刷新页面 ②当前 profile 没有 Web 设置面板（纯 CLI headless 启动）③包是旧版本，没带 `client.js`/`dsh.client` 元数据 | 先刷新页面，再重启；确认 dsh 版本有 `settings.section` 槽位；换新版包 |
+| 设置页里改了参数，行为没变 | 该字段是**重启生效**项：`storage.dbPath`、`skills.enabled`/`skills.dir`、`extraction.provider`/`extraction.model` | 看行上的「重启生效」徽标与保存提示的「n 项重启后生效」→ 重启 DSH |
+| 点「打开目录」没反应 | 宿主进程调不起桌面文件管理器（无 GUI 会话），或非 Windows 平台没有 `xdg-open` | 按「存储位置」卡片显示的路径手动打开；这个按钮是尽力而为（异步失败只记日志，不影响别的功能） |
+| 改完设置页，重启后变回旧值 | ①保存报错没落盘（目录不可写 / 杀软拦截）②事后删过 `settings.json` 或点过「恢复 YAML 基线」 | 看保存提示；确认 `$DSH_HOME\memory\settings.json` 里确有那个 key（YAML 不会盖回来，它优先级更低） |
 | `memory_stats` 的 `vec=` 小于总数 | 旧行还没回填（每次启动最多补 500 行） | 再重启一两次；或临时 `vector.enabled: false` |
 | 召回为空 | 语料太少，或 2 字中文查询走了 LIKE 兜底 | 用 `memory_save` 固化关键结论，再聊几轮 |
 

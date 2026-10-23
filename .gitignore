@@ -28,3 +28,6 @@
 
 # scratch: local db backups and replay artifacts
 /.tmp/
+
+# 青灯表情包：本地聊天贴图，不属于插件产物 —— 只在本地，不入库
+/stickers/

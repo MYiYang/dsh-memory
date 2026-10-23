@@ -17,9 +17,10 @@
  * @module dsh-memory
  */
 import { homedir } from 'node:os'
-import { join, basename } from 'node:path'
+import { basename, dirname, isAbsolute, resolve as resolvePath } from 'node:path'
+import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { openDatabase, saveMemory, forgetMemories, stats, getMeta, coreMemories, touchMemories, CORE_PRIORITY } from './src/store.js'
+import { openDatabase, saveMemory, forgetMemories, stats, getMeta, coreMemories, touchMemories } from './src/store.js'
 import { recall, renderMemoryBlock, renderStableBlock } from './src/recall.js'
 import { captureTurn, extractText } from './src/capture.js'
 import { appendTurn, pendingSessionIds } from './src/l0.js'
@@ -29,119 +30,29 @@ import { createPipeline } from './src/pipeline.js'
 import { createLlmClient } from './src/llm.js'
 import { runPersona } from './src/consolidate.js'
 import { registerBundledSkills } from './src/skills.js'
+import {
+  applyLiveConfig,
+  buildGroups,
+  deepMerge,
+  deletePath,
+  fieldByKey,
+  mergeRaw,
+  resolveConfig,
+  resolveHome,
+  resolveSettingsPath,
+  toNested,
+  validatePatch,
+  validateUnset,
+} from './src/settings.js'
+import { clearSettingsFile, describeStorage, messageOf, readSettingsFile, revealDirectory, writeSettingsFile } from './src/settings-store.js'
+import { createApiRoute, MemoryApiError } from './src/api.js'
+import { createMemory, deleteMemories, getMemory, listMemories, updateMemory } from './src/data.js'
 
 export const name = 'memory'
 export const inject = ['tools', 'agents', 'sessions']
 
 /** Plugin tag used in log lines. */
 const TAG = '[dsh-memory]'
-
-/**
- * Resolve the database path from config / DSH_HOME.
- * @param {Record<string, unknown>} config
- * @returns {string}
- */
-function resolveDbPath(config) {
-  if (typeof config.dbPath === 'string' && config.dbPath.trim() !== '') {
-    return String(config.dbPath).replace(/^~(?=$|[\\/])/, homedir())
-  }
-  const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
-  return join(home, 'memory', 'memory.db')
-}
-
-/**
- * Normalize the loader-provided config.
- * @param {unknown} raw
- */
-function resolveConfig(raw) {
-  const config = raw && typeof raw === 'object' ? /** @type {Record<string, unknown>} */ (raw) : {}
-  const number = (value, fallback, min, max) =>
-    Number.isFinite(Number(value)) ? Math.min(max, Math.max(min, Number(value))) : fallback
-  const section = (value) => (value && typeof value === 'object' ? /** @type {Record<string, unknown>} */ (value) : {})
-  const layers = section(config.layers)
-  const extraction = section(config.extraction)
-  const scenes = section(config.scenes)
-  const persona = section(config.persona)
-  const vector = section(config.vector)
-  const text = (value, fallback = '') => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
-  return {
-    dbPath: resolveDbPath(config),
-    maxItems: number(config.maxItems, 6, 1, 20),
-    maxChars: number(config.maxChars, 1400, 200, 8000),
-    minScore: number(config.minScore, 0.2, 0, 1),
-    capture: config.capture !== false,
-    injectGlobalFacts: config.injectGlobalFacts !== false,
-    scope: config.scope === 'global' ? 'global' : 'project',
-    stableMaxChars: number(config.stableMaxChars, 1800, 300, 6000),
-    core: {
-      enabled: section(config.core).enabled !== false,
-      maxItems: number(section(config.core).maxItems, 6, 1, 20),
-      minPriority: number(section(config.core).minPriority, CORE_PRIORITY, 0, 100),
-    },
-    debug: config.debug === true,
-    layers: {
-      l0: layers.l0 !== false,
-      l1: layers.l1 !== false,
-      l2: layers.l2 !== false,
-      l3: layers.l3 !== false,
-    },
-    extraction: {
-      enabled: extraction.enabled !== false,
-      provider: text(extraction.provider),
-      model: text(extraction.model),
-      everyN: number(extraction.everyN, 5, 1, 100),
-      idleMs: number(extraction.idleMs, 60_000, 1_000, 3_600_000),
-      maxInputChars: number(extraction.maxInputChars, 8_000, 500, 60_000),
-      maxMemories: number(extraction.maxMemories, 10, 1, 50),
-      maxAttempts: number(extraction.maxAttempts, 3, 1, 10),
-      timeoutMs: number(extraction.timeoutMs, 60_000, 1_000, 300_000),
-      maxTokens: number(extraction.maxTokens, 2400, 64, 8192),
-    },
-    scenes: {
-      enabled: scenes.enabled !== false,
-      minFacts: number(scenes.minFacts, 3, 1, 20),
-      maxScenes: number(scenes.maxScenes, 20, 1, 100),
-      halfLifeDays: number(scenes.halfLifeDays, 14, 1, 365),
-    },
-    persona: {
-      enabled: persona.enabled !== false,
-      triggerEveryN: number(persona.triggerEveryN, 10, 1, 100),
-      maxChars: number(persona.maxChars, 1200, 200, 8000),
-      // What the generator aims at (maxChars stays the hard cap). A persona
-      // longer than 1.4× the target is rewritten on the spot ("compact").
-      targetChars: number(persona.targetChars, 700, 120, 8000),
-      globalTargetChars: number(persona.globalTargetChars, 240, 120, 8000),
-      // The persona rewrite is the longest JSON answer this plugin asks for;
-      // reasoning tokens eat the budget first, so it gets its own (bigger) caps
-      // and asks for low effort before falling back to the model default.
-      personaMaxTokens: number(persona.personaMaxTokens, 4000, 400, 16000),
-      personaTimeoutMs: number(persona.personaTimeoutMs, 120000, 5000, 600000),
-      personaReasoningEffort:
-        typeof persona.personaReasoningEffort === 'string' && persona.personaReasoningEffort !== ''
-          ? persona.personaReasoningEffort
-          : 'low',
-      // L3 also maintains a cross-project profile built from global facts.
-      // It has its own batch counter and gate, so it never starves the project one.
-      global: persona.global !== false,
-    },
-    vector: {
-      enabled: vector.enabled !== false,
-      weight: number(vector.weight, 0.1, 0, 1),
-      scanLimit: number(vector.scanLimit, 2000, 0, 5000),
-      // Inverted n-gram feature index used as a lexical prefilter before the
-      // exact cosine rerank; false forces the bounded brute-force scan only.
-      prefilter: vector.prefilter !== false,
-      // Query-side feature cap for the pre-filter probe (stored features are
-      // fixed at 96 by feature-index.js; probing is capped again at 48).
-      featureLimit: number(vector.featureLimit, 96, 16, 96),
-    },
-    // Bundled skills shipped inside this package (`./skills`).
-    skills: {
-      enabled: section(config.skills).enabled !== false,
-      dir: text(section(config.skills).dir),
-    },
-  }
-}
 
 /**
  * Project key from a session's cwd (basename), or null.
@@ -244,12 +155,55 @@ function lastUserText(session) {
 }
 
 /**
+ * Settings file path: `$DSH_HOME/memory/settings.json` by default.
+ *
+ * The loader row config may redirect it with `settingsPath` — that is a test /
+ * packaging escape hatch, deliberately not part of the Settings page catalog.
+ * @param {Record<string, unknown>} loaderRaw
+ * @returns {string}
+ */
+function resolveSettingsPathFor(loaderRaw) {
+  const candidate = loaderRaw?.settingsPath
+  if (typeof candidate === 'string' && candidate.trim() !== '') {
+    const expanded = candidate.trim().replace(/^~(?=$|[\\/])/, homedir())
+    return isAbsolute(expanded) ? expanded : resolvePath(expanded)
+  }
+  return resolveSettingsPath()
+}
+
+/**
+ * Version reported by the settings page. Read from the package manifest at
+ * runtime (never imported as JSON: a linked package must work from any cwd).
+ * @returns {string}
+ */
+function readPluginVersion() {
+  try {
+    const parsed = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    return typeof parsed.version === 'string' ? parsed.version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
+
+/**
  * Register the plugin.
  * @param {any} ctx - cordis context
  * @param {unknown} [rawConfig]
  */
 export function apply(ctx, rawConfig) {
-  const config = resolveConfig(rawConfig)
+  // The loader-provided row config (YAML) is the base layer; the Settings page
+  // writes a second layer next to the database. `settingsPath` is accepted in
+  // the row config only so tests and packagers can redirect the file — it is
+  // not exposed as a settings field.
+  const loaderRaw = rawConfig !== null && typeof rawConfig === 'object' && !Array.isArray(rawConfig) ? rawConfig : {}
+  const settingsPath = resolveSettingsPathFor(loaderRaw)
+  const initialSettings = readSettingsFile(settingsPath)
+  /** @type {Record<string, any>} Settings-page layer: only explicitly changed keys. */
+  let storedSettings = initialSettings.settings
+  /** Read/write problem of the settings file, surfaced in the settings page. */
+  let settingsError = initialSettings.error
+
+  const config = resolveConfig(mergeRaw(loaderRaw, storedSettings))
   const log = (level, message) => {
     try {
       const logger = ctx.logger ?? console
@@ -259,6 +213,7 @@ export function apply(ctx, rawConfig) {
       /* logging must never throw */
     }
   }
+  if (settingsError !== null) log('warn', `settings file ignored (${settingsPath}): ${settingsError}`)
 
   /** Database handle; opened eagerly but failures only disable the plugin. */
   let db
@@ -290,14 +245,17 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  // ── L0/L1 pipeline: extraction only when enabled and a model is resolvable ──
+  // ── L0/L1 pipeline: built whenever a model is resolvable ──────────────────
+  // The layer/extraction switches are read at use time (turn/end, runJob), not
+  // here, so the Settings page can turn extraction off and on without a
+  // restart. Only an unresolvable model keeps the pipeline absent.
   /** @type {ReturnType<typeof createPipeline>|null} */
   let pipeline = null
   /** @type {ReturnType<typeof createScheduler>|null} */
   let scheduler = null
   /** @type {ReturnType<typeof createLlmClient>|null} */
   let llmClient = null
-  if (dbReady && config.layers.l1 && config.extraction.enabled) {
+  if (dbReady) {
     try {
       const llm = createLlmClient(ctx, config.extraction, log)
       if (llm.available) {
@@ -309,12 +267,16 @@ export function apply(ctx, rawConfig) {
           idleMs: config.extraction.idleMs,
           onDue: (sessionId, reason) => pipeline?.schedule(sessionId, reason),
         })
-        log('debug', `extraction on (everyN=${config.extraction.everyN}, idleMs=${config.extraction.idleMs})`)
+        log(
+          'debug',
+          `extraction ready (enabled=${config.layers.l1 && config.extraction.enabled}, everyN=${config.extraction.everyN}, idleMs=${config.extraction.idleMs})`,
+        )
       }
     } catch (error) {
       log('warn', `extraction disabled: ${error instanceof Error ? error.message : String(error)}`)
       pipeline = null
       scheduler = null
+      llmClient = null
     }
   }
 
@@ -409,7 +371,9 @@ export function apply(ctx, rawConfig) {
             })
             if (appended.inserted) log('debug', `l0 turn ${state.turn} -> #${appended.id}`)
           }
-          if (scheduler !== null) {
+          // Read the switches here (not at boot) so turning extraction off in
+          // the Settings page stops scheduling immediately.
+          if (scheduler !== null && config.layers.l1 && config.extraction.enabled) {
             const decision = scheduler.noteTurn(session.id, state.turn)
             if (decision.fired) log('debug', `l1 due (threshold=${decision.threshold}, turn=${state.turn})`)
           }
@@ -528,6 +492,11 @@ export function apply(ctx, rawConfig) {
         if (fresh.length > 0) {
           sections.push(renderMemoryBlock(fresh))
           log('debug', `recall turn ${turn}: ${fresh.length} hit(s) via ${hits.strategy}`)
+        }
+        // `debug` (settings → advanced) promotes the per-turn recall summary to
+        // info level; it logs sizes and strategy, never the query or the text.
+        if (config.debug) {
+          log('info', `recall turn ${turn}: query=${query.length}chars hits=${fresh.length} strategy=${hits.strategy}`)
         }
       }
 
@@ -698,7 +667,7 @@ export function apply(ctx, rawConfig) {
             text:
               `memories=${s.total} facts=${s.facts} episodes=${s.episodes} superseded=${s.superseded} ` +
               `kinds={${kinds}} l0=${s.l0Pending}/${s.l0Total} scenes=${s.scenes} personas=${s.personas} ` +
-              `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath}`,
+              `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath} settings=${settingsPath}`,
           }
         },
       }),
@@ -825,6 +794,217 @@ export function apply(ctx, rawConfig) {
       }
     }
   }, 'dsh-memory: tools')
+
+  // ── Settings → Memory ────────────────────────────────────────────────────
+  // One state read plus three writes. The page shows the effective value of
+  // every field, where it came from, and whether saving it needs a restart;
+  // `save`/`reset` re-resolve the merged config, persist the settings layer,
+  // and push the live-able part into the running plugin.
+  const pluginVersion = readPluginVersion()
+  const startedAt = Date.now()
+  const EMPTY_STATS = {
+    total: 0,
+    facts: 0,
+    episodes: 0,
+    superseded: 0,
+    projects: 0,
+    byKind: {},
+    l0Total: 0,
+    l0Pending: 0,
+    scenes: 0,
+    personas: 0,
+    vectorized: 0,
+    featureIndexed: 0,
+    tokensSpent: 0,
+    dbBytes: 0,
+  }
+
+  const readStats = () => {
+    if (!dbReady) return { ...EMPTY_STATS, byKind: {} }
+    try {
+      return stats(getDb())
+    } catch (error) {
+      log('warn', `stats failed: ${messageOf(error)}`)
+      return { ...EMPTY_STATS, byKind: {} }
+    }
+  }
+
+  /** Config as it will run: defaults < loader row config < settings layer. */
+  const effectiveConfig = () => resolveConfig(mergeRaw(loaderRaw, storedSettings))
+
+  /** Everything the settings page renders, in one object. */
+  const createState = () => {
+    const effective = effectiveConfig()
+    const storage = describeStorage({
+      dir: dirname(config.dbPath),
+      dbPath: config.dbPath,
+      settingsPath,
+      home: resolveHome(),
+    })
+    if (settingsError !== null) storage.error = storage.error ?? settingsError
+    return {
+      plugin: { name: 'dsh-memory-layered', version: pluginVersion, dbReady, startedAt },
+      storage,
+      stats: readStats(),
+      runtime: {
+        extraction: {
+          available: llmClient?.available === true,
+          provider: llmClient?.provider ?? null,
+          model: llmClient?.model ?? null,
+          scheduled: pipeline !== null,
+        },
+        skills: { enabled: config.skills.enabled, dir: config.skills.dir },
+        vector: { enabled: config.vector.enabled },
+      },
+      groups: buildGroups(effective, config, loaderRaw, storedSettings),
+    }
+  }
+
+  /**
+   * Persist a settings patch, then apply what can be applied live.
+   * @param {{ patch?: Record<string, unknown>, unset?: unknown }} payload
+   */
+  const saveSettings = (payload) => {
+    const patched = validatePatch(payload?.patch)
+    if (!patched.ok) {
+      throw new MemoryApiError(
+        'bad-request',
+        patched.errors.map((error) => `${error.key || 'patch'}: ${error.message}`).join('; '),
+      )
+    }
+    const unset = validateUnset(payload?.unset)
+    if (!unset.ok) {
+      throw new MemoryApiError(
+        'bad-request',
+        unset.errors.map((error) => `${error.key || 'unset'}: ${error.message}`).join('; '),
+      )
+    }
+    const nextStored = deepMerge(storedSettings, toNested(patched.flat))
+    for (const key of unset.keys) {
+      const field = fieldByKey(key)
+      if (field !== undefined) deletePath(nextStored, field.path)
+    }
+    const next = resolveConfig(mergeRaw(loaderRaw, nextStored))
+    try {
+      writeSettingsFile(settingsPath, nextStored)
+    } catch (error) {
+      // Persistence first: a failed write must leave the running plugin exactly
+      // as it was, otherwise the page and the next boot would disagree.
+      throw new MemoryApiError('io-error', `cannot write settings: ${messageOf(error)}`)
+    }
+    storedSettings = nextStored
+    settingsError = null
+    const { applied, restartRequired } = applyLiveConfig(config, next)
+    // These two copy their values at construction (see src/pipeline.js,
+    // src/scheduler.js); everything else reads the shared config object.
+    pipeline?.refresh()
+    scheduler?.configure({ everyN: config.extraction.everyN, idleMs: config.extraction.idleMs })
+    return { state: createState(), applied, unset: unset.keys, restartRequired }
+  }
+
+  /**
+   * Drop settings overrides: all of them, or the listed keys only.
+   * @param {{ keys?: unknown }} payload
+   */
+  const resetSettings = (payload) => {
+    const keys = Array.isArray(payload?.keys) && payload.keys.length > 0 ? payload.keys : null
+    try {
+      if (keys === null) {
+        clearSettingsFile(settingsPath)
+        storedSettings = {}
+      } else {
+        const unset = validateUnset(keys)
+        if (!unset.ok) {
+          throw new MemoryApiError(
+            'bad-request',
+            unset.errors.map((error) => `${error.key || 'unset'}: ${error.message}`).join('; '),
+          )
+        }
+        const nextStored = deepMerge({}, storedSettings)
+        for (const key of unset.keys) {
+          const field = fieldByKey(key)
+          if (field !== undefined) deletePath(nextStored, field.path)
+        }
+        if (Object.keys(nextStored).length === 0) clearSettingsFile(settingsPath)
+        else writeSettingsFile(settingsPath, nextStored)
+        storedSettings = nextStored
+      }
+    } catch (error) {
+      if (error instanceof MemoryApiError) throw error
+      throw new MemoryApiError('io-error', `cannot reset settings: ${messageOf(error)}`)
+    }
+    settingsError = null
+    const next = resolveConfig(mergeRaw(loaderRaw, storedSettings))
+    const { applied, restartRequired } = applyLiveConfig(config, next)
+    pipeline?.refresh()
+    scheduler?.configure({ everyN: config.extraction.everyN, idleMs: config.extraction.idleMs })
+    return { state: createState(), applied, restartRequired, reset: true }
+  }
+
+  /** Open the storage directory in the platform file manager (best effort). */
+  const revealStorage = () => revealDirectory(dirname(config.dbPath), { log })
+
+  /**
+   * The data endpoints need an open database. A plugin that failed to open its
+   * store (read-only home, locked file) still serves the parameter page, so this
+   * reports a stable `not-ready` instead of leaking the openDatabase error.
+   */
+  const requireDb = () => {
+    if (!dbReady) throw new MemoryApiError('not-ready', 'the memory database is not ready')
+    try {
+      return getDb()
+    } catch (error) {
+      throw new MemoryApiError('io-error', `cannot open the memory database: ${messageOf(error)}`)
+    }
+  }
+
+  const apiRoute = createApiRoute({
+    methods: {
+      state: () => createState(),
+      save: (payload) => saveSettings(payload),
+      reset: (payload) => resetSettings(payload),
+      reveal: () => revealStorage(),
+      // Settings → Memory → 记忆数据: the row-level CRUD surface.
+      memories: (payload) => listMemories(requireDb(), payload),
+      memory: (payload) => getMemory(requireDb(), payload?.id),
+      memoryCreate: (payload) => createMemory(requireDb(), payload),
+      memoryUpdate: (payload) => updateMemory(requireDb(), payload),
+      memoryDelete: (payload) => deleteMemories(requireDb(), payload),
+    },
+    admits: (req) => {
+      try {
+        if (typeof ctx.get !== 'function') return true
+        const connection = ctx.get('connection')
+        if (connection === undefined || typeof connection.requestRejection !== 'function') return true
+        return connection.requestRejection(req) === undefined
+      } catch {
+        return false
+      }
+    },
+    log,
+  })
+
+  // The settings page needs the GUI webserver; the agent side does not. Mount
+  // lazily so headless profiles (no webServer service) keep every other feature
+  // instead of failing to load the entry.
+  try {
+    if (typeof ctx.inject === 'function') {
+      ctx.effect(() => {
+        const fiber = ctx.inject(['webServer'], (webCtx) => {
+          webCtx.effect(() => webCtx.webServer.register(apiRoute), 'dsh-memory: /memory/api')
+        })
+        return () => {
+          try {
+            fiber?.dispose?.()
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 'dsh-memory: settings api')
+    }
+  } catch (error) {
+    log('warn', `settings api not mounted: ${messageOf(error)}`)
+  }
 
   log('debug', `loaded (db=${config.dbPath}, maxItems=${config.maxItems}, scope=${config.scope})`)
 }

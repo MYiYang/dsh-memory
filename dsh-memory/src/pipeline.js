@@ -52,6 +52,21 @@ export function createPipeline(options) {
   const now = options.now ?? Date.now
   const cfg = { ...PIPELINE_DEFAULTS, ...(options.config?.extraction ?? {}) }
 
+  /**
+   * Re-read the extraction knobs from the live config object.
+   *
+   * The Settings page mutates `config.extraction` in place; this pipeline
+   * copied those values at construction, so without a refresh a saved value
+   * would only take effect on the next restart. Called by the host after every
+   * settings save.
+   * @returns {Record<string, any>} the values now in force
+   */
+  function refresh() {
+    const next = options.config?.extraction
+    if (next !== null && typeof next === 'object') Object.assign(cfg, next)
+    return { ...cfg }
+  }
+
   /** @type {Array<{ sessionId: string, reason: string }>} */
   const queue = []
   /** @type {Set<string>} */
@@ -118,6 +133,12 @@ export function createPipeline(options) {
    * @param {AbortSignal} signal
    */
   async function runJob(sessionId, reason, signal) {
+    // Layer and extraction switches are live: a job that was queued before the
+    // user turned extraction off must not spend a model call.
+    if (options.config?.layers?.l1 === false || options.config?.extraction?.enabled === false) {
+      setMeta(db, 'l1-last-reason', 'disabled')
+      return { skipped: true, reason: 'disabled' }
+    }
     const turns = pendingTurns(db, sessionId, cfg.maxTurns)
     if (turns.length === 0) {
       setMeta(db, 'l1-last-reason', 'empty')
@@ -278,6 +299,7 @@ export function createPipeline(options) {
     schedule,
     flush,
     dispose,
+    refresh,
     /** Exposed for tests/diagnostics. */
     get pending() {
       return queue.length + (running ? 1 : 0)

@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { apply } from '../index.js'
 import { openDatabase, saveMemory, coreMemories, CORE_PRIORITY } from '../src/store.js'
 import { renderStableBlock } from '../src/recall.js'
@@ -118,7 +118,7 @@ test('a greeting-only turn injects the pinned global preference (pre-step wiring
   seed.close()
 
   const { ctx, handlers } = fakeCtx()
-  apply(ctx, { dbPath, capture: false, extraction: { enabled: false } })
+  apply(ctx, { dbPath, settingsPath: join(dirname(dbPath), 'settings.json'), capture: false, extraction: { enabled: false } })
 
   const preStep = handlers.get('agent/pre-step')
   assert.equal(typeof preStep, 'function')
@@ -164,7 +164,7 @@ test('a turn without text (attachment only) still injects the standing rules', a
   seed.close()
 
   const { ctx, handlers } = fakeCtx()
-  apply(ctx, { dbPath, capture: false, extraction: { enabled: false } })
+  apply(ctx, { dbPath, settingsPath: join(dirname(dbPath), 'settings.json'), capture: false, extraction: { enabled: false } })
   const session = { id: 'session-image', header: { cwd: 'F:\\work\\demo' }, events: [] }
   const messages = [{ source: { kind: 'user' }, content: [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAA' } }] }]
   const decision = await handlers.get('agent/pre-step')({ agent: { session }, messages, turn: 1, step: 1, signal: {} }, async () => ({ kind: 'enter', messages: [] }))
@@ -182,7 +182,7 @@ test('the global channel is re-checked every turn instead of closing after a mis
   seed.close()
 
   const { ctx, handlers } = fakeCtx()
-  apply(ctx, { dbPath, capture: false, extraction: { enabled: false } })
+  apply(ctx, { dbPath, settingsPath: join(dirname(dbPath), 'settings.json'), capture: false, extraction: { enabled: false } })
   const preStep = handlers.get('agent/pre-step')
   const session = { id: 'session-reopen', header: { cwd: 'F:\\work\\demo' }, events: [] }
   const enter = async () => ({ kind: 'enter', messages: [] })
@@ -221,7 +221,7 @@ test('the stable block seeds the session set so a standing rule is never shown t
   seed.close()
 
   const { ctx, handlers } = fakeCtx()
-  apply(ctx, { dbPath, capture: false, extraction: { enabled: false } })
+  apply(ctx, { dbPath, settingsPath: join(dirname(dbPath), 'settings.json'), capture: false, extraction: { enabled: false } })
   const preStep = handlers.get('agent/pre-step')
   const session = { id: 'session-seed', header: { cwd: 'F:\\work\\demo' }, events: [] }
   const enter = async () => ({ kind: 'enter', messages: [] })
@@ -247,7 +247,7 @@ test('an attachment-only later turn does not answer the previous question again'
   seed.close()
 
   const { ctx, handlers } = fakeCtx()
-  apply(ctx, { dbPath, capture: false, extraction: { enabled: false } })
+  apply(ctx, { dbPath, settingsPath: join(dirname(dbPath), 'settings.json'), capture: false, extraction: { enabled: false } })
   const preStep = handlers.get('agent/pre-step')
   // The session log still carries the previous turn's question.
   const session = {

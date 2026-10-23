@@ -186,6 +186,7 @@ test('apply() wires bundled skills without needing a model or a session', () => 
   const { ctx, providers } = fakeCtx()
   apply(ctx, {
     dbPath: join(dir, 'memory.db'),
+    settingsPath: join(dir, 'settings.json'),
     capture: false,
     extraction: { enabled: false },
   })
@@ -195,6 +196,7 @@ test('apply() wires bundled skills without needing a model or a session', () => 
   const off = fakeCtx()
   apply(off.ctx, {
     dbPath: join(dir, 'memory-off.db'),
+    settingsPath: join(dir, 'settings.json'),
     capture: false,
     extraction: { enabled: false },
     skills: { enabled: false },

@@ -56,6 +56,8 @@
 
 在 profile patch 里覆盖；**patch 的 config 是整行替换、不深合并**，要覆盖就写全：
 
+> 运行时改参数不用改这里：装好后 **设置 → 记忆** 能改同一批 46 个参数并立即生效（5 个字段要重启），优先级 默认 < YAML < 设置页。详见 [设置页（记忆）](#设置页记忆)。
+
 ```yaml
 - id: memory
   name: 'dsh-memory-layered'      # loader 模块说明符，必须等于安装后的包名
@@ -113,6 +115,174 @@
 包内技能以 `ctx.skills.registerProvider` 注册、`source: 'bundled'`、rank **600**（最低档）：
 项目 `.dsh/skills`(100) > 项目 `.agents/skills`(200) > `customSkillDirs`(300) > `~/.dsh/skills`(400) > `~/.agents/skills`(500) > 包内 bundled(600)。
 **同名时用户自己的技能赢**，日志会写 `from bundled ignored because a higher-priority skill already exists`——想用包内版本就删/改名 `~/.dsh/skills` 里那份。
+
+## 设置页（记忆）
+
+> 这节解决两件事：改参数不用手改 YAML、不用重启；以及「记忆到底存在哪个目录」。
+
+装好插件并**刷新页面**后，**设置 → 记忆**（`settings.section`，id `memory`）里能看到四块，数据全部来自 `POST /memory/api/state`，前端不写死任何默认值：
+
+| 区块 | 内容 |
+| --- | --- |
+| 存储位置 | 存储目录 + 复制路径 + 打开目录；目录里的文件（名称、体积、修改时间）与数据库体积；「当前数据库路径」（运行中的库）与「设置文件路径」（还没创建时标「尚未创建」） |
+| 统计 | 记忆总数、事实、片段、待提炼、场景、人设、词元消耗 |
+| 记忆数据 | 一行摘要 + **管理数据** 按钮：弹窗里直接对记忆条目做搜索 / 新增 / 编辑 / 删除（见下节） |
+| 参数 | 8 张分组卡（合计 46 项），每行「标题 + 说明 + 控件 + 来源徽标（默认/YAML/设置页）+ 未保存徽标 + 重启生效徽标 + 行内恢复默认」 |
+| 操作条 | 页头「刷新」；有改动时出现「保存（n）」「撤销」；常驻「恢复 YAML 基线」 |
+
+### 能改什么
+
+46 个字段分 8 组，组的顺序就是页面上的顺序：
+
+| 分组 | 代表字段（`key`） | 管什么 |
+| --- | --- | --- |
+| `recall`（召回） | `recall.scope` `recall.maxItems` `recall.maxChars` `recall.minScore` `recall.injectGlobalFacts` `recall.stableMaxChars`、`core.enabled` `core.maxItems` `core.minPriority` | 动态段召回条数/字符/阈值、稳定段预算、长期约定（core）层 |
+| `capture`（捕获） | `capture`、`layers.l0` `layers.l1` `layers.l2` `layers.l3` | 是否记原文/episode，四层各自开关 |
+| `extraction`（提炼） | `extraction.enabled` `extraction.everyN` `extraction.idleMs` `extraction.maxInputChars` `extraction.maxMemories` `extraction.maxAttempts` `extraction.timeoutMs` `extraction.maxTokens`、`extraction.provider` `extraction.model` | 抽取节奏、单批上限、LLM 预算与路由 |
+| `scenes`（场景） | `scenes.enabled` `scenes.minFacts` `scenes.maxScenes` `scenes.halfLifeDays` | L2 场景归并与热度淘汰 |
+| `persona`（人设） | `persona.enabled` `persona.global` `persona.triggerEveryN` `persona.maxChars` `persona.targetChars` `persona.globalTargetChars` `persona.personaMaxTokens` `persona.personaTimeoutMs` `persona.personaReasoningEffort` | L3 画像（项目 + 全局）的节奏与长度 |
+| `vector`（向量） | `vector.enabled` `vector.weight` `vector.scanLimit` `vector.prefilter` `vector.featureLimit` | 词法向量召回 |
+| `storage`（存储） | `storage.dbPath` | 数据库路径（重启才生效） |
+| `advanced`（高级） | `debug`、`skills.enabled` `skills.dir` | 调试开关、包内技能注册 |
+
+> `debug` 打开后，每轮召回会把「query 长度 / 命中数 / 检索策略」打到 info 日志（只记尺寸与策略，不记 query 正文）；默认仅在 debug 级日志里记同样内容。
+
+每个字段对象（`state` 返回的 `groups[].fields[]`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `key` | 上表的点号 key，保存/重置都用它 |
+| `type` | `number` / `boolean` / `enum` / `text` |
+| `min` `max` `step` | 仅 `number`：范围与步长 |
+| `options` | 仅 `enum`：可选值 |
+| `default` | 内置默认值（来自 `resolveConfig({})`，和插件启动用的是同一个归一化函数） |
+| `value` | 合并 YAML + 设置页后的生效值，也就是**下次启动**会用的值 |
+| `active` | 仅 `live:false` 字段：**正在运行**的实例实际在用的值；与 `value` 不同 = 改了但还没重启 |
+| `source` | `default` / `config` / `settings`（来源徽标） |
+| `live` | `false` = 需重启 |
+
+> 数字越界**不报错**，会被夹到边界（`recall.maxItems: 999` 存成 20）；`text` 最长 500 字。
+> 真正会 400 的是：未知 key、类型不对、枚举不在列表（例如 `recall.scope` 传 `team`）、`patch`/`unset` 不是对象/数组。
+
+### 保存是立即生效还是重启
+
+- **立即生效**（`live:true`，46 个里 41 个）：保存时直接改插件内存里那份 config —— 召回、捕获、工具都闭包读同一个对象，下一次触发就用新值；抽取节奏额外通过 `pipeline.refresh()` 与 `scheduler.configure()` 同步到已创建的对象上。已排队的 idle 定时器保留原延迟，下一轮结束才按新值重新计时（保存时清掉它会丢掉这次兜底触发）。
+- **需要重启**（`live:false`，保存响应里的 `restartRequired` 会列出来，行上也有「重启生效」徽标）：
+
+| key | 为什么必须重启 |
+| --- | --- |
+| `storage.dbPath` | 数据库句柄在插件加载时打开，换路径等于换库 |
+| `skills.enabled` / `skills.dir` | 技能在加载时注册进宿主的技能表，生命周期与插件绑定 |
+| `extraction.provider` / `extraction.model` | LLM 客户端在加载时解析一次路由 |
+
+这些字段的保存**照样落盘**（重启后生效），页面不会假装它已经生效。想确认「改了但还没重启」：看 `storage` 组里 `storage.dbPath` 这一行——`value` 是下次启动会用的路径，`active` 是运行中真正在用的路径，两者不同就是待重启；「存储位置」卡片始终指向运行中的库。
+
+> 还有一个容易踩的边界：抽取管线只在**插件启动时**满足 `layers.l1 && extraction.enabled && 能解析到模型` 才创建。
+> 如果启动时它就是关的，在设置页把 `extraction.enabled` / `layers.l1` 打开**不会凭空创建 LLM 客户端与调度器**——要真正开始抽取，改完重启一次。
+> `state` 里的 `runtime.extraction.scheduled` / `available` 能看出管线在不在（这块页面暂不展示）。
+
+### 配置优先级
+
+```text
+resolveConfig 内置默认值（46 个字段各一份）
+  < profile 的 cordis.patch.yml（loader 行 config）
+    < $DSH_HOME/memory/settings.json（设置页写的）
+```
+
+- 合并是**深合并**：YAML 与 settings 的对象层级递归合并，数组与标量整体覆盖（后者赢）。设置页只写「你显式改过的 key」，不整份拷贝默认值 → YAML 里以后调整别的字段仍然生效。
+- `source` 判定：settings 里出现过该 key → `settings`；否则 YAML 里出现过 → `config`；否则 `default`。所以「填一个和默认值一样的数」会把来源变成 `settings`，真想回默认请用行上的「恢复默认」。
+- 「恢复 YAML 基线」= 清掉 settings.json 里的全部覆盖 → 回到 **YAML + 默认**。它不是出厂值，也不动记忆库。
+
+### 文件在哪
+
+| 文件 | 位置 | 说明 |
+| --- | --- | --- |
+| 数据库 | `$DSH_HOME/memory/memory.db`（缺省 `~/.dsh/memory/memory.db`，可用 `storage.dbPath` 改） | schema v4、WAL 模式；同目录还有 `-wal` / `-shm` |
+| 设置文件 | `$DSH_HOME/memory/settings.json` | **固定**在这个目录，与 `storage.dbPath` 无关——否则「把库挪到别处」这条设置会把自己弄丢；删掉即回基线 |
+| 技能 | 包内 `skills/`（`skills.dir` 可改） | 加载时注册进宿主，不落盘 |
+
+> 存储卡片里列的是**数据库所在目录**（`storage.dbPath` 的父目录）；改了 `storage.dbPath` 以后目录也跟着换，而设置文件仍在 `$DSH_HOME/memory/`，卡片上的「设置文件路径」单独显示它。
+
+```json
+{
+  "version": 1,
+  "updatedAt": "2026-10-23T08:00:00.000Z",
+  "settings": {
+    "maxItems": 8,
+    "core": { "enabled": false },
+    "extraction": { "everyN": 10 },
+    "dbPath": "D:\\dsh\\memory.db"
+  }
+}
+```
+
+- `settings` 里是 **loader 行 config 的形状**，不是页面上的分组名：UI 的 `recall.maxItems` 落在顶层 `maxItems`，`extraction.everyN` 落在 `extraction.everyN`，`storage.dbPath` 落在顶层 `dbPath`。好处是这段 JSON 可以直接粘进 `cordis.patch.yml` 的 `config:`。
+- 写盘是「临时文件 + rename」的原子替换；`version`/`updatedAt` 只是记账，读回时会剔除，不会混进配置。
+- 文件坏掉（不是合法 JSON、顶层不是对象、超过 1 MB）→ 读回 `{}`，插件照常启动，原因显示在 `storage.error` 里。
+- 手写兼容：顶层没有 `settings` 包装时，整个对象会被当作 settings 层。
+- 设置文件的位置可以用 loader 行 config 里的 `settingsPath` 改（测试 / 打包用的口子，不属于设置页字段）。
+
+### 宿主 HTTP API
+
+页面只调这些端点，全部 **POST** + `content-type: application/json`，响应统一 `{ok:true,value}` / `{ok:false,error:{code,message}}`：
+
+| 端点 | 请求体 | 响应 `value` 要点 |
+| --- | --- | --- |
+| `POST /memory/api/state` | `{}` | `plugin{name,version,dbReady,startedAt}`、`storage{home,dir,dbPath,settingsPath,settingsExists,files[],totalBytes,error}`、`stats{total,facts,episodes,superseded,projects,byKind,l0Total,l0Pending,scenes,personas,vectorized,featureIndexed,tokensSpent,dbBytes}`、`runtime{extraction{available,provider,model,scheduled},skills{enabled,dir},vector{enabled}}`、`groups[].fields[]` |
+| `POST /memory/api/save` | `{"patch":{"recall.maxItems":8},"unset":["scenes.maxScenes"]}` | `{state, applied[], unset[], restartRequired[]}` |
+| `POST /memory/api/reset` | `{}` 或 `{"keys":["recall.maxItems"]}`（省略 `keys` = 全部） | `{state, applied[], restartRequired[], reset:true}` |
+| `POST /memory/api/reveal` | `{}` | `{opened,dir,error?}`：在系统文件管理器里打开**数据库所在目录**（Windows `explorer.exe`、macOS `open`、其他 `xdg-open`）；spawn 本身失败才回 `opened:false`，文件管理器异步启动失败只记日志 |
+| `POST /memory/api/memories` | `{query?,kind?,scope?,project?,includeSuperseded?,sort?,page?,pageSize?}` | 一页记忆 + 下拉筛选数据：`{items[],total,page,pageSize,pages,sort,includeSuperseded,facets{kinds[],scopes[],projects[],total}}`；`query` 是子串搜索（LIKE，2 字中文也能命中）；默认隐藏 `superseded_by` 非空的行，`includeSuperseded:true` 才带出来；`sort ∈ updated\|created\|priority\|id`，`pageSize` 上限 100 |
+| `POST /memory/api/memory` | `{id}` | `{item,history[]}`：单行 + 最近 10 条旧正文（`version/op/text/createdAt`） |
+| `POST /memory/api/memoryCreate` | `{text,title?,kind?,scope?,project?,tags?,pinned?,priority?}` | `{item,inserted}`；`text` 必填（≤ 20000 字）；**同文本幂等**：已存在时更新属性并回 `inserted:false`（`hash` 唯一索引决定一行只存一份正文）；`scope:'project'` 必须带 `project` |
+| `POST /memory/api/memoryUpdate` | `{id,text?,title?,kind?,scope?,project?,tags?,pinned?,priority?}` | `{item,version}`；只改传入的字段；**改正文**才 `version+1` 并写 `memory_history`，改标签/置顶/优先级只更新 `updated_at`；改正文会重算 `hash`/向量/特征索引；撞上另一行正文回 409 `conflict` |
+| `POST /memory/api/memoryDelete` | `{id}` 或 `{ids:[…]}` | `{deleted,ids[]}`；不存在的 id 被忽略；FTS 与特征索引由触发器一并清掉 |
+
+错误码：
+
+| code | HTTP | 触发 |
+| --- | --- | --- |
+| `bad-request` | 400 | 请求体不是 JSON object / 超过 64 KB、未知 key、类型或枚举不合法（`message` 形如 `recall.scope: expected one of "project", "global"`）；数据接口的非法正文/超长/未知 kind/项目缺名同样是 400；**不落盘** |
+| `conflict` | 409 | 改名后的正文和另一条记忆完全相同（`hash` 唯一）——`message` 会给出占用的行号，改成编辑那一行即可 |
+| `forbidden` | 403 | 宿主提供 connection 信任校验且请求被拒（跨站）——这一步在判断方法之前 |
+| `method-not-allowed` | 405 | 用了 POST 以外的方法 |
+| `not-found` | 404 | 未知方法 / 路径不匹配 / `memory`、`memoryUpdate` 的 id 不存在 |
+| `not-ready` | 503 | 数据库没打开（例如目录只读）：参数页照常可用，只有数据接口回这个 |
+| `io-error` | 500 | 写 `settings.json` 失败；内存里的运行时配置保持不变 |
+| `internal` | 500 | 兜底异常；细节只进日志 |
+
+> 纯 CLI / headless profile 没有 `webServer`，这套路由不会挂载，插件其余功能照常。
+
+### 恢复默认
+
+| 想做什么 | 怎么做 |
+| --- | --- |
+| 单个字段回默认 | 行上「恢复默认」→ 标成「待恢复」，随下一次「保存」以 `unset` 提交（只删 settings 层里这个 key） |
+| 整页回 YAML 基线 | 底部「恢复 YAML 基线」→ 立即调 `reset`（清空 settings 层），会先确认 |
+| 只用命令行 | 删 `$DSH_HOME/memory/settings.json`，再刷新页面 |
+| 连记忆一起重来 | 停 DSH，删 `~/.dsh/memory/`（数据库 + 设置一起没，不可恢复） |
+
+### 记忆数据管理（增删改查）
+
+「设置 → 记忆 → 记忆数据 → 管理数据」打开一个覆盖整个设置面板的弹窗，直接管 `memory` 表里的条目，不用再让模型调工具：
+
+| 动作 | 怎么做 | 背后 |
+| --- | --- | --- |
+| 查 | 搜索框（标题/正文/标签子串，2 字中文也命中）+ 类型/范围/项目下拉 + 「含已取代」开关 + 翻页（每页 20） | `memories` |
+| 增 | 「新增记忆」→ 填正文（必填）、标题、类型、范围、项目、标签、优先级、常驻 | `memoryCreate` |
+| 改 | 行上「编辑」→ 同一表单，带最近 10 条旧正文（历史版本） | `memory` + `memoryUpdate` |
+| 删 | 行上「删除」→ 二次确认 | `memoryDelete` |
+
+几个刻意设计的行为：
+
+- **改正文 ≠ 改属性**：正文变了才 `version+1`、写 `memory_history`、重算 `hash`/向量/倒排特征，和 LLM 抽取改写走同一套不变量；只改标签/优先级/常驻时 `version` 不动（版本号表示「第几版正文」）。
+- **同文本幂等**：`memory.hash` 是唯一索引，一行正文只存在一份。新增时命中已有正文 → 更新那条的属性并提示「相同内容已存在，已更新 #id」，不会报错也不会造重复行；编辑时撞上另一行 → 409，提示去改那一行。
+- **项目范围的硬约束**：`scope='project'` 必须给 `project`，否则这行在召回里永远不可见（所有读路径都按 `project = ?` 过滤）——host 直接 400，不静默改全局。
+- **删除是真的删**：FTS 行与 `memory_features` 由触发器一并清理；`memory_history` 保留（审计用途），和 `memory_forget` 的行为一致。
+- **`tags` 两种写法都收**：数组或逗号分隔字符串（中英文逗号均可），最多 20 个、每个 ≤ 64 字。
+- **弹窗用 portal 挂到 `<body>`**：设置面板可能处于滚动/变换容器里，`react-dom` 可用时用 `createPortal`，不可用时退化为 `position:fixed`。
+
+> 改完一条，页面顶部的统计卡会重新拉 `state`，计数立刻更新；弹窗自己的列表也会按当前筛选/页码重读。
 
 ## 工具
 
@@ -237,7 +407,7 @@ agent/pre-step（每轮首 step）
 
 ```powershell
 cd dsh-memory
-# 全量：153 项，0 fail
+# 全量：214 项，0 fail（settings 32 项 + 记忆数据 CRUD 18 项）
 node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)
 # 单文件
 node test/recall.test.js
@@ -260,7 +430,11 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 - `src/consolidate.js` — 场景归并、画像重写（项目/全局）、JEV-lite 判决
 - `src/recall.js` — 查询词、FTS/LIKE + 倒排预筛 + 向量混合打分、稳定/动态注入块
 - `src/capture.js` — v1 episode 捕获（兼容保留）
-- `index.js` — 与 dsh 接线（事件、pre-step、工具、降级）
+- `src/settings.js` — 字段目录（46 个 key）、`resolveConfig` 归一化、校验/深合并/来源、原地应用
+- `src/settings-store.js` — `settings.json` 读写（原子替换、损坏隔离）、存储目录描述
+- `src/data.js` — 记忆条目 CRUD（分页/筛选、hash 冲突、版本历史、向量与特征重算）
+- `src/api.js` — `POST /memory/api/*` 路由（POST-only、64 KB 上限、稳定错误码）
+- `index.js` — 与 dsh 接线（事件、pre-step、工具、设置页路由、降级）
 
 > 在受限环境里不要用 `node --test test/`（会 spawn 子进程触发 EPERM），逐个跑文件即可。
 

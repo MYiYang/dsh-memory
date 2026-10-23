@@ -53,7 +53,7 @@ function emitTurn(handlers, session, { user, assistant, tools = [] }) {
 test('plugin declares its services and loads with a temp database', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-'))
   const { ctx, handlers, tools, logs } = fakeCtx()
-  apply(ctx, { dbPath: join(dir, 'memory.db') })
+  apply(ctx, { dbPath: join(dir, 'memory.db'), settingsPath: join(dir, 'settings.json') })
   assert.deepEqual(inject, ['tools', 'agents', 'sessions'])
   assert.equal(name, 'memory')
   assert.ok(handlers.has('session/event'))
@@ -65,7 +65,7 @@ test('plugin declares its services and loads with a temp database', () => {
 test('capture writes one episode per completed turn and skips plugin-injected messages', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-'))
   const { ctx, handlers, tools } = fakeCtx()
-  apply(ctx, { dbPath: join(dir, 'memory.db') })
+  apply(ctx, { dbPath: join(dir, 'memory.db'), settingsPath: join(dir, 'settings.json') })
   const session = fakeSession()
 
   emitTurn(handlers, session, {
@@ -98,7 +98,7 @@ test('capture writes one episode per completed turn and skips plugin-injected me
 test('pre-step injects recalled memory once per turn and keeps the user decision', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-'))
   const { ctx, handlers, tools } = fakeCtx()
-  apply(ctx, { dbPath: join(dir, 'memory.db'), maxItems: 3 })
+  apply(ctx, { dbPath: join(dir, 'memory.db'), settingsPath: join(dir, 'settings.json'), maxItems: 3 })
 
   // seed one fact through the tool layer
   await tools.get('memory_save').execute(
@@ -148,7 +148,7 @@ test('pre-step injects recalled memory once per turn and keeps the user decision
 test('memory_forget removes a wrong memory by id', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-'))
   const { ctx, tools } = fakeCtx()
-  apply(ctx, { dbPath: join(dir, 'memory.db') })
+  apply(ctx, { dbPath: join(dir, 'memory.db'), settingsPath: join(dir, 'settings.json') })
   const saved = await tools.get('memory_save').execute({ text: '错误结论：CI 会跑测试' }, {})
   const id = Number(saved.text.match(/#(\d+)/)[1])
   const removed = await tools.get('memory_forget').execute({ ids: [id] }, {})

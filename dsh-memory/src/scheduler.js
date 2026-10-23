@@ -42,8 +42,8 @@ export function nextThreshold(current, everyN) {
  */
 export function createScheduler(options) {
   const db = options.db
-  const everyN = Math.max(1, Math.min(100, options.everyN ?? 5))
-  const idleMs = Math.max(50, options.idleMs ?? 60_000)
+  let everyN = Math.max(1, Math.min(100, options.everyN ?? 5))
+  let idleMs = Math.max(50, options.idleMs ?? 60_000)
   const now = options.now ?? Date.now
   const setTimer = options.setTimer ?? setTimeout
   const clearTimer = options.clearTimer ?? clearTimeout
@@ -151,5 +151,31 @@ export function createScheduler(options) {
     for (const sessionId of [...timers.keys()]) clearIdle(sessionId)
   }
 
-  return { noteTurn, trigger, dispose, everyN, idleMs }
+  /**
+   * Update the extraction cadence in place (Settings → Memory save).
+   *
+   * Already-armed idle timers keep the delay they were armed with; the next
+   * completed turn re-arms with the new one. That is deliberate: clearing a
+   * pending idle timer on save would silently drop the tail trigger.
+   * @param {{ everyN?: number, idleMs?: number }} [next]
+   * @returns {{ everyN: number, idleMs: number }}
+   */
+  const configure = (next = {}) => {
+    if (Number.isFinite(Number(next.everyN))) everyN = Math.max(1, Math.min(100, Math.floor(Number(next.everyN))))
+    if (Number.isFinite(Number(next.idleMs))) idleMs = Math.max(50, Number(next.idleMs))
+    return { everyN, idleMs }
+  }
+
+  return {
+    noteTurn,
+    trigger,
+    dispose,
+    configure,
+    get everyN() {
+      return everyN
+    },
+    get idleMs() {
+      return idleMs
+    },
+  }
 }

@@ -5,7 +5,10 @@
 
 零外部依赖：`node:sqlite`（FTS5）+ 进程内 384 维**词法**特征哈希向量，不联网、不要 Docker / 向量库 / embedding key。
 
+**设置 → 记忆**：GUI 里直接改 40+ 个记忆参数（保存即生效，`storage.dbPath` 等 5 个字段要重启）、看记忆库与设置文件到底在哪个目录、一键打开目录，也能一键恢复 YAML 基线；「记忆数据」还能直接搜索/新增/编辑/删除库里的条目。
+
 - 插件做什么、配置、评测数据：[dsh-memory/README.md](dsh-memory/README.md)
+- **设置页（记忆）**（改参数不用重启、看记忆库/设置文件在哪）：[dsh-memory/README.md](dsh-memory/README.md#设置页记忆)
 - **安装（三种路径）**：[dsh-memory/INSTALL.md](dsh-memory/INSTALL.md)
 - 设计与实现细节：[dsh-memory/DESIGN-v2.md](dsh-memory/DESIGN-v2.md)
 - **全局记忆失效审计**（为什么「标了全局」还会忘）：[dsh-memory/AUDIT-global-recall.md](dsh-memory/AUDIT-global-recall.md)
@@ -13,19 +16,19 @@
 
 ## 安装（给人看的三个入口）
 
-已发布版本：npm [`dsh-memory-layered@0.6.1`](https://www.npmjs.com/package/dsh-memory-layered) · GitHub [v0.6.1](https://github.com/MYiYang/dsh-memory/releases/tag/v0.6.1)
+已发布版本：npm [`dsh-memory-layered@0.7.0`](https://www.npmjs.com/package/dsh-memory-layered) · 仓库 [MYiYang/dsh-memory](https://github.com/MYiYang/dsh-memory)
 
 ```powershell
 # A. npm（推荐）：GUI 侧栏「插件」→「添加插件」→ 输包名；或
 dsh plugin --profile web add dsh-memory-layered
 # 再把 dsh-memory-layered 加进 profile 的 dsh.profile.bundles，重启
 
-# B. GitHub Release 里的 tarball（粘进 GUI 也行）
-dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.6.1/dsh-memory-layered-0.6.1.tgz
+# B. GitHub Release 里的 tarball（有对应 Release 时；把 <ver> 换成版本号，如 0.6.1）
+dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v<ver>/dsh-memory-layered-<ver>.tgz
 
-# C. 离线：下 dsh-memory-layered-0.6.1.zip → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz
-pwsh -File .\install.ps1 -From .\dsh-memory-layered-0.6.1.tgz -Apply
+# C. 离线：下 dsh-memory-layered-<ver>.zip → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz
+pwsh -File .\install.ps1 -From .\dsh-memory-layered-<ver>.tgz -Apply
 ```
 
 | 场景 | 一句话 |
