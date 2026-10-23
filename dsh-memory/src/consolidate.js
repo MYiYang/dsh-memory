@@ -95,13 +95,21 @@ export function buildScenePrompt(name, facts, existing = {}) {
 
 /**
  * Build the persona rewrite prompt.
+ *
+ * `maxChars` is only the hard cap (the model happily fills it, which is how a
+ * persona ends up twice the size the stable block can afford). When a
+ * `targetChars` is given the prompt asks for that length instead, so the
+ * generator itself stays lean.
+ *
  * @param {Array<Record<string, any>>} facts
  * @param {{ body?: string }} [existing]
- * @param {number} [maxChars]
+ * @param {number | { maxChars?: number, targetChars?: number }} [limits]
  * @param {'global'|'project'} [scope] - which persona is being written
  * @returns {{ system: string, user: string }}
  */
-export function buildPersonaPrompt(facts, existing = {}, maxChars = 1200, scope = 'project') {
+export function buildPersonaPrompt(facts, existing = {}, limits = 1200, scope = 'project') {
+  const maxChars = typeof limits === 'number' ? limits : Math.max(200, limits?.maxChars ?? 1200)
+  const targetChars = typeof limits === 'number' ? null : limits?.targetChars ?? null
   const lines = facts.slice(0, CONSOLIDATE_LIMITS.personaFacts).map(
     (row) => `- [${row.kind}${row.scope === 'global' ? '/global' : ''}] ${clip(row.text, 240)}`,
   )
@@ -110,7 +118,10 @@ export function buildPersonaPrompt(facts, existing = {}, maxChars = 1200, scope 
     user: [
       `目标画像：${scope === 'global' ? '全局画像' : '项目画像'}`,
       existing.body ? `现有画像：\n${clip(existing.body, 900)}` : '现有画像：无',
-      `目标长度：不超过 ${maxChars} 字。`,
+      targetChars === null
+        ? `目标长度：不超过 ${maxChars} 字。`
+        : `目标长度：约 ${targetChars} 字（硬上限 ${maxChars} 字）。写不下就删次要内容，不要为凑长度灌水。`,
+      '压缩要求：与「长期约定」或其他层重复的内容不要写；同一个意思只写一次；优先保留命令、路径、约束这类可执行信息。',
       '事实：',
       ...lines,
       '只输出约定的 JSON。',
@@ -361,6 +372,15 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   if (scope === 'project' && project === null) return { rewritten: false, reason: 'no-project' }
   const triggerEveryN = Math.max(1, config.triggerEveryN ?? 10)
   const maxChars = Math.max(200, config.maxChars ?? 1200)
+  // The generator aims at `targetChars`; `maxChars` stays the hard cap. Without
+  // this the model fills the cap and the persona crowds the stable block.
+  const targetChars = Math.min(
+    maxChars,
+    Math.max(
+      120,
+      scope === 'global' ? config.globalTargetChars ?? 240 : config.targetChars ?? 700,
+    ),
+  )
   // Keep `l3-batches:<project>` unchanged for projects (existing installs have
   // it); the global persona gets its own key so the two never reset each other.
   const batchKey = scope === 'global' ? 'l3-batches:@global' : `l3-batches:${project}`
@@ -390,22 +410,29 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
 
   const current = getPersona(db, { scope, project })
   if (current !== undefined) {
-    if (batches < triggerEveryN) return { rewritten: false, reason: 'deferred' }
-    const gate = await askJson(llm, buildGatePrompt(current, facts), {
-      maxTokens: 120,
-      timeoutMs: config.timeoutMs,
-      sessionId: ctx.sessionId,
-      signal: ctx.signal,
-    })
-    track(db, gate.usage)
-    const decision = typeof gate.value?.decision === 'string' ? gate.value.decision : 'none'
-    if (!['conflict', 'boundary_change', 'new_rule'].includes(decision)) {
-      log('debug', `l3 gate deferred (${decision})`)
-      return { rewritten: false, reason: `gate:${decision}` }
+    // An oversized persona is rewritten immediately: it does not fit the stable
+    // budget, so whether the new facts are "worth" a rewrite no longer matters.
+    const bloatLimit = Math.floor(targetChars * 1.4)
+    if (current.body.length > bloatLimit) {
+      log('debug', `l3 compact (${scope} ${current.body.length} > ${bloatLimit} chars)`)
+    } else {
+      if (batches < triggerEveryN) return { rewritten: false, reason: 'deferred' }
+      const gate = await askJson(llm, buildGatePrompt(current, facts), {
+        maxTokens: 120,
+        timeoutMs: config.timeoutMs,
+        sessionId: ctx.sessionId,
+        signal: ctx.signal,
+      })
+      track(db, gate.usage)
+      const decision = typeof gate.value?.decision === 'string' ? gate.value.decision : 'none'
+      if (!['conflict', 'boundary_change', 'new_rule'].includes(decision)) {
+        log('debug', `l3 gate deferred (${decision})`)
+        return { rewritten: false, reason: `gate:${decision}` }
+      }
     }
   }
 
-  const prompt = buildPersonaPrompt(facts, current ?? {}, maxChars, scope)
+  const prompt = buildPersonaPrompt(facts, current ?? {}, { maxChars, targetChars }, scope)
   const { value, usage } = await askJson(llm, prompt, {
     maxTokens: 1_200,
     timeoutMs: config.timeoutMs,

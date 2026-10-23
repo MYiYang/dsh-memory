@@ -81,7 +81,7 @@
       maxMemories: 10
       maxAttempts: 3
       timeoutMs: 60000
-      maxTokens: 1200
+      maxTokens: 2400           # 推理模型的 reasoning 也吃这份预算，别再往下调
     scenes:
       enabled: true
       minFacts: 3
@@ -89,8 +89,10 @@
       halfLifeDays: 14
     persona:
       enabled: true
-      triggerEveryN: 10
-      maxChars: 1200
+      triggerEveryN: 10         # 每 N 个成功批次过一道 JEV-lite 门控
+      maxChars: 1200            # 硬上限（超出直接截断）
+      targetChars: 700          # 生成目标长度；超过 1.4 倍即视为膨胀，当场重写压缩
+      globalTargetChars: 240    # 全局画像的生成目标（它与长期约定重复，宜更短）
       global: true              # 额外维护跨项目全局画像（只吃 global 事实）
     vector:
       enabled: true             # 关掉就只用 FTS/LIKE

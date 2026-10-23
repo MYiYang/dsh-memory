@@ -261,3 +261,33 @@ test('the eviction marker keeps the newest 200 entries and drops the oldest', as
   assert.equal(stored['场景001'], 1_001)
   assert.equal(stored['冷场景'], 2_000)
 })
+
+test('an oversized persona is compacted on the spot, without asking the gate', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  // 300 chars against a 120-char target: 1.4× bloat, so the batch count and the
+  // gate are both irrelevant — the profile does not fit the stable block.
+  putPersona(db, { scope: 'project', project: 'menm', body: '长'.repeat(300), now: 1 })
+  const llm = fakeLlm([JSON.stringify({ body: '## 用户偏好\n- 中文' })])
+  const result = await runPersona(db, llm, { triggerEveryN: 50, maxChars: 600, targetChars: 120 }, { project: 'menm', now: 2 })
+  assert.equal(result.rewritten, true)
+  assert.equal(result.version, 2)
+  assert.equal(llm.calls.length, 1) // rewrite only: no gate call
+  assert.match(llm.calls[0].user, /约 120 字/)
+  assert.match(llm.calls[0].user, /硬上限 600 字/)
+  assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).body, '## 用户偏好\n- 中文')
+
+  // A persona inside the bloat band still goes through the normal gate path.
+  const gatedLlm = fakeLlm([JSON.stringify({ decision: 'none' })])
+  const gated = await runPersona(db, gatedLlm, { triggerEveryN: 50, maxChars: 600, targetChars: 120 }, { project: 'menm', now: 3 })
+  assert.equal(gated.reason, 'deferred')
+})
+
+test('the persona prompt asks for the target length and forbids duplication', () => {
+  const prompt = buildPersonaPrompt([{ kind: 'work_fact', text: '用 pnpm' }], { body: '旧画像' }, { maxChars: 900, targetChars: 400 })
+  assert.match(prompt.user, /约 400 字/)
+  assert.match(prompt.user, /硬上限 900 字/)
+  assert.match(prompt.user, /压缩要求/)
+  // Without a target the old contract still holds.
+  assert.match(buildPersonaPrompt([], {}, 800).user, /不超过 800 字/)
+})

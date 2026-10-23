@@ -106,6 +106,10 @@ function resolveConfig(raw) {
       enabled: persona.enabled !== false,
       triggerEveryN: number(persona.triggerEveryN, 10, 1, 100),
       maxChars: number(persona.maxChars, 1200, 200, 8000),
+      // What the generator aims at (maxChars stays the hard cap). A persona
+      // longer than 1.4× the target is rewritten on the spot ("compact").
+      targetChars: number(persona.targetChars, 700, 120, 8000),
+      globalTargetChars: number(persona.globalTargetChars, 240, 120, 8000),
       // L3 also maintains a cross-project profile built from global facts.
       // It has its own batch counter and gate, so it never starves the project one.
       global: persona.global !== false,
