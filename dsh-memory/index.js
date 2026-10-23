@@ -22,7 +22,7 @@ import { randomUUID } from 'node:crypto'
 import { openDatabase, saveMemory, forgetMemories, stats, getMeta, coreMemories, touchMemories, CORE_PRIORITY } from './src/store.js'
 import { recall, renderMemoryBlock, renderStableBlock } from './src/recall.js'
 import { captureTurn, extractText } from './src/capture.js'
-import { appendTurn } from './src/l0.js'
+import { appendTurn, pendingSessionIds } from './src/l0.js'
 import { listPersonas, sceneNavigation } from './src/profile.js'
 import { createScheduler } from './src/scheduler.js'
 import { createPipeline } from './src/pipeline.js'
@@ -691,18 +691,49 @@ export function apply(ctx, rawConfig) {
       ctx.tools.register({
         name: 'memory_extract',
         description:
-          'Force one memory extraction for the current session now (debug/recovery). Normally extraction runs automatically every few turns; call this only when asked to refresh memories explicitly.',
-        parameters: { type: 'object', additionalProperties: false, properties: {} },
+          'Force one memory extraction for the current session now (debug/recovery). Pass all:true to drain the backlog of every session with un-extracted L0 turns (bounded to 20 sessions), or sessionId to process one specific session. Normally extraction runs automatically every few turns; call this only when asked to refresh memories explicitly.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            all: {
+              type: 'boolean',
+              description: 'Process every session that still has un-extracted L0 turns (oldest backlog first, max 20 sessions).',
+            },
+            sessionId: {
+              type: 'string',
+              description: 'Process one specific persisted session id instead of the current session.',
+            },
+          },
+        },
         output: textOutput(),
-        execute: async (_args, exec) => {
+        execute: async (args, exec) => {
           if (pipeline === null) return { text: 'extraction disabled (layers.l1 or extraction.enabled is off)' }
-          const sessionId = exec?.agent?.session?.id
-          if (typeof sessionId !== 'string' || sessionId === '') return { text: 'no active session' }
-          pipeline.schedule(sessionId, 'manual')
+          const before = Number(
+            getDb().prepare('SELECT COUNT(*) AS n FROM l0_turns WHERE extracted_at IS NULL').get()?.n ?? 0,
+          )
+          /** @type {string[]} */
+          let targets = []
+          if (args?.all === true) {
+            targets = pendingSessionIds(getDb(), 20).map((row) => row.sessionId)
+            if (targets.length === 0) return { text: 'no session with pending l0 turns' }
+          } else if (typeof args?.sessionId === 'string' && args.sessionId.trim() !== '') {
+            targets = [args.sessionId.trim()]
+          } else {
+            const sessionId = exec?.agent?.session?.id
+            if (typeof sessionId !== 'string' || sessionId === '') return { text: 'no active session' }
+            targets = [sessionId]
+          }
+          for (const sessionId of targets) pipeline.schedule(sessionId, 'manual')
           await pipeline.flush()
           const reason = getMeta(getDb(), 'l1-last-reason') ?? 'unknown'
           const summary = getMeta(getDb(), 'l1-last-summary') ?? '{}'
-          return { text: `extract reason=${reason} summary=${summary}` }
+          const after = Number(
+            getDb().prepare('SELECT COUNT(*) AS n FROM l0_turns WHERE extracted_at IS NULL').get()?.n ?? 0,
+          )
+          return {
+            text: `extract reason=${reason} sessions=${targets.length} pending=${after}/${before} summary=${summary}`,
+          }
         },
       }),
     )

@@ -14,6 +14,7 @@ import {
   parseExtraction,
   parseJsonLoose,
   repairJson,
+  repairStringEscapes,
   stripNoise,
   withCandidates,
 } from '../src/extract.js'
@@ -38,6 +39,23 @@ test('extractJsonSlice is string-aware and repairJson fixes usual slips', () => 
   assert.equal(parseJsonLoose('garbage only'), null)
 })
 
+test('repairJson fixes unescaped Windows paths and raw control chars in strings', () => {
+  // The model pastes paths verbatim; `\U` / `\.` / `\m` are not valid JSON escapes.
+  const windowsPath = '{"memories":[{"kind":"work_fact","text":"库在 C:\\Users\\17915\\.dsh\\memory.db","priority":60}]}'
+  const parsedPath = parseExtraction(windowsPath)
+  assert.equal(parsedPath.reason, 'ok')
+  assert.equal(parsedPath.memories[0].text, '库在 C:\\Users\\17915\\.dsh\\memory.db')
+
+  // Literal newlines inside a string are invalid JSON too.
+  const withNewline = '{"memories":[{"kind":"work_fact","text":"第一行\n第二行"}]}'
+  const parsedNewline = parseExtraction(withNewline)
+  assert.equal(parsedNewline.reason, 'ok')
+  assert.equal(parsedNewline.memories[0].text, '第一行 第二行')
+
+  // Valid escapes must survive untouched.
+  assert.equal(repairStringEscapes('{"p":"C:\\\\Users","q":"a\\nb"}'), '{"p":"C:\\\\Users","q":"a\\nb"}')
+})
+
 test('parseExtraction normalizes kinds, clamps priority, clips text and dedupes', () => {
   const long = 'x'.repeat(EXTRACT_LIMITS.text + 50)
   const raw = JSON.stringify({
@@ -58,6 +76,16 @@ test('parseExtraction normalizes kinds, clamps priority, clips text and dedupes'
   assert.equal(result.memories[1].priority, 0)
   assert.equal(result.memories[2].text.length, EXTRACT_LIMITS.text)
   assert.equal(result.memories.filter((m) => m.text === '偏好 pwsh').length, 1)
+})
+
+test('parseExtraction prefers the final memories slice over an earlier example', () => {
+  const raw = [
+    '推理里先写个示例：{"memories":[{"kind":"work_fact","text":"示例事实"}]}',
+    '真正答案：{"memories":[{"kind":"work_fact","text":"真实事实"}]}',
+  ].join('\n')
+  const result = parseExtraction(raw)
+  assert.equal(result.reason, 'ok')
+  assert.deepEqual(result.memories.map((memory) => memory.text), ['真实事实'])
 })
 
 test('parseExtraction reports closed reasons for empty, parse and filtered outputs', () => {

@@ -20,6 +20,7 @@ import {
   getCursor,
   markTurnsExtracted,
   pendingCount,
+  pendingSessionIds,
   pendingTurns,
   pruneTurns,
   updateCursor,
@@ -146,6 +147,19 @@ test('l0 prune keeps the newest extracted turns and never drops pending ones', (
   assert.deepEqual(remaining, [5])
   const extracted = db.prepare('SELECT turn FROM l0_turns WHERE extracted_at IS NOT NULL ORDER BY turn').all().map((row) => row.turn)
   assert.deepEqual(extracted, [3, 4])
+})
+
+test('pendingSessionIds lists each backlogged session once, oldest backlog first', () => {
+  const db = memoryDb()
+  appendTurn(db, { sessionId: 's1', turn: 1, userText: 'a', assistantText: 'A' }, 100)
+  appendTurn(db, { sessionId: 's2', turn: 1, userText: 'b', assistantText: 'B' }, 200)
+  appendTurn(db, { sessionId: 's1', turn: 2, userText: 'c', assistantText: 'C' }, 300)
+  appendTurn(db, { sessionId: 's3', turn: 1, userText: 'd', assistantText: 'D' }, 400)
+  // s2 is processed: it must disappear from the backlog list.
+  markTurnsExtracted(db, [pendingTurns(db, 's2')[0].id], 500)
+  const rows = pendingSessionIds(db, 10)
+  assert.deepEqual(rows.map((row) => row.sessionId), ['s1', 's3'])
+  assert.deepEqual(rows.map((row) => row.pending), [2, 1])
 })
 
 test('buildTranscript keeps newest turns within budget and restores order', () => {

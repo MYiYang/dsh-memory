@@ -115,7 +115,7 @@
 | `memory_save` | `text`, `kind?`, `scope?`, `tags?`, `pinned?` | 人工固化一条记忆（同文本幂等） |
 | `memory_forget` | `ids?` / `query?` | 删除错误/过期记忆 |
 | `memory_stats` | — | 分层计数、L0 待抽取数、场景/画像数、token 花费、库大小 |
-| `memory_extract` | — | **手动**补跑一次抽取（调试/恢复；正常无需调用） |
+| `memory_extract` | `all?`, `sessionId?` | **手动**补跑抽取（调试/恢复）；`all:true` 处理所有还有 L0 待抽取的会话（最多 20 个，最老积压优先） |
 
 ## 工作方式
 
@@ -215,7 +215,8 @@ agent/pre-step（每轮首 step）
 | 插件列表里看不到 `dsh-memory` | 只写了 patch insert，没注册成 bundle | `pwsh -File .\install.ps1 -Apply` → 重启 |
 | 条目 `enabled: true` 但 `fiberPhase: null`，工具消失 | `node_modules/dsh-memory` 断链或目录丢失 | 同上（脚本会重建 link） |
 | 本轮失败：`format v4 message requires a producer-owned source kind` | 注入消息用了旧 source 形状 | 本版已用 `{ kind: 'plugin:dsh-memory' }` |
-| `memory_stats` 里 `l0` 一直不降 | 没有 llm 服务/模型，或抽取一直失败 | 看日志 `[dsh-memory]`；`l1-last-reason` 会写 `llm_error/parse/timeout` |
+| `memory_stats` 里 `l0` 一直不降 | 没有 llm 服务/模型，或抽取一直失败；重启后旧会话不会自动重试 | 看日志 `[dsh-memory]`；`l1-last-reason` 会写 `llm_error/parse/timeout`；调 `memory_extract` 传 `{all:true}` 补抽积压 |
+| 抽取 `reason=parse` | 模型把 Windows 路径写成单反斜杠（`\U`/`\m` 非法转义），或前面带示例 JSON | 本版 `repairStringEscapes` 修非法转义与裸控制字符，并在多个 JSON 片段中选 `memories` 最多的一个；仍失败可用 `all:true` 重跑 |
 | 没有人格/场景 | 事实太少（`minFacts`）或还没到 `triggerEveryN` | 多聊几轮，或调小阈值 |
 | 召回为空 | 语料太少，或 2 字中文走 LIKE 兜底 | 用 `memory_save` 固化关键结论（`fact` 权重高） |
 | `memory_stats` 的 `vec=` 小于总数 | 旧行还没回填（每次 open 最多补 500 行）或写入路径没跑 v3 | 重启一次让它继续回填；或 `enabled: false` 临时关掉向量 |
@@ -228,7 +229,7 @@ agent/pre-step（每轮首 step）
 
 ```powershell
 cd dsh-memory
-# 全量：149 项，0 fail
+# 全量：153 项，0 fail
 node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)
 # 单文件
 node test/recall.test.js
@@ -269,4 +270,5 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
   有独立的批次计数 `l3-batches:@global` 与 JEV-lite 门控；与 core 长期约定层互补（core 管「每轮必须遵守的规则」，
   全局画像管跨项目的背景与决策摘要）。只想要项目画像可设 `persona.global: false`。
 - 抽取/场景/画像共用会话模型；想更省可配便宜模型（`extraction.model`）。
+- 重启后旧会话的 L0 待抽取**不会自动重试**（idle timer 是进程内的）；用 `memory_extract {all:true}` 按最老积压补抽，最多 20 个会话。
 - 单机单库；多人共享需换存储后端（接口隔离在 `store.js`）。

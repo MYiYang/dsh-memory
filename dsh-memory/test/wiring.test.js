@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
 import { openDatabase, saveMemory } from '../src/store.js'
-import { pendingCount } from '../src/l0.js'
+import { appendTurn, pendingCount } from '../src/l0.js'
 
 function fakeCtx(extractionBatches = [], extras = {}) {
   const handlers = new Map()
@@ -124,6 +124,38 @@ test('memory_extract tool forces a run and reports status', async () => {
   emitTurn(handlers, session, { turn: 1, user: '数据库是什么', assistant: 'MySQL' })
   const result = await tools.get('memory_extract').execute({}, { agent: { session } })
   assert.match(result.text, /extract reason=ok/)
+})
+
+test('memory_extract all drains the backlog of inactive sessions after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-wiring5-'))
+  const dbPath = join(dir, 'memory.db')
+  // Two sessions that will never receive another turn in this process: their
+  // pending turns must still be recoverable through the maintenance tool.
+  const seed = openDatabase(dbPath)
+  appendTurn(seed, { sessionId: 'old-a', turn: 1, project: 'menm', userText: '旧会话 A 的问题', assistantText: '旧会话 A 的结论' }, 1)
+  appendTurn(seed, { sessionId: 'old-b', turn: 1, project: 'menm', userText: '旧会话 B 的问题', assistantText: '旧会话 B 的结论' }, 2)
+  seed.close()
+
+  const { ctx, tools } = fakeCtx([
+    [{ kind: 'work_fact', text: '旧会话 A 的事实', priority: 60 }],
+    [{ kind: 'work_fact', text: '旧会话 B 的事实', priority: 60 }],
+  ])
+  apply(ctx, {
+    dbPath,
+    capture: false,
+    extraction: { everyN: 100, idleMs: 60_000, provider: 'fake', model: 'fake' },
+    scenes: { enabled: false },
+    persona: { enabled: false },
+  })
+
+  const result = await tools.get('memory_extract').execute({ all: true }, {})
+  assert.match(result.text, /sessions=2/)
+  assert.match(result.text, /pending=0\/2/)
+  const db = openDatabase(dbPath)
+  assert.equal(pendingCount(db, 'old-a'), 0)
+  assert.equal(pendingCount(db, 'old-b'), 0)
+  const facts = db.prepare("SELECT text FROM memory WHERE source = 'extract' ORDER BY text").all().map((row) => row.text)
+  assert.deepEqual(facts, ['旧会话 A 的事实', '旧会话 B 的事实'])
 })
 
 test('enabled L2/L3 turns facts into a scene block and a persona', async () => {

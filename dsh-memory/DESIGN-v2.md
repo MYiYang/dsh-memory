@@ -357,7 +357,7 @@ const model    = config.extraction.model    || selection?.model
 | `memory_save` | 不变；kind 枚举扩展到新类型 |
 | `memory_forget` | 支持 `layer` 过滤删除 |
 | `memory_stats` | 增加 l0 未抽取数、facts by kind、scenes、persona version、token 花费 |
-| `memory_extract` | 手动触发一次抽取（调试/补跑），返回 op 统计 |
+| `memory_extract` | 手动触发抽取（调试/补跑）；`all:true` 补抽全部有 L0 积压的会话（≤20 个），`sessionId` 指定单个会话 |
 | `memory_scene` | 读场景正文（name 或 top N） |
 
 工具数 6 个，仍然轻量；`memory_extract` 不自动暴露给普通对话（description 写明「调试用」）。
@@ -440,11 +440,11 @@ const model    = config.extraction.model    || selection?.model
 - `vector`：确定性、L2 归一化、相似/不相似、2 字中文重叠、pack/unpack 宽度、FNV-1a 稳定性。
 - `feature-index`：topFeatures 确定性与上限、index/replace、候选按稀有特征提名、scope/kinds/superseded 过滤、backfill、删除触发器、空特征哨兵、模型变更清表。
 - `recall`：FTS/LIKE 候选、priority/kind 打分、向量加分、倒排预筛救回 2 字拉丁查询、`prefilter:false` 兜底路径、stable/dynamic 注入块预算。
-- `extract`：prompt 构造；JSON 容错（think/围栏/裸 priority/坏条）；op 决策启发式；输出白名单。
+- `extract`：prompt 构造；JSON 容错（think/围栏/裸 priority/坏条、Windows 路径的非法反斜杠、裸控制字符、多个示例片段中选最终答案）；op 决策启发式；输出白名单。
 - `scheduler`：阈值 1→2→4→8→5；idle；失败重试；dispose 取消。用注入的 `now` + 假定时器，不 sleep。
 - `llm`：假 llm 服务（脚本化响应）+ 超时/错误分支。
-- `plugin`：模拟多轮 → L0 入库 → 触发抽取 → 注入 stable+dynamic；注入 source kind 仍为 `plugin:dsh-memory`。
-- 回归：149 个测试全绿（v0.5.0；v0.3.0 时 93）。
+- `plugin`：模拟多轮 → L0 入库 → 触发抽取 → 注入 stable+dynamic；注入 source kind 仍为 `plugin:dsh-memory`；`memory_extract {all:true}` 补抽非活跃会话。
+- 回归：153 个测试全绿（v0.5.0；v0.3.0 时 93）。
 
 ---
 
@@ -734,7 +734,33 @@ SQLite 的 `LIMIT` 在这里等于「按 rowid 取最老的 2000 行」：大库
 
 ### 23.4 回归
 
-- DSH 插件测试：**117 → 149 项全绿**（新增 feature-index 13、recall 3、store 3、profile 4、consolidate 8、wiring 1）。
+- DSH 插件测试：**117 → 153 项全绿**（新增 feature-index 13、recall 3、store 3、profile 4、consolidate 8、extract 2、layers 1、wiring 2）。
 - 迁移验证（真实库副本 139 条）：v3→v4 open 64ms，`schema=4`、`feat=139/139`、11,921 特征行；
   5 条真实查询召回 0.85–6ms，命中包含 pinned #104。
 - 命令：`node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)`。
+
+### 23.5 L1 抽取 parse 修复与存量 L0 补抽（2026-10-23）
+
+**症状**：live 库 `l0=15/30` 待抽取、`l1-last-reason=parse`；重启后旧会话的待抽取不会自动重试
+（scheduler 的 idle timer 是进程内的），积压最老到前一天 16:41。
+
+**根因**（用 headless 模型重放同一批提示复现）：
+
+1. 模型把 Windows 路径按单反斜杠写进 JSON 字符串（`C:\Users\…` 里的 `\U`/`\m` 不是合法转义），`JSON.parse` 直接失败；
+   旧 `repairJson` 只修尾逗号/裸键/单引号，不修非法转义。
+2. 模型在推理里先打印示例 `{"memories":[...]}`，旧 `parseExtraction` 只取第一个 `{`，于是解析到示例或直接失败。
+
+**修复**：
+
+- `repairStringEscapes()`：string-aware 修复字符串内的非法反斜杠、裸换行/制表/控制字符；合法转义保持不动。
+- `extractJsonSlices()` / `parseJsonCandidates()`：遍历全部顶层 JSON 片段；`parseExtraction`/`parseDedupe`
+  选 `memories`/`decisions` 最多的一项（数量相同取后者，即最终答案）。
+- `memory_extract` 新增 `all` / `sessionId`：`all` 按最老积压优先处理最多 20 个会话，专治重启后旧会话 backlog；
+  底层 `pendingSessionIds()` 负责分组查询。
+- 测试 +4（extract 2、l0 1、wiring 1）。
+
+**真实库补抽**（2026-10-23 10:47–10:55）：对 8 个会话 / 15 条待抽取 L0 用 headless 模型重跑抽取，
+人工剔除过期/重复/跨项目噪音后写入 39 条（ids 145–183），15 条 L0 全部标记已抽取，`pending 15→0`；
+备份在 `.tmp/memory-backup-20261023-104808/`。修复前 8 个输出里有 3 个拿不到正确结果（2 个 parse 失败、
+1 个只解析到推理示例），修复后 8/8 正确。补抽走的是离线脚本而非真实 pipeline，所以本轮没有触发 L2/L3；
+重启后可直接用 `memory_extract {all:true}` 走真实 pipeline。

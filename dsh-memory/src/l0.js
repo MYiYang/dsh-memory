@@ -90,6 +90,33 @@ export function pendingTurns(db, sessionId, limit = 20) {
 }
 
 /**
+ * Sessions that still have un-extracted turns, oldest backlog first.
+ *
+ * Used by the manual `memory_extract` maintenance path: the idle scheduler is
+ * process-local, so after a restart nothing ever retries a session that is no
+ * longer active. This query is what lets the user drain that backlog.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} [limit]
+ * @returns {Array<{ sessionId: string, pending: number, firstId: number }>}
+ */
+export function pendingSessionIds(db, limit = 20) {
+  const rows = db
+    .prepare(
+      `SELECT session_id, COUNT(*) AS pending, MIN(id) AS first_id
+         FROM l0_turns WHERE extracted_at IS NULL
+        GROUP BY session_id ORDER BY first_id
+        LIMIT ?`,
+    )
+    .all(Math.max(1, Math.min(100, limit)))
+  return rows.map((row) => ({
+    sessionId: String(row.session_id),
+    pending: Number(row.pending ?? 0),
+    firstId: Number(row.first_id ?? 0),
+  }))
+}
+
+/**
  * Number of turns waiting for extraction in one session.
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {string} sessionId

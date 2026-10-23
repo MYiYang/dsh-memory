@@ -75,8 +75,74 @@ export function stripNoise(raw) {
 }
 
 /**
+ * Repair raw string-literal damage that makes JSON.parse throw.
+ *
+ * The model often pastes Windows paths into a fact (`C:\Users\…`) without
+ * escaping the backslashes; JSON only allows `\" \\ \/ \b \f \n \r \t \uXXXX`.
+ * It also occasionally emits a literal newline/tab inside a string. Both are
+ * repaired here, string-aware, so valid escapes are left untouched.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function repairStringEscapes(text) {
+  const source = String(text ?? '')
+  let out = ''
+  let inString = false
+  const validSimple = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't'])
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i]
+    if (!inString) {
+      out += ch
+      if (ch === '"') inString = true
+      continue
+    }
+    if (ch === '"') {
+      inString = false
+      out += ch
+      continue
+    }
+    if (ch === '\\') {
+      const next = source[i + 1]
+      if (next !== undefined && validSimple.has(next)) {
+        out += ch + next
+        i += 1
+        continue
+      }
+      if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(source.slice(i + 2, i + 6))) {
+        out += source.slice(i, i + 6)
+        i += 5
+        continue
+      }
+      // A lone backslash (typical Windows path): escape the slash itself and
+      // let the following character be processed normally.
+      out += '\\\\'
+      continue
+    }
+    if (ch === '\n') {
+      out += '\\n'
+      continue
+    }
+    if (ch === '\r') {
+      out += '\\r'
+      continue
+    }
+    if (ch === '\t') {
+      out += '\\t'
+      continue
+    }
+    if (ch.charCodeAt(0) < 0x20) {
+      out += `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/**
  * Light JSON repair for the usual model slips: trailing commas, bare keys,
- * single-quoted strings, unquoted numeric priority.
+ * single-quoted strings, unquoted numeric priority, and invalid string escapes.
  * @param {string} text
  * @returns {string}
  */
@@ -87,7 +153,8 @@ export function repairJson(text) {
   value = value.replace(/(:\s*)'([^'\\]*)'/g, '$1"$2"')
   // {"priority": 60} is fine; `priority: 60` (bare key) is not
   value = value.replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
-  return value
+  // Must run last: it rewrites backslashes only inside string literals.
+  return repairStringEscapes(value)
 }
 
 /**
@@ -128,6 +195,57 @@ export function extractJsonSlice(text) {
     }
   }
   return null
+}
+
+/**
+ * All top-level JSON slices in `text`, in source order.
+ *
+ * Models (and the headless runner) sometimes print an illustrative example
+ * object before the real answer. Taking only the first slice then parses the
+ * example or fails on it; extraction instead needs to consider every slice and
+ * pick the one shaped like `{"memories": [...]}` / a decisions array.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function extractJsonSlices(text) {
+  const source = stripNoise(text)
+  /** @type {string[]} */
+  const slices = []
+  let index = 0
+  while (index < source.length) {
+    const rest = source.slice(index)
+    const slice = extractJsonSlice(rest)
+    if (slice === null) break
+    const start = index + rest.indexOf(slice)
+    slices.push(slice)
+    index = start + slice.length
+  }
+  return slices
+}
+
+/**
+ * Parse every JSON slice, tolerantly. Invalid slices are simply skipped.
+ * @param {string} text
+ * @returns {unknown[]}
+ */
+export function parseJsonCandidates(text) {
+  /** @type {unknown[]} */
+  const values = []
+  for (const slice of extractJsonSlices(text)) {
+    try {
+      values.push(JSON.parse(slice))
+      continue
+    } catch {
+      /* try repair below */
+    }
+    try {
+      values.push(JSON.parse(repairJson(slice)))
+    } catch {
+      /* not JSON after all */
+    }
+  }
+  return values
 }
 
 /**
@@ -184,25 +302,37 @@ export function normalizeMemoryItem(item) {
  */
 export function parseExtraction(raw, options = {}) {
   const maxMemories = Math.max(1, Math.min(50, options.maxMemories ?? EXTRACT_LIMITS.memories))
-  const value = parseJsonLoose(raw)
-  if (value === null) return { memories: [], reason: 'parse' }
-  const list = Array.isArray(value)
-    ? value
-    : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).memories)
-      ? /** @type {any} */ (value).memories
-      : null
-  if (list === null) return { memories: [], reason: 'parse' }
-  /** @type {Array<{ kind: string, text: string, priority: number, scene: string|null }>} */
-  const memories = []
-  for (const item of list) {
-    const normalized = normalizeMemoryItem(item)
-    if (normalized === null) continue
-    if (memories.some((entry) => entry.text === normalized.text)) continue
-    memories.push(normalized)
-    if (memories.length >= maxMemories) break
+  const values = parseJsonCandidates(raw)
+  if (values.length === 0) return { memories: [], reason: 'parse' }
+
+  /** @type {{ memories: Array<{ kind: string, text: string, priority: number, scene: string|null, scope?: 'global'|null }>, listLength: number } | null} */
+  let best = null
+  for (const value of values) {
+    const list = Array.isArray(value)
+      ? value
+      : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).memories)
+        ? /** @type {any} */ (value).memories
+        : null
+    if (list === null) continue
+    /** @type {Array<{ kind: string, text: string, priority: number, scene: string|null }>} */
+    const memories = []
+    for (const item of list) {
+      const normalized = normalizeMemoryItem(item)
+      if (normalized === null) continue
+      if (memories.some((entry) => entry.text === normalized.text)) continue
+      memories.push(normalized)
+      if (memories.length >= maxMemories) break
+    }
+    // Prefer the candidate with the most usable memories: a reasoning trace may
+    // print `{"memories":[...]}` as an example before the real answer. On a tie
+    // the later candidate wins, because the model's final answer comes last.
+    if (best === null || memories.length > best.memories.length || (memories.length > 0 && memories.length === best.memories.length)) {
+      best = { memories, listLength: list.length }
+    }
   }
-  if (memories.length === 0) return { memories: [], reason: list.length === 0 ? 'empty' : 'filtered' }
-  return { memories, reason: 'ok' }
+  if (best === null) return { memories: [], reason: 'parse' }
+  if (best.memories.length === 0) return { memories: [], reason: best.listLength === 0 ? 'empty' : 'filtered' }
+  return { memories: best.memories, reason: 'ok' }
 }
 
 /**
@@ -259,32 +389,37 @@ export function buildDedupePrompt(plan) {
  * @returns {Array<{ index: number, op: 'store'|'update'|'merge'|'skip', targetId: number|null, mergeIds: number[], text: string|null }>}
  */
 export function parseDedupe(raw, count) {
-  const value = parseJsonLoose(raw)
-  const list = Array.isArray(value)
-    ? value
-    : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).decisions)
-      ? /** @type {any} */ (value).decisions
-      : null
-  if (list === null) return []
+  const values = parseJsonCandidates(raw)
   const ops = new Set(['store', 'update', 'merge', 'skip'])
   /** @type {Array<any>} */
-  const decisions = []
-  for (const item of list) {
-    if (item === null || typeof item !== 'object') continue
-    const record = /** @type {Record<string, unknown>} */ (item)
-    const index = Number(record.i ?? record.index)
-    if (!Number.isInteger(index) || index < 0 || index >= count) continue
-    const op = String(record.op ?? '').trim()
-    if (!ops.has(op)) continue
-    const targetId = Number(record.target_id ?? record.targetId ?? 0)
-    const mergeIds = Array.isArray(record.merge_ids)
-      ? record.merge_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0)
-      : []
-    const text = typeof record.text === 'string' && record.text.trim() !== '' ? clip(record.text, EXTRACT_LIMITS.text) : null
-    decisions.push({ index, op, targetId: targetId > 0 ? targetId : null, mergeIds, text })
-    if (decisions.length >= count) break
+  let best = []
+  for (const value of values) {
+    const list = Array.isArray(value)
+      ? value
+      : value !== null && typeof value === 'object' && Array.isArray(/** @type {any} */ (value).decisions)
+        ? /** @type {any} */ (value).decisions
+        : null
+    if (list === null) continue
+    /** @type {Array<any>} */
+    const decisions = []
+    for (const item of list) {
+      if (item === null || typeof item !== 'object') continue
+      const record = /** @type {Record<string, unknown>} */ (item)
+      const index = Number(record.i ?? record.index)
+      if (!Number.isInteger(index) || index < 0 || index >= count) continue
+      const op = String(record.op ?? '').trim()
+      if (!ops.has(op)) continue
+      const targetId = Number(record.target_id ?? record.targetId ?? 0)
+      const mergeIds = Array.isArray(record.merge_ids)
+        ? record.merge_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0)
+        : []
+      const text = typeof record.text === 'string' && record.text.trim() !== '' ? clip(record.text, EXTRACT_LIMITS.text) : null
+      decisions.push({ index, op, targetId: targetId > 0 ? targetId : null, mergeIds, text })
+      if (decisions.length >= count) break
+    }
+    if (decisions.length > best.length) best = decisions
   }
-  return decisions
+  return best
 }
 
 /**
