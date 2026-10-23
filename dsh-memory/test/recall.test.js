@@ -147,8 +147,7 @@ test('renderStableBlock frames persona and scene navigation with a budget', () =
   assert.ok(!tiny.includes('全局画像'))
 })
 
-test('scoreRow adds a bounded vector contribution', () => {
-  const now = Date.now()
+test('scoreRow adds a bounded vector contribution', () => {  const now = Date.now()
   const base = { id: 1, kind: 'work_fact', scope: 'project', project: 'menm', text: 't', created_at: now, updated_at: now, use_count: 0, pinned: 0 }
   const cold = scoreRow(base, { now, project: 'menm', bm25: -4, vector: 0, vectorWeight: 0.35 })
   const warm = scoreRow(base, { now, project: 'menm', bm25: -4, vector: 1, vectorWeight: 0.35 })
@@ -188,5 +187,31 @@ test('vector scan rescues a candidate that FTS and LIKE both miss', () => {
   })
   assert.equal(withVector.items.length, 1)
   assert.equal(withVector.items[0].id, saved.id)
+  db.close()
+})
+
+test('a weak bm25 hit never scores below a row without any lexical signal', () => {
+  const now = Date.now()
+  const row = { id: 1, kind: 'work_fact', scope: 'project', project: 'menm', text: 't', created_at: now, updated_at: now, use_count: 0, pinned: 0 }
+  const noSignal = scoreRow(row, { now, project: 'menm' })
+  const weak = scoreRow(row, { now, project: 'menm', bm25: -0.5 })
+  const strong = scoreRow(row, { now, project: 'menm', bm25: -6 })
+  assert.equal(weak, noSignal, 'a 0.5 bm25 hit must not be worse than no hit at all')
+  assert.ok(strong > weak)
+})
+
+test('a project scope without a project key sees global rows only', () => {
+  const db = openDatabase(':memory:')
+  const now = Date.now()
+  saveMemory(db, { text: '全局偏好：回答用中文', kind: 'fact', scope: 'global' }, now)
+  saveMemory(db, { text: 'menm 项目偏好：回答用中文', kind: 'fact', scope: 'project', project: 'menm' }, now)
+  saveMemory(db, { text: 'dsh 项目偏好：回答用中文', kind: 'fact', scope: 'project', project: 'dsh' }, now)
+
+  const keyless = recall(db, '回答用中文', { scope: 'project', project: null, minScore: 0, touch: false })
+  assert.equal(keyless.items.length, 1, 'a session without a cwd must not read other projects rows')
+  assert.equal(keyless.items[0].scope, 'global')
+
+  const scoped = recall(db, '回答用中文', { scope: 'project', project: 'menm', minScore: 0, touch: false })
+  assert.equal(scoped.items.length, 2, 'global + own project')
   db.close()
 })

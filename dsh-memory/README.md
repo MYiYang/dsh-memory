@@ -65,6 +65,11 @@
     capture: true               # 是否保留 episode（v1 兼容）
     injectGlobalFacts: true
     scope: project
+    stableMaxChars: 1800        # stable 段（长期约定 + 画像 + 场景导航）字符预算
+    core:                       # 「每轮都必须生效」的置顶/硬规则，按策略注入、不靠词法命中
+      enabled: true
+      maxItems: 6               # 首轮最多注入几条
+      minPriority: 85           # persona/instruction 达到该优先级即视为硬规则
     layers: { l0: true, l1: true, l2: true, l3: true }
     extraction:
       enabled: true             # 关掉就退回纯 FTS 记忆
@@ -124,9 +129,18 @@ session/event(turn/end)
               └─ L3: JEV-lite 判决 → 重写项目画像
 
 agent/pre-step（每轮首 step）
-  ├─ 稳定段（每会话一次）: 画像 + 场景导航
+  ├─ 稳定段（每会话一次）: 长期约定（pinned / 高优先 persona+instruction）+ 画像 + 场景导航
   └─ 动态段（每轮）: FTS/LIKE + 384 维词法向量混合召回（text/priority/kind/recency/vector 加权）
 ```
+
+- **长期约定（core）**：召回是**词法**的，问候（「你好啊」）与偏好文本零重叠，pinned 偏好会永远进不了上下文——
+  所以 `pinned=1` 或 `priority>=85` 的 persona/instruction 行改由 `coreMemories()` **按策略**取，
+  放进 stable 段最前面（`### 长期约定（每轮都要遵守，优先级最高）`），与提问内容无关。
+  有这一层，用户「记住我是谁」类的要求才在每一轮都生效。
+  - 预算：core 段最多占 `stableMaxChars` 的 60%（含标题与第一条），超出按条裁、不挤占画像。
+  - `pinned` 对**任意** kind 生效（用户显式置顶即视为「每轮都要」）：`memory_save` 只在称呼/语气/硬规则这类
+    「永远成立」的要求上置顶，别把进行中的任务状态置顶。
+  - 手工 `memory_save` 只能写 `fact`/`note`，所以工具侧进入 core 的唯一入口是 `pinned`；未置顶的 `fact` 只走动态召回。
 
 - **阈值**：新会话 1→2→4→8→`everyN`（默认 5），之后按 `everyN`；idle 60s 兜底。
 - **失败**：LLM 超时/报错/JSON 坏 → 重试，最多 3 次后丢弃该批并记录 `l1-last-reason`；
@@ -138,6 +152,17 @@ agent/pre-step（每轮首 step）
 - **注入**：`<memory_context type="stable|dynamic" source="dsh-memory">`，
   `source.kind='plugin:dsh-memory'`（会话格式 v4 只接受 producer-owned kind；
   写成 `{kind:'plugin', plugin:…}` 会让整轮失败）。
+- **全局记忆的三条硬规则**（v0.4.2，详见 [AUDIT-global-recall.md](AUDIT-global-recall.md)）：
+  1. `scope` **只在新建时决定**：`update`/`merge` 改写一条已存在的行时沿用该行自己的 scope，
+     不会因为「在哪改」而被降级成项目行（除非调用方显式传 `decision.scope`）；
+  2. 全局偏好**每轮都重查**一次（按 id 在会话内去重），不是「每会话只开一次门」——
+     开场是问候语时也不会把这一整场的全局通道关掉；
+  3. 没有文字的轮（只发附件/图片）仍注入 stable 段（长期约定 + 画像），只是不做词法检索。
+     另外 `scope=project` 但拿不到项目键的行按 `global` 落库，不产生永远召不回的幽灵行。
+- **`scope='global'` ≠ 「每轮都注入」**（最容易误解的一条，详见 [AUDIT-global-recall.md](AUDIT-global-recall.md)）：
+  global 只表示「不限项目、各项目都可见」，注入仍要靠策略（`pinned` 或 `persona/instruction ≥85`）
+  或词法命中。实测：库里唯一那条 global 行去掉 `pinned` 后，20 条真实短句 × 3 个项目的可见性是 **0/60**。
+  想让一句话「每轮都生效」，显式 `pinned: true`。
 
 ## 效果实测（2026-10-22，v0.3.0）
 
@@ -192,15 +217,17 @@ agent/pre-step（每轮首 step）
 
 ## 开发与测试
 
-```bash
+按文件跑（**不要用 `node --test test/`**：它会为每个文件 spawn 子进程，在 DSH 沙箱下报 `spawn EPERM`）：
+
+```powershell
 cd dsh-memory
-node test/vector.test.js && node test/store.test.js && node test/recall.test.js \
-  && node test/capture.test.js && node test/plugin.test.js && node test/layers.test.js \
-  && node test/extract.test.js && node test/scheduler.test.js && node test/llm.test.js \
-  && node test/pipeline.test.js && node test/wiring.test.js && node test/profile.test.js \
-  && node test/consolidate.test.js
-# 93 tests, 0 fail
+# 全量：117 项，0 fail
+node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)
+# 单文件
+node test/recall.test.js
 ```
+
+CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略，新增测试文件无需改 workflow。
 
 模块：
 

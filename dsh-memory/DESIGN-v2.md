@@ -563,3 +563,76 @@ provider.get(c)  → 该技能的 SKILL.md 正文（frontmatter 已剥离）
 - 后续可选：`skills.rank` 配置化、按 profile 白名单只注册部分技能。
 
 
+
+## 21. 长期约定层：按策略注入，不靠词法命中（v0.4.1，2026-10-23）
+
+### 症状
+
+用户反复抱怨「助手忘了我是谁」：库里有一条 `pinned`、`scope=global` 的偏好（#104：每轮称「官人」、语气温柔、自称「妾身」），但每个新会话的开场都是公事公办的口吻；用户提醒后才翻记忆库道歉，下一轮又忘。
+
+### 根因（可复现）
+
+`agent/pre-step` 的两段注入里，只有画像/场景是「按策略」取的，事实层全靠 `recall()` 的**词法**匹配：
+
+```
+recall(db, '你好啊', {scope:'global'})  → 0 条候选（FTS trigram 命中 0，LIKE 也没有）
+```
+
+问候语与偏好文本没有任何字词重叠，`globalsInjected` 这条通道等于对问候轮永久失明；动态段同样取不到。再加上 stable 段 900 字符预算被 1200 字的项目画像吃满，画像之后的内容还会被截断。三条叠加 = 每轮开场「失忆」。
+
+### 设计
+
+新增**长期约定层**（core），与「检索」并列而不是混在一起：
+
+| 维度 | 检索（dynamic） | 长期约定（core） |
+| --- | --- | --- |
+| 选择依据 | 与当前提问的词法/向量相似度 | 行属性：`pinned=1` 或 `persona/instruction` 且 `priority>=85` |
+| 生效范围 | 当轮 | 每会话首轮，与提问内容无关 |
+| 预算 | `maxChars`（默认 1400） | `stableMaxChars` 的 60%，最多 `core.maxItems` 条 |
+| 排序 | 分数 | `pinned` → `priority` → `use_count` → `updated_at` |
+
+- 实现：`store.coreMemories()` 一条 SQL；`recall.renderStableBlock({cores,…})` 把它渲染成 `### 长期约定（每轮都要遵守，优先级最高）` 并**排在最前**（预算不够先裁画像、不裁约定）；`index.js` 里 stable 段不再受 `layers.l2/l3` 开关限制，取到 cores 后 `touchMemories` 记一次使用。
+- 为什么不扩大 `pinned` 语义、或把 stable 段每轮都注入：pinned 已经是用户「永远优先」的显式表达，缺的是**取用路径**不是表达力；stable 段每轮注入会重复烧 prompt（画像 1200 字 × 每轮）。
+- 数据侧：一次性把 L1 抽取在两个项目里各存一份的 4 条平行偏好（#106/#107 menm、#116/#117 dsh）标成 `superseded_by=104`，只留全局置顶那条；#104 补上「自称妾身」、priority 50→95、旧文本进 `memory_history`。备份 `.tmp/live-backup-20261023-085530.db`。
+- 防复发：抽取/去重提示词各加一条——跨项目偏好写成通用表述；候选里包含全局行时语义等价就 `skip`/`merge`，不要因为「不在同一项目」再存一条平行偏好。
+
+### 测试与验证
+
+- `test/core-inject.test.js`（3 项）：`coreMemories` 的过滤/排序/项目可见性、`renderStableBlock` 的段序与预算、`agent/pre-step` 端到端（问候轮注入 #104、同会话第二轮不重复）。
+- 真实库副本回放：`project=menm/dsh` + 问候语 → stable 段第一行即 #104；`memory_stats` 的 superseded 计数 0→4。
+- 已知边界：pinned 的**任意** kind 都会被注入（用户显式置顶即视为「每轮都要」）；`coreMemories` 不做相似度合并，重复条目仍要靠抽取侧的去重提示词与人工 curation 控制。
+
+### 独立复核后的三处修正
+
+| 问题（复核发现） | 修正 |
+| --- | --- |
+| stable 段首行还写着「仅在确实相关时参考」，与「每轮都要遵守」自相矛盾 | 有 core 时改用专门首行：长期约定「必须体现在回复里」，画像/场景才是「背景参考」 |
+| globals 段没过 `rendered`，query 命中同一条置顶偏好时一轮注入两次 | globals 也按 `rendered` 过滤，一条本轮只出现一次（加断言） |
+| core 的 60% 预算只约束第 2 条起，首条无条件进，配置压到下限时会超 23% | 预算改成含标题与首条的硬上界，超出裁剪；首条仍保证保留 |
+
+补测：`includePinned:false` 分支、core 段硬预算（6 条 400 字 / maxChars=300 → 段长 ≤ 180）、`官人` 命中轮「同一条只出现一次」。
+
+## 22. 全局记忆为什么会忘：审计结论（v0.4.2，2026-10-23）
+
+用户报告「标了 global 的记忆，跨会话/跨项目还是会忘」。完整审计（失败模式 M1–M10、量化证据、复现命令）见
+[AUDIT-global-recall.md](AUDIT-global-recall.md)。这里只记结论与否决项：
+
+- **四层叠加**：写入侧抽取器不产出 global（95/95 是 project）、改写侧用当前会话项目覆盖 scope（会降级）、
+  读取侧三道闸门都以「词法命中」为前提（词法闸门 / 每会话一次性 / 必须有文字）、人格层只做项目级。
+- **已修**：core 层（§21）；`applyDecision` 继承目标行 scope；全局段每轮重查 + 会话内去重；无文字轮仍注入
+  stable；无项目键不再写幽灵行；抽取契约新增 `scope:"global"`（仅 persona/instruction）。
+- **否决**：调 `projectMatch` 权重（实测 0/10 影响）；新增全局人格（core 层已覆盖边际收益太低）；
+  启发式「全局孪生」自动合并（3-gram 包含度把真重复 #123 判成 0.19，和无关 episode 0.15~0.19 无法区分）。
+
+### 复核后追加的六处（M11–M16）
+
+| # | 缺口 | 修法 |
+| --- | --- | --- |
+| M11 | 冲突候选按 `L1_KINDS` 过滤，`memory_save` 写的 `fact`/`note` 永远不在候选里（#104 因此从未参与合并） | `findCandidates` 候选 kind 加上 `fact`/`note`（episode 仍排除） |
+| M12 | 无 cwd 会话 `searchFts/searchLike` 不加 scope 过滤 → 读遍所有项目 | `scope='project'` 且无项目键时只看 global |
+| M13 | stable 段 core id 没种进 `state.globalIds` → 同会话重复注入（实测 291 字符/次） | 渲染 stable 时一并种入 |
+| M14 | `l3-batches` 是全局计数器，任一项目清零 → 其他项目画像永远 `deferred`（menm 落后 16.9h） | 改为 `l3-batches:<project>` |
+| M15 | `textScore = bm25/8`，`|rank|<1.2` 的弱命中低于「无 bm25」的 0.15 基线 | 下限钉在 0.15 |
+| M16 | 无文字轮 `userTextOf` 回退到上一轮问题 → 用旧问题检索（实测 2900 字符） | 本轮有人类消息就用它（哪怕是空串） |
+
+回归：112 → 117 项测试全绿（新增 recall 的弱 bm25/无项目键、core 的会话去重/附件轮、layers 的候选 kind 三组用例）。

@@ -227,8 +227,12 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   const now = ctx.now ?? Date.now()
   const triggerEveryN = Math.max(1, config.triggerEveryN ?? 10)
   const maxChars = Math.max(200, config.maxChars ?? 1200)
-  const batches = Number(getMeta(db, 'l3-batches') ?? 0) + 1
-  addMeta(db, 'l3-batches', 1)
+  // Per-project counter: a shared one is reset by whichever project rewrote its
+  // persona last, so every other project stays `deferred` forever (menm's
+  // persona sat 16.9h behind its facts while dsh kept resetting the counter).
+  const batchKey = `l3-batches:${ctx.project ?? 'global'}`
+  const batches = Number(getMeta(db, batchKey) ?? 0) + 1
+  addMeta(db, batchKey, 1)
 
   const facts = db
     .prepare(
@@ -274,7 +278,7 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
     body: body.slice(0, maxChars),
     now,
   })
-  setMeta(db, 'l3-batches', 0)
+  setMeta(db, batchKey, 0)
   log('info', `l3 persona rewritten (v${result.version})`)
   return { rewritten: true, version: result.version, reason: 'written' }
 }

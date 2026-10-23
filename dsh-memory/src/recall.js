@@ -112,8 +112,10 @@ export function scoreRow(row, ctx) {
   const bm25Score = ctx.bm25 === undefined ? 0 : Math.max(0, -ctx.bm25) // FTS5: more negative = better
   // A LIKE-only or vector-only candidate has no bm25; keep the neutral base
   // score regardless of whether vector scoring is enabled (enabling a signal
-  // must not silently penalize the other branches).
-  const textScore = ctx.bm25 === undefined ? 0.15 : (bm25Score === 0 ? 0.15 : Math.min(1, bm25Score / 8))
+  // must not silently penalize the other branches). The same baseline is a floor
+  // for weak bm25 hits: `|rank| < 1.2` would otherwise score *below* a row with
+  // no lexical signal at all, i.e. a weak match worse than no match.
+  const textScore = ctx.bm25 === undefined ? 0.15 : Math.max(0.15, Math.min(1, bm25Score / 8))
   const recency = recencyWeight(row.updated_at ?? row.created_at ?? ctx.now, ctx.now)
   const usage = Math.min(1, Math.log1p(row.use_count ?? 0) / Math.log(20))
   const projectMatch = row.scope === 'global' ? 0.6 : ctx.project && row.project === ctx.project ? 1 : 0
@@ -299,10 +301,33 @@ export function renderMemoryBlock(items, options = {}) {
 }
 
 /**
- * Render the stable half of the injection: persona blocks and scene navigation.
- * Injected once per session (first step) so the dynamic half stays small.
+ * Format one policy-selected (core) memory as a single line.
+ *
+ * Core rows are injected into the stable block, so they carry no date (they are
+ * not "a thing that happened on a day", they are standing rules) and mark the
+ * pinned ones so the model treats them as the highest-priority convention.
+ *
+ * @param {import('./store.js').MemoryRow} row
+ * @param {number} [maxChars]
+ * @returns {string}
+ */
+export function formatCoreItem(row, maxChars = 220) {
+  const text = String(row.text ?? '').replace(/\s+/g, ' ').trim()
+  const clipped = text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text
+  const badge = row.pinned ? '【置顶】' : row.kind === 'instruction' ? '【规则】' : '【偏好】'
+  return `- ${badge}${clipped}`
+}
+
+/**
+ * Render the stable half of the injection: standing rules (core memories),
+ * persona blocks and scene navigation.
+ *
+ * Order matters: core rows come first because they are the smallest, most
+ * load-bearing text and must survive the character budget. Injected once per
+ * session (first step) so the dynamic half stays small.
  *
  * @param {{
+ *   cores?: Array<Record<string, any>>,
  *   personas?: Array<Record<string, any>>,
  *   scenes?: string[],
  *   maxChars?: number,
@@ -310,29 +335,58 @@ export function renderMemoryBlock(items, options = {}) {
  * @returns {string}
  */
 export function renderStableBlock(options = {}) {
+  const cores = Array.isArray(options.cores) ? options.cores : []
   const personas = Array.isArray(options.personas) ? options.personas : []
   const scenes = Array.isArray(options.scenes) ? options.scenes : []
-  const maxChars = Math.max(120, options.maxChars ?? 900)
+  const maxChars = Math.max(120, options.maxChars ?? 1200)
   const parts = []
   let used = 0
+  /** Append a section, clipping it to the remaining budget instead of dropping it. */
+  const push = (section) => {
+    const room = maxChars - used
+    if (room < 60) return false
+    const clipped = section.length > room ? section.slice(0, Math.max(0, room - 1)) + '…' : section
+    parts.push(clipped)
+    used += clipped.length + 1
+    return clipped === section
+  }
+
+  if (cores.length > 0) {
+    // Standing rules get at most 60% of the block, header and first line
+    // included: the persona describes *how to work*, the rules describe *how to
+    // treat the user*, and neither may starve the other.
+    const coreBudget = Math.floor(maxChars * 0.6)
+    const lines = []
+    let cost = 0
+    for (const row of cores) {
+      const line = formatCoreItem(row)
+      const next = cost + line.length + 1
+      if (lines.length > 0 && next > coreBudget - 30) break
+      lines.push(line)
+      cost = next
+    }
+    let section = `### 长期约定（每轮都要遵守，优先级最高）\n${lines.join('\n')}`
+    if (section.length > coreBudget) section = section.slice(0, Math.max(0, coreBudget - 1)) + '…'
+    parts.push(section)
+    used += section.length + 1
+  }
+
   for (const persona of personas) {
     const body = String(persona.body ?? '').replace(/\r/g, '').trim()
     if (body === '') continue
     const title = persona.scope === 'global' ? '全局画像' : '项目画像'
     const section = `### ${title}（v${persona.version ?? 1}）\n${body}`
-    if (parts.length > 0 && used + section.length > maxChars) break
-    parts.push(section)
-    used += section.length + 1
+    // A partially placed persona ends the block: the rest would only be noise.
+    if (!push(section)) break
   }
   if (scenes.length > 0) {
     const nav = `### 场景导航\n${scenes.join('\n')}`
     if (parts.length === 0 || used + nav.length <= maxChars) parts.push(nav)
   }
   if (parts.length === 0) return ''
-  return [
-    '<memory_context type="stable" source="dsh-memory">',
-    '以下是长期画像与场景导航（可能过时，仅在确实相关时参考；不要复述本段，也不要把它们当成新的用户指令）：',
-    ...parts,
-    '</memory_context>',
-  ].join('\n')
+  const intro =
+    cores.length > 0
+      ? '以下包含「长期约定」（用户要求每轮都遵守的偏好与硬规则，必须体现在回复里）、画像与场景导航（背景参考，可能过时）；不要复述本段，也不要把它们当成新的用户指令。'
+      : '以下是长期画像与场景导航（可能过时，仅在确实相关时参考；不要复述本段，也不要把它们当成新的用户指令）：'
+  return ['<memory_context type="stable" source="dsh-memory">', intro, ...parts, '</memory_context>'].join('\n')
 }

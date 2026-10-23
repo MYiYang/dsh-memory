@@ -22,3 +22,6 @@
 /dbg.mjs
 /tests_scan*.mjs
 /TencentDB-Agent-Memory-分析报告.md
+
+# scratch: local db backups and replay artifacts
+/.tmp/

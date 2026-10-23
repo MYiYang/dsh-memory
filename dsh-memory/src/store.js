@@ -332,7 +332,11 @@ export function saveMemory(db, input, now = Date.now()) {
   const text = String(input.text ?? '').trim()
   if (text === '') throw new Error('memory text is empty')
   const kind = KINDS.includes(input.kind) ? input.kind : 'fact'
-  const scope = input.scope === 'project' ? 'project' : 'global'
+  // A project row without a project key can never be recalled: every read path
+  // filters on `project = ?`, so `scope='project' AND project IS NULL` is a
+  // ghost row that exists but is invisible everywhere. Store it as global
+  // instead of silently losing it.
+  const scope = input.scope === 'project' && input.project ? 'project' : 'global'
   const project = scope === 'project' ? (input.project ?? null) : null
   const title = String(input.title ?? deriveTitle(text)).slice(0, 200)
   const tags = JSON.stringify(Array.isArray(input.tags) ? input.tags.slice(0, 20).map(String) : [])
@@ -421,10 +425,16 @@ export function searchFts(db, ftsQuery, options = {}) {
     where.push(`m.kind IN (${options.kinds.map(() => '?').join(',')})`)
     params.push(...options.kinds)
   }
-  if (options.scope === 'project' && options.project) {
+  if (options.scope === 'project') {
     // project-scoped results may include global facts, which always apply
-    where.push("(m.scope = 'global' OR (m.scope = 'project' AND m.project = ?))")
-    params.push(options.project)
+    if (options.project) {
+      where.push("(m.scope = 'global' OR (m.scope = 'project' AND m.project = ?))")
+      params.push(options.project)
+    } else {
+      // No project key (session without cwd): only global rows are in scope.
+      // Without this branch the query degraded to "every project's rows".
+      where.push("m.scope = 'global'")
+    }
   } else if (options.scope === 'global') {
     where.push("m.scope = 'global'")
   }
@@ -462,9 +472,14 @@ export function searchLike(db, terms, options = {}) {
     scopeClause += ` AND m.kind IN (${options.kinds.map(() => '?').join(',')})`
     params.push(...options.kinds)
   }
-  if (options.scope === 'project' && options.project) {
-    scopeClause += " AND (m.scope = 'global' OR (m.scope = 'project' AND m.project = ?))"
-    params.push(options.project)
+  if (options.scope === 'project') {
+    if (options.project) {
+      scopeClause += " AND (m.scope = 'global' OR (m.scope = 'project' AND m.project = ?))"
+      params.push(options.project)
+    } else {
+      // No project key: only global rows are in scope (see searchFts).
+      scopeClause += " AND m.scope = 'global'"
+    }
   } else if (options.scope === 'global') {
     scopeClause += " AND m.scope = 'global'"
   }
@@ -577,6 +592,44 @@ export function stats(db) {
     tokensSpent: Number(getMeta(db, 'l1_tokens_total') ?? 0),
     dbBytes,
   }
+}
+
+/**
+ * Priority at or above which a `persona` / `instruction` row counts as a
+ * standing rule and is injected without any lexical match.
+ */
+export const CORE_PRIORITY = 85
+
+/**
+ * Rows that must shape **every** reply, independent of the current question.
+ *
+ * Recall is lexical: a greeting ("你好啊") matches nothing, so a pinned
+ * preference would never be injected on exactly the turns where tone matters
+ * most. These rows are pulled by *policy* instead of by text.
+ *
+ * Selected when (non-superseded):
+ *   - `pinned = 1` (the user explicitly asked to always prefer it), or
+ *   - `kind IN ('persona','instruction') AND priority >= minPriority` (extracted
+ *     standing preference / hard rule).
+ * Visible scope: global rows plus project rows of the current project.
+ *
+ * @param {DatabaseSync} db
+ * @param {{ project?: string|null, limit?: number, minPriority?: number, includePinned?: boolean }} [options]
+ * @returns {MemoryRow[]}
+ */
+export function coreMemories(db, options = {}) {
+  const limit = Math.max(1, Math.min(20, Number(options.limit ?? 6)))
+  const project = options.project ?? null
+  const minPriority = Number.isFinite(Number(options.minPriority)) ? Number(options.minPriority) : CORE_PRIORITY
+  const includePinned = options.includePinned !== false
+  const sql = `
+    SELECT * FROM memory
+     WHERE superseded_by IS NULL
+       AND (scope = 'global' OR (scope = 'project' AND ? IS NOT NULL AND project = ?))
+       AND (${includePinned ? 'pinned = 1 OR ' : ''}(kind IN ('persona', 'instruction') AND priority >= ?))
+     ORDER BY pinned DESC, priority DESC, use_count DESC, updated_at DESC
+     LIMIT ${limit}`
+  return /** @type {MemoryRow[]} */ (db.prepare(sql).all(project, project, minPriority))
 }
 
 /**

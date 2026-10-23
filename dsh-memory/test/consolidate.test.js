@@ -70,7 +70,7 @@ test('runPersona generates the first persona without a gate call', async () => {
   assert.equal(llm.calls.length, 1)
   const persona = getPersona(db, { scope: 'project', project: 'menm' })
   assert.match(persona.body, /pnpm/)
-  assert.equal(getMeta(db, 'l3-batches'), '0')
+  assert.equal(getMeta(db, 'l3-batches:menm'), '0')
 })
 
 test('runPersona defers until triggerEveryN and only rewrites on a gate conflict', async () => {
@@ -96,7 +96,7 @@ test('runPersona defers until triggerEveryN and only rewrites on a gate conflict
   assert.equal(gatedConflict.rewritten, true)
   assert.equal(gatedConflict.version, 2)
   assert.match(getPersona(db, { scope: 'project', project: 'menm' }).body, /偶尔英文/)
-  assert.equal(getMeta(db, 'l3-batches'), '0')
+  assert.equal(getMeta(db, 'l3-batches:menm'), '0')
 })
 
 test('prompt builders include existing content and bounded fact lines', () => {

@@ -257,3 +257,26 @@ test('writes store a local vector and backfill repairs legacy NULL vectors', () 
   assert.equal(row.vec_model, VECTOR_MODEL)
   assert.equal(backfillVectors(db, { limit: 10 }), 0)
 })
+
+test('conflict candidates include hand-saved fact/note rows, not just extracted kinds', () => {
+  const db = memoryDb()
+  // What `memory_save` writes: a v1 `fact`, i.e. not in L1_KINDS.
+  const saved = db
+    .prepare(
+      `INSERT INTO memory(kind, scope, project, title, text, tags, source, hash, created_at, updated_at, pinned)
+       VALUES ('fact', 'global', NULL, '称呼偏好', '每轮称用户「官人」，语气温柔', '[]', 'tool', ?, 1, 1, 1)`,
+    )
+    .run('hash-call-preference')
+  const candidates = findCandidates(db, '与用户交流时每轮称呼他为官人', { project: 'menm' })
+  assert.ok(
+    candidates.some((row) => Number(row.id) === Number(saved.lastInsertRowid)),
+    'a pinned global fact must be visible to conflict resolution, or the extractor keeps rebuilding copies of it',
+  )
+  // Episodes stay out: they are conversation logs, not rules.
+  db.prepare(
+    `INSERT INTO memory(kind, scope, project, title, text, tags, source, hash, created_at, updated_at, pinned)
+     VALUES ('episode', 'project', 'menm', 'ep', '每轮称用户「官人」，语气温柔', '[]', 'turn', ?, 1, 1, 0)`,
+  ).run('hash-episode')
+  const withEpisode = findCandidates(db, '每轮称用户官人语气温柔', { project: 'menm' })
+  assert.ok(withEpisode.every((row) => row.kind !== 'episode'))
+})

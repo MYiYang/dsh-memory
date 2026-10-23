@@ -19,7 +19,7 @@
 import { homedir } from 'node:os'
 import { join, basename } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { openDatabase, saveMemory, forgetMemories, stats, getMeta } from './src/store.js'
+import { openDatabase, saveMemory, forgetMemories, stats, getMeta, coreMemories, touchMemories, CORE_PRIORITY } from './src/store.js'
 import { recall, renderMemoryBlock, renderStableBlock } from './src/recall.js'
 import { captureTurn, extractText } from './src/capture.js'
 import { appendTurn } from './src/l0.js'
@@ -71,6 +71,12 @@ function resolveConfig(raw) {
     capture: config.capture !== false,
     injectGlobalFacts: config.injectGlobalFacts !== false,
     scope: config.scope === 'global' ? 'global' : 'project',
+    stableMaxChars: number(config.stableMaxChars, 1800, 300, 6000),
+    core: {
+      enabled: section(config.core).enabled !== false,
+      maxItems: number(section(config.core).maxItems, 6, 1, 20),
+      minPriority: number(section(config.core).minPriority, CORE_PRIORITY, 0, 100),
+    },
     debug: config.debug === true,
     layers: {
       l0: layers.l0 !== false,
@@ -176,11 +182,14 @@ function isHumanTurn(messages) {
 function userTextOf(messages, session) {
   try {
     if (Array.isArray(messages)) {
+      // The entering messages are authoritative: if this step carries a human
+      // message, use *its* text even when it is empty (attachment-only turn).
+      // Falling back to "the last non-empty user text in the log" would answer
+      // the previous question again on a turn that asked nothing.
       for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i]
         if (message?.source?.kind !== 'user') continue
-        const text = extractText(message.content)
-        if (text !== '') return text
+        return extractText(message.content)
       }
     }
   } catch {
@@ -303,7 +312,7 @@ export function apply(ctx, rawConfig) {
   const stateOf = (sessionId) => {
     let state = sessions.get(sessionId)
     if (state === undefined) {
-      state = { turn: 0, userText: '', assistantText: '', tools: [], seq: null, injectedTurn: -1, globalsInjected: false, stableInjected: false }
+      state = { turn: 0, userText: '', assistantText: '', tools: [], seq: null, injectedTurn: -1, globalIds: new Set(), stableInjected: false }
       sessions.set(sessionId, state)
     }
     return state
@@ -407,63 +416,96 @@ export function apply(ctx, rawConfig) {
       if (!isHumanTurn(messages)) return decision
 
       const query = userTextOf(messages, session)
-      if (query === '') return decision
       const project = projectOf(session)
       const sections = []
       /** Rows already rendered in an earlier section; avoid paying for them twice. */
       const rendered = new Set()
 
-      // Stable half: persona + scene navigation, once per session.
-      if (!state.stableInjected && (config.layers.l2 || config.layers.l3)) {
+      // Stable half: standing rules (pinned / high-priority persona+instruction)
+      // plus persona and scene navigation. Once per session, before the first
+      // model call — and deliberately **not** gated on the query, because it is
+      // context-free: an image-only message or a one-word turn must still carry
+      // the user's conventions.
+      if (!state.stableInjected) {
         try {
+          const cores = config.core.enabled
+            ? coreMemories(getDb(), { project, limit: config.core.maxItems, minPriority: config.core.minPriority })
+            : []
           const personas = config.layers.l3 ? listPersonas(getDb(), { project }) : []
           const scenes = config.layers.l2
             ? sceneNavigation(getDb(), { project, limit: 8, halfLifeDays: config.scenes.halfLifeDays })
             : []
-          const stable = renderStableBlock({ personas, scenes, maxChars: 900 })
+          const stable = renderStableBlock({ cores, personas, scenes, maxChars: config.stableMaxChars })
           if (stable !== '') sections.push(stable)
+          if (cores.length > 0) {
+            // Count the use so curation can see which standing rules matter.
+            try {
+              touchMemories(getDb(), cores.map((row) => row.id))
+            } catch {
+              /* bookkeeping only */
+            }
+            for (const row of cores) {
+              rendered.add(row.id)
+              // Seed the session-wide set too: otherwise the globals pass would
+              // re-inject a standing rule that the stable block already showed.
+              state.globalIds.add(row.id)
+            }
+            log('debug', `core memories: ${cores.map((row) => `#${row.id}`).join(',')}`)
+          }
         } catch (error) {
           log('warn', `stable block failed: ${error instanceof Error ? error.message : String(error)}`)
         }
         state.stableInjected = true
       }
 
-      if (!state.globalsInjected && config.injectGlobalFacts) {
-        const globals = recall(getDb(), query, {
-          scope: 'global',
-          project: null,
-          maxItems: 3,
-          maxChars: Math.max(200, Math.floor(config.maxChars / 3)),
+      // Lexical halves need text to match against. A turn without any human text
+      // (attachment-only, command) still gets the stable half above and stops here.
+      if (query !== '') {
+        // Global preferences: re-checked *every* turn, not once per session. The
+        // old once-per-session latch meant a first turn like「你好啊」（zero lexical
+        // overlap）closed the channel for the whole session. Rows already shown
+        // in this session are skipped, so the block does not repeat.
+        if (config.injectGlobalFacts) {
+          const globals = recall(getDb(), query, {
+            scope: 'global',
+            project: null,
+            maxItems: 3,
+            maxChars: Math.max(200, Math.floor(config.maxChars / 3)),
+            minScore: config.minScore,
+            vector: config.vector,
+          })
+          if (globals.items.length > 0) {
+            // Drop rows already rendered in the stable block (a pinned preference
+            // would otherwise be injected twice in the same turn).
+            const fresh = globals.items.filter((row) => !rendered.has(row.id) && !state.globalIds.has(row.id))
+            if (fresh.length > 0) {
+              sections.push(
+                renderMemoryBlock(fresh).replace('以下是从历史会话中检索到的相关记忆', '以下是用户/团队的长期偏好与约定'),
+              )
+              for (const row of fresh) {
+                rendered.add(row.id)
+                state.globalIds.add(row.id)
+              }
+            }
+          }
+        }
+
+        const hits = recall(getDb(), query, {
+          scope: config.scope,
+          project,
+          maxItems: config.maxItems,
+          maxChars: config.maxChars,
           minScore: config.minScore,
           vector: config.vector,
         })
-        if (globals.items.length > 0) {
-          sections.push(
-            renderMemoryBlock(globals.items).replace(
-              '以下是从历史会话中检索到的相关记忆',
-              '以下是用户/团队的长期偏好与约定',
-            ),
-          )
-          for (const row of globals.items) rendered.add(row.id)
+        const fresh = hits.items.filter((row) => !rendered.has(row.id))
+        if (fresh.length > 0) {
+          sections.push(renderMemoryBlock(fresh))
+          log('debug', `recall turn ${turn}: ${fresh.length} hit(s) via ${hits.strategy}`)
         }
       }
 
-      const hits = recall(getDb(), query, {
-        scope: config.scope,
-        project,
-        maxItems: config.maxItems,
-        maxChars: config.maxChars,
-        minScore: config.minScore,
-        vector: config.vector,
-      })
-      const fresh = hits.items.filter((row) => !rendered.has(row.id))
-      if (fresh.length > 0) {
-        sections.push(renderMemoryBlock(fresh))
-        log('debug', `recall turn ${turn}: ${fresh.length} hit(s) via ${hits.strategy}`)
-      }
-
       state.injectedTurn = turn
-      state.globalsInjected = true
       if (sections.length === 0) return decision
       return { kind: 'enter', messages: [...decision.messages, contextMessage(sections.join('\n\n'))] }
     } catch (error) {
@@ -540,7 +582,7 @@ export function apply(ctx, rawConfig) {
       ctx.tools.register({
         name: 'memory_save',
         description:
-          'Save one durable fact to long-term memory (a preference, a decision, an environment constraint). Use for information that must survive this session; do not save temporary task detail.',
+          'Save one durable fact to long-term memory (a preference, a decision, an environment constraint). Use for information that must survive this session; do not save temporary task detail. `scope:"global"` makes it visible from every project, but it is still recalled by relevance; use `pinned` for rules that must apply to every reply.',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -557,7 +599,11 @@ export function apply(ctx, rawConfig) {
               description: 'global = applies everywhere (default), project = this workspace only.',
             },
             tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags.' },
-            pinned: { type: 'boolean', description: 'Always prefer this record when it matches.' },
+            pinned: {
+              type: 'boolean',
+              description:
+                'Set when the user says this must always apply (forms of address, tone, hard rules). Pinned rows are injected at the start of every session even when the current question does not mention them.',
+            },
           },
           required: ['text'],
         },
@@ -575,7 +621,14 @@ export function apply(ctx, rawConfig) {
             pinned: args?.pinned === true,
             source: 'tool',
           })
-          return { text: `${result.inserted ? 'saved' : 'updated'} memory #${result.id} (${scope})` }
+          // Spell out the difference between "visible everywhere" and "injected
+          // every turn" — a global row that is neither pinned nor a high-priority
+          // persona/instruction fact is only ever recalled by lexical match.
+          const hint =
+            scope === 'global' && args?.pinned !== true
+              ? ' — global = visible in every project; add pinned=true if it must apply to every reply'
+              : ''
+          return { text: `${result.inserted ? 'saved' : 'updated'} memory #${result.id} (${scope})${hint}` }
         },
       }),
     )

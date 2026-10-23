@@ -77,13 +77,18 @@ export function findCandidates(db, text, options = {}) {
   const { ftsTerms, likeTerms } = extractTerms(text)
   const ftsQuery = buildFtsQuery(ftsTerms)
   const scope = options.scope === 'global' ? 'global' : 'project'
+  // `memory_save` writes the v1 kinds (`fact`/`note`), which are not in
+  // L1_KINDS. Leaving them out meant a hand-saved preference could never be
+  // found by conflict resolution — the extractor kept rebuilding copies of it
+  // (#104 vs #106/#107/#116/#117/#123). Episodes stay out: they are logs.
+  const kinds = [...L1_KINDS, 'fact', 'note']
   const found = new Map()
   if (ftsQuery !== '') {
     for (const row of searchFts(db, ftsQuery, {
       limit,
       scope,
       project: options.project ?? null,
-      kinds: L1_KINDS,
+      kinds,
     })) {
       found.set(row.id, row)
     }
@@ -93,7 +98,7 @@ export function findCandidates(db, text, options = {}) {
       limit,
       scope,
       project: options.project ?? null,
-      kinds: L1_KINDS,
+      kinds,
     })) {
       if (!found.has(row.id)) found.set(row.id, row)
     }
@@ -165,7 +170,12 @@ export function applyDecision(db, decision, ctx = {}) {
   if (op === 'skip') return { op, id: decision.targetId ?? null, version: 0 }
 
   const project = ctx.project ?? null
-  const scope = ctx.scope === 'global' || project === null ? 'global' : 'project'
+  // Where a *new* row lands: an explicit `scope` from the extractor wins (it can
+  // promote a cross-project preference to the global layer); otherwise the row
+  // follows the session, and a session without a cwd cannot scope anything.
+  const derivedScope = ctx.scope === 'global' || project === null ? 'global' : 'project'
+  const scope =
+    decision.scope === 'global' ? 'global' : decision.scope === 'project' && project !== null ? 'project' : derivedScope
   const kind = normalizeKind(decision.kind)
   const priority = clampPriority(decision.priority)
   const scene = decision.scene === undefined ? null : decision.scene
@@ -176,9 +186,17 @@ export function applyDecision(db, decision, ctx = {}) {
     const target = targetId > 0 ? db.prepare('SELECT * FROM memory WHERE id = ?').get(targetId) : undefined
     if ((op === 'update' || op === 'merge') && target === undefined) {
       // Target vanished (forgotten concurrently): fall back to a new row.
-      return insertFact(db, { text, kind, priority, scene, scope, project, sessionId: ctx.sessionId ?? null, sourceSeqs, now })
+      return insertFact(db, { text, kind, priority, scene, scope, project: scope === 'global' ? null : project, sessionId: ctx.sessionId ?? null, sourceSeqs, now })
     }
     if (target !== undefined) {
+      // Rewriting an existing row keeps **its** scope. Taking the extracting
+      // session's scope instead demotes a global rule to the project it happened
+      // to be edited in (it then vanishes from every other project) and promotes
+      // a project fact to global when the session has no cwd. Callers that
+      // really want to move a row must say so via `decision.scope`.
+      const explicit = decision.scope === 'global' || decision.scope === 'project' ? decision.scope : null
+      const nextScope = explicit ?? (target.scope === 'global' ? 'global' : 'project')
+      const nextProject = nextScope === 'global' ? null : explicit === null ? (target.project ?? project) : project
       // A different row already owns the new text: treat it as merged into that row.
       const owner = db.prepare('SELECT id FROM memory WHERE hash = ? AND id <> ?').get(textHash(text), targetId)
       if (owner !== undefined) {
@@ -205,8 +223,8 @@ export function applyDecision(db, decision, ctx = {}) {
         textHash(text),
         priority,
         scene,
-        scope,
-        project,
+        nextScope,
+        nextProject,
         sourceSeqs,
         packVector(embed(text)),
         VECTOR_MODEL,
@@ -220,7 +238,7 @@ export function applyDecision(db, decision, ctx = {}) {
     }
   }
 
-  return insertFact(db, { text, kind, priority, scene, scope, project, sessionId: ctx.sessionId ?? null, sourceSeqs, now })
+  return insertFact(db, { text, kind, priority, scene, scope, project: scope === 'global' ? null : project, sessionId: ctx.sessionId ?? null, sourceSeqs, now })
 }
 
 /**

@@ -72,6 +72,22 @@ test('parseExtraction enforces the batch cap', () => {
   assert.equal(result.memories.length, 3)
 })
 
+test('scope=global is only honoured for persona/instruction facts', () => {
+  const raw = JSON.stringify({
+    memories: [
+      { kind: 'persona', text: '每轮称用户「官人」', priority: 95, scope: 'global' },
+      { kind: 'instruction', text: '不要自动 git push', priority: 90, scope: 'GLOBAL' },
+      { kind: 'work_fact', text: '端口是 3000', priority: 60, scope: 'global' },
+      { kind: 'persona', text: '本项目提交前跑测试', priority: 88 },
+    ],
+  })
+  const result = parseExtraction(raw)
+  assert.deepEqual(
+    result.memories.map((memory) => memory.scope),
+    ['global', 'global', null, null],
+  )
+})
+
 test('buildExtractionPrompt wraps the transcript and states the cap', () => {
   const prompt = buildExtractionPrompt('用户: 你好\n助手: 你好', { maxMemories: 4 })
   assert.match(prompt.system, /只输出 JSON/)

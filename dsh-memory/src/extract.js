@@ -29,6 +29,8 @@ export const EXTRACTION_SYSTEM = [
   '- work_artifact：产物位置（文件、表、服务、URL）',
   '- episodic：一次性事件（某天做了什么）',
   'priority 0-100：长期偏好/硬规则 80+；项目事实 60-79；任务状态 40-59；一次性事件 10-39。',
+  '跨项目成立的偏好（称呼、语言、语气、沟通风格）写成不绑定某个项目的通用表述，避免同一约定在每个项目各存一份。',
+  '如果这条偏好/规则在任何项目里都成立（称呼、语言、语气、身份、通用硬规则），加 "scope":"global"；其余一律省略（默认项目内）。',
   'scene 是 2-6 个字的场景名（如「构建与工具链」「数据库」「部署」）。',
   '不要抽取：寒暄、临时调试输出、模型推理过程、重复内容。',
   '输出格式：{"memories":[{"kind":"work_fact","text":"…","priority":60,"scene":"数据库"}]}',
@@ -43,6 +45,7 @@ export const DEDUPE_SYSTEM = [
   '- update：新事实修正/补充了某个候选，target_id 指向它',
   '- merge：新事实是多个候选的合并结果，target_id 为主，merge_ids 列出被吸收的',
   '- skip：候选里已有等价事实',
+  '候选可能来自其他项目，也可能是全局规则（scope=global）：只要语义等价就 skip 或 merge，不要因为不在同一项目就新增一条平行的偏好。',
   'text 输出合并/修正后的最终文本（不超过 200 字）。',
   '输出格式：[{"i":0,"op":"update","target_id":12,"merge_ids":[],"text":"最终文本"}]',
 ].join('\n')
@@ -148,8 +151,13 @@ export function parseJsonLoose(text) {
 
 /**
  * Validate and normalize one extracted memory. Returns null when unusable.
+ *
+ * `scope` is only accepted for `persona` / `instruction`: a cross-project
+ * preference or hard rule belongs in the global layer, everything else is
+ * project knowledge and must stay scoped to the project that produced it.
+ *
  * @param {unknown} item
- * @returns {{ kind: string, text: string, priority: number, scene: string|null } | null}
+ * @returns {{ kind: string, text: string, priority: number, scene: string|null, scope: 'global'|null } | null}
  */
 export function normalizeMemoryItem(item) {
   if (item === null || typeof item !== 'object') return null
@@ -157,11 +165,14 @@ export function normalizeMemoryItem(item) {
   const text = clip(record.text, EXTRACT_LIMITS.text)
   if (text === '') return null
   const sceneRaw = clip(record.scene, EXTRACT_LIMITS.scene)
+  const kind = normalizeKind(record.kind)
+  const wantsGlobal = String(record.scope ?? '').trim().toLowerCase() === 'global'
   return {
-    kind: normalizeKind(record.kind),
+    kind,
     text,
     priority: clampPriority(record.priority),
     scene: sceneRaw === '' ? null : sceneRaw,
+    scope: wantsGlobal && (kind === 'persona' || kind === 'instruction') ? 'global' : null,
   }
 }
 
@@ -319,6 +330,7 @@ export function applyDecisions(db, plan, decisions, ctx = {}) {
         text,
         priority: entry.fact.priority,
         scene: entry.fact.scene,
+        scope: entry.fact.scope ?? undefined,
         targetId,
         mergeIds: decision.mergeIds ?? [],
       },

@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "description": "Layered cross-session memory for DeepSeek Harness: L0 raw turns, L1 LLM-extracted facts with conflict resolution, L2 scenes, L3 persona, hybrid FTS + local 384-dim lexical vectors, plus recall injection and memory_search / memory_save / memory_extract tools",
   "type": "module",
   "main": "index.js",
@@ -28,7 +28,8 @@
     "README.md",
     "INSTALL.md",
     "LICENSE",
-    "DESIGN-v2.md"
+    "DESIGN-v2.md",
+    "AUDIT-global-recall.md"
   ],
   "engines": {
     "node": ">=22.16.0"
