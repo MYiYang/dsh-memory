@@ -88,7 +88,10 @@ test('openDatabase creates the v2 tables and is idempotent', () => {
   }
   db.close()
   const again = openDatabase(path)
-  assert.equal(again.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '3')
+  assert.equal(
+    again.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value,
+    String(SCHEMA_VERSION),
+  )
   again.close()
 })
 

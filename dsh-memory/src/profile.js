@@ -131,6 +131,107 @@ export function sceneNavigation(db, options = {}) {
 }
 
 /**
+ * True when any persona body still names this scene.
+ *
+ * A persona that says「构建：pnpm build」is a pointer into the navigation; once
+ * the scene row is gone the persona mentions something the agent can no longer
+ * look up. Scene names shorter than two characters are skipped — a one-character
+ * name (or a stray letter) matches almost any Chinese text.
+ *
+ * @param {string} name
+ * @param {string[]} bodies
+ * @returns {boolean}
+ */
+function referencedByPersona(name, bodies) {
+  const needle = name.trim()
+  if (needle.length < 2) return false
+  return bodies.some((body) => body.includes(needle))
+}
+
+/**
+ * Delete scenes beyond the per-bucket cap, coldest first.
+ *
+ * The cap is applied separately to the current project's scenes and to the
+ * global scenes: a project with many scenes must not evict the shared global
+ * ones, and vice versa. Ranking uses `effectiveHeat`, so a scene that was hot a
+ * month ago loses to one touched yesterday even if its raw heat is higher.
+ *
+ * Scenes a persona body still references are re-added after the top-N cut (they
+ * do not count against `maxScenes`), which keeps the persona's pointers valid.
+ * Only `l2_scenes` rows are removed: L1 facts are never touched.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{
+ *   maxScenes?: number, project?: string|null, now?: number,
+ *   halfLifeDays?: number, protectReferenced?: boolean,
+ * }} [options]
+ * @returns {{ deleted: number, kept: number, protected: string[], removed: string[] }}
+ *   `kept` counts the scene rows left in the pruned buckets (protected ones
+ *   included), `protected` lists the scene names kept only by reference, and
+ *   `removed` lists the deleted scene names (deduped, in eviction order: global
+ *   bucket first, hottest-of-the-evicted first within a bucket) so callers can
+ *   remember them.
+ */
+export function pruneScenes(db, options = {}) {
+  const now = options.now ?? Date.now()
+  const maxScenes = Math.max(1, Math.min(1_000, Number(options.maxScenes ?? 20)))
+  const project = options.project ?? null
+  const halfLifeDays = options.halfLifeDays ?? 14
+  const protectReferenced = options.protectReferenced !== false
+
+  /** @type {string[]} */
+  const personaBodies = []
+  const globalPersona = getPersona(db, { scope: 'global' })
+  if (globalPersona !== undefined) personaBodies.push(String(globalPersona.body ?? ''))
+  if (project !== null) {
+    const projectPersona = getPersona(db, { scope: 'project', project })
+    if (projectPersona !== undefined) personaBodies.push(String(projectPersona.body ?? ''))
+  }
+
+  /** @type {Array<Array<Record<string, any>>>} */
+  const buckets = [db.prepare("SELECT * FROM l2_scenes WHERE scope = 'global'").all()]
+  if (project !== null) {
+    buckets.push(db.prepare("SELECT * FROM l2_scenes WHERE scope = 'project' AND project = ?").all(project))
+  }
+
+  /** @type {number[]} */
+  const toDelete = []
+  /** @type {Set<string>} */
+  const removedNames = new Set()
+  /** @type {string[]} */
+  const protectedNames = []
+  let kept = 0
+  for (const rows of buckets) {
+    const ranked = rows
+      .map((row) => ({ row, heat: effectiveHeat(row.heat, row.updated_at, now, halfLifeDays) }))
+      // Ties break on recency, then on insertion order: the pruning must be
+      // deterministic, otherwise two runs over the same data disagree.
+      .sort((a, b) => b.heat - a.heat || Number(b.row.updated_at) - Number(a.row.updated_at) || Number(b.row.id) - Number(a.row.id))
+    for (const entry of ranked.slice(maxScenes)) {
+      const name = String(entry.row.name ?? '')
+      if (protectReferenced && referencedByPersona(name, personaBodies)) {
+        protectedNames.push(name)
+        kept += 1
+        continue
+      }
+      toDelete.push(Number(entry.row.id))
+      // Same name may exist in both buckets (one global, one project); the
+      // caller only needs to remember the name once.
+      removedNames.add(name)
+    }
+    kept += Math.min(ranked.length, maxScenes)
+  }
+
+  // Chunked: SQLite caps the number of bound parameters per statement, and a
+  // long-lived database can hold far more stale scenes than one chunk allows.
+  for (let i = 0; i < toDelete.length; i += 400) {
+    const chunk = toDelete.slice(i, i + 400)
+    db.prepare(`DELETE FROM l2_scenes WHERE id IN (${chunk.map(() => '?').join(',')})`).run(...chunk)
+  }
+  return { deleted: toDelete.length, kept, protected: protectedNames, removed: [...removedNames] }
+}
+
+/**
  * One persona row (global or project).
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {{ scope: 'global'|'project', project?: string|null }} input

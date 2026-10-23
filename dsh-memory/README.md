@@ -5,8 +5,8 @@
 - **L0 原文**：每轮完整落库（用户/助手文本 + 工具名），不可变、可重放；
 - **L1 原子事实**：按 warm-up 阈值异步调用 LLM 抽取，带 kind / priority / version / 冲突消解（store / update / merge / skip）；
 - **L2 场景块**：把同类事实归并成 Markdown 场景（summary + heat + 热度衰减），生成「场景导航」；
-- **L3 画像**：项目画像（偏好/约定/决策/环境），由 JEV-lite 判决门控，只在值得时重写；
-- **召回**：稳定段（画像 + 场景导航，每会话一次）+ 动态段（本轮命中的 L1 事实）两段注入；检索是 **FTS5 + 本地 384 维词法向量** 的混合（无需 embedding 服务）；
+- **L3 画像**：项目画像 + 跨项目全局画像（偏好/约定/决策/环境），由 JEV-lite 判决门控，只在值得时重写；
+- **召回**：稳定段（画像 + 场景导航，每会话一次）+ 动态段（本轮命中的 L1 事实）两段注入；检索是 **FTS5 + 本地 384 维词法向量** 的混合（倒排特征预筛 + 精确余弦，无需 embedding 服务）；
 - **工具**：`memory_search` / `memory_save` / `memory_forget` / `memory_stats` / `memory_extract`。
 
 零外部依赖：存储用 Node 自带 `node:sqlite`（FTS5 + trigram），向量是进程内 **feature hashing**（字符 n-gram + 英文词，384 维 Float32），
@@ -85,16 +85,19 @@
     scenes:
       enabled: true
       minFacts: 3
-      maxScenes: 20
+      maxScenes: 20             # 超出的场景按衰减热度淘汰（persona 引用的保留）
       halfLifeDays: 14
     persona:
       enabled: true
       triggerEveryN: 10
       maxChars: 1200
+      global: true              # 额外维护跨项目全局画像（只吃 global 事实）
     vector:
       enabled: true             # 关掉就只用 FTS/LIKE
       weight: 0.1               # 向量分权重（实测 0.2+ 会掉点，默认 0.1）
-      scanLimit: 2000           # 词法阶段候选不足时，最多扫描多少条向量
+      scanLimit: 2000           # 预筛没有命中时的有界兜底扫描行数
+      prefilter: true           # 倒排特征索引预筛（memory_features）
+      featureLimit: 96          # 预筛查询侧最多用多少个特征（存储固定 96/条）
     skills:
       enabled: true             # 关掉就不注册包内技能
       dir: ''                   # 覆盖技能目录（默认 = 包内 skills/）
@@ -125,8 +128,8 @@ session/event(turn/end)
               ├─ 解析容错（think/围栏/裸 priority/坏条）
               ├─ 候选召回(FTS) → 二次 LLM 冲突消解 → 启发式兜底
               ├─ L1: store/update/merge/skip + version/history
-              ├─ L2: 场景归并（事实 ≥ minFacts）→ summary/body/heat
-              └─ L3: JEV-lite 判决 → 重写项目画像
+              ├─ L2: 场景归并（事实 ≥ minFacts）→ summary/body/heat → 超 maxScenes 淘汰
+              └─ L3: JEV-lite 判决 → 重写项目画像 + 全局画像
 
 agent/pre-step（每轮首 step）
   ├─ 稳定段（每会话一次）: 长期约定（pinned / 高优先 persona+instruction）+ 画像 + 场景导航
@@ -147,8 +150,11 @@ agent/pre-step（每轮首 step）
   抽取失败不影响会话，L0 原文仍在。
 - **成本**：一次抽取约 2–5k tokens，按阈值摊薄；`memory_stats` 的 `tokens=` 是累计花费。
 - **向量**：每行写入时算一个 384 维 `Float32` 向量（字符 2/3/4-gram + 英文词，feature hashing + signed hash + L2 归一化），
-  存成 BLOB（约 1.5 KB/条）。召回时对 FTS/LIKE 候选算余弦重排；词法候选不足（如 2 字中文查询）时再扫描向量补候选。
+  存成 BLOB（约 1.5 KB/条）。召回时先用**倒排特征索引**（`memory_features`，存未哈希的 n-gram/英文词）按稀有特征取候选，
+  再对候选算精确余弦；索引没有提名时才按 `updated_at DESC` 做有界兜底扫描（最多 `vector.scanLimit` 行）。
   **它是词法向量，不是语义向量**：能补字词重叠与排序，不理解同义词（「构建」和「编译」仍不同）。
+- **规模化**：向量召回不再对整表做暴力余弦。`memory_features` 在每次打开库时渐进补建（每次最多 500 行），
+  大库首次升级可能需要几次重启才补齐；没补齐的行仍由兜底扫描覆盖。索引模型（`feature-index-model`）变化时整表重建。
 - **注入**：`<memory_context type="stable|dynamic" source="dsh-memory">`，
   `source.kind='plugin:dsh-memory'`（会话格式 v4 只接受 producer-owned kind；
   写成 `{kind:'plugin', plugin:…}` 会让整轮失败）。
@@ -193,7 +199,7 @@ agent/pre-step（每轮首 step）
 ## 验证是否真的加载了
 
 1. **插件列表**：侧栏「插件」页里应出现 `dsh-memory`（来自 `dsh.profile.bundles`），状态为启用/active。
-2. **工具层**：新会话里说「看下你的记忆库」→ 模型应调用 `memory_stats`，输出含 `l0=`、`scenes=`、`vec=`、`tokens=`。
+2. **工具层**：新会话里说「看下你的记忆库」→ 模型应调用 `memory_stats`，输出含 `l0=`、`scenes=`、`vec=`、`feat=`、`tokens=`。
 3. **抽取层**：聊几轮后 `memory_stats` 的 `l0=0/N`（待抽取为 0）且 `kinds={...}` 出现 `work_fact` 等；
    或直接让模型调 `memory_extract` 看 `reason=ok`。
 4. **注入层**：消息里出现 `<memory_context type="stable|dynamic">`；会话日志 request/header 里有 `memory_*` 工具：
@@ -213,6 +219,7 @@ agent/pre-step（每轮首 step）
 | 没有人格/场景 | 事实太少（`minFacts`）或还没到 `triggerEveryN` | 多聊几轮，或调小阈值 |
 | 召回为空 | 语料太少，或 2 字中文走 LIKE 兜底 | 用 `memory_save` 固化关键结论（`fact` 权重高） |
 | `memory_stats` 的 `vec=` 小于总数 | 旧行还没回填（每次 open 最多补 500 行）或写入路径没跑 v3 | 重启一次让它继续回填；或 `enabled: false` 临时关掉向量 |
+| `memory_stats` 的 `feat=` 小于总数 | 特征索引还在渐进补建（每次 open 最多 500 行） | 重启一次继续；不影响召回，未索引行仍走有界兜底 |
 | 向量把不相关记忆排上来 | 词法哈希碰撞或权重过高 | 调低 `vector.weight`（如 0.2）或 `enabled: false` |
 
 ## 开发与测试
@@ -221,7 +228,7 @@ agent/pre-step（每轮首 step）
 
 ```powershell
 cd dsh-memory
-# 全量：117 项，0 fail
+# 全量：149 项，0 fail
 node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)
 # 单文件
 node test/recall.test.js
@@ -231,17 +238,18 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 
 模块：
 
-- `src/store.js` — schema v1→v3 迁移、memory 表、FTS、meta、stats、向量回填
+- `src/store.js` — schema v1→v4 迁移、memory 表、FTS、meta、stats、向量/特征索引回填
 - `src/vector.js` — 384 维词法向量（feature hashing、pack/unpack、cosine）
+- `src/feature-index.js` — 倒排特征索引（向量预筛、df 探测、渐进补建）
 - `src/l0.js` — L0 原文、游标、pending、transcript 预算
 - `src/l1.js` — 候选、冲突决策（store/update/merge/skip）、version/history
 - `src/extract.js` — 抽取/去重 prompt、JSON 容错解析、决策落库
 - `src/scheduler.js` — warm-up 阈值 + idle（可注入定时器）
 - `src/llm.js` — `ctx.get('llm')` 封装（超时/usage/降级）
-- `src/pipeline.js` — 串行队列、失败重试/丢弃、L2/L3 串接
-- `src/profile.js` — L2 场景、L3 画像、heat 衰减/导航
-- `src/consolidate.js` — 场景归并、画像重写、JEV-lite 判决
-- `src/recall.js` — 查询词、FTS/LIKE + 向量混合打分、稳定/动态注入块
+- `src/pipeline.js` — 串行队列、失败重试/丢弃、L2/L3 串接（项目 + 全局画像）
+- `src/profile.js` — L2 场景、maxScenes 淘汰、L3 画像、heat 衰减/导航
+- `src/consolidate.js` — 场景归并、画像重写（项目/全局）、JEV-lite 判决
+- `src/recall.js` — 查询词、FTS/LIKE + 倒排预筛 + 向量混合打分、稳定/动态注入块
 - `src/capture.js` — v1 episode 捕获（兼容保留）
 - `index.js` — 与 dsh 接线（事件、pre-step、工具、降级）
 
@@ -251,7 +259,14 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 
 - 向量是**词法向量**（字符 n-gram hashing），不是语义 embedding：同义词、跨语言改写仍然召回不到；
   要语义得接真的 embedding 服务（dsh 目前没有），或用 LLM 做查询扩展。
-- 向量扫描是暴力余弦（上限 `vector.scanLimit`，默认 2000 条）；记忆量很大时应换成 ANN 索引或先用词法预筛。
+- 向量召回已改为「倒排特征索引预筛 → 精确余弦 → 有界兜底」，不再对整表暴力扫描。
+  **没有引入 LSH/ANN**：向量本身就是词法哈希，倒排预筛对真实字词重叠是无损的（哈希碰撞只影响候选排序，最终分仍是精确 cosine），
+  ANN 的近似误差在这个特征空间没有收益。代价：`memory_features` 约 +0.3–1 KB/条；大库升级后每次 open 补 500 行，
+  未补齐的行仍由兜底扫描覆盖。2 字中文/短拉丁查询的 LIKE 兜底仍是全表扫描（10k 行约百毫秒级），是下一步可优化项。
+- L2 场景超过 `maxScenes` 会按**衰减热度**淘汰（persona 正文引用的场景保留）；被淘汰场景用 `l2-evicted:<project>` 记录，
+  在没有更新事实前不会重建，避免「淘汰→重建→再淘汰」反复烧 LLM。引用保护是子串匹配，2 字常用词可能过度保护。
+- L3 现在同时维护**项目画像**与**全局画像**（`persona.global`，默认 true）：全局画像只吃 `scope='global'` 的事实，
+  有独立的批次计数 `l3-batches:@global` 与 JEV-lite 门控；与 core 长期约定层互补（core 管「每轮必须遵守的规则」，
+  全局画像管跨项目的背景与决策摘要）。只想要项目画像可设 `persona.global: false`。
 - 抽取/场景/画像共用会话模型；想更省可配便宜模型（`extraction.model`）。
-- L2 场景上限 `maxScenes` 未做淘汰（后续加）；L3 只做项目画像（全局画像后续）。
 - 单机单库；多人共享需换存储后端（接口隔离在 `store.js`）。

@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
-import { openDatabase } from '../src/store.js'
+import { openDatabase, saveMemory } from '../src/store.js'
 import { pendingCount } from '../src/l0.js'
 
 function fakeCtx(extractionBatches = [], extras = {}) {
@@ -159,4 +159,40 @@ test('enabled L2/L3 turns facts into a scene block and a persona', async () => {
   assert.match(scene.summary, /Node 24/)
   const persona = db.prepare("SELECT * FROM l3_persona WHERE scope = 'project'").get()
   assert.match(persona.body, /pnpm/)
+})
+
+test('enabled L3 also maintains the global persona next to the project one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-wiring4-'))
+  const dbPath = join(dir, 'memory.db')
+  // The global persona pool is global rows only, so seed one before the plugin
+  // opens the database. Without it this job would stop at `no-facts`.
+  const seed = openDatabase(dbPath)
+  saveMemory(seed, { text: '用户偏好中文回答', kind: 'persona', scope: 'global', project: null })
+  seed.close()
+  const { ctx, handlers } = fakeCtx(
+    [[{ kind: 'work_fact', text: '用 pnpm build 构建', priority: 70, scene: '工具链' }]],
+    { persona: '## 用户偏好\n- 中文\n## 项目约定\n- pnpm' },
+  )
+  apply(ctx, {
+    dbPath,
+    capture: false,
+    extraction: { everyN: 1, idleMs: 60_000, provider: 'fake', model: 'fake' },
+    scenes: { enabled: false },
+    persona: { enabled: true, triggerEveryN: 10 },
+  })
+  const session = { id: 'session-global-l3', header: { cwd: 'F:\\work\\demo' }, events: [] }
+  emitTurn(handlers, session, { turn: 1, user: '构建与语气偏好', assistant: 'pnpm build，中文回答' })
+
+  const db = openDatabase(dbPath)
+  const done = await waitFor(() => db.prepare('SELECT COUNT(*) AS n FROM l3_persona').get().n >= 2)
+  assert.equal(done, true, 'project and global persona should both be written')
+  const global = db.prepare("SELECT * FROM l3_persona WHERE scope = 'global'").get()
+  assert.match(global.body, /中文/)
+  const project = db.prepare("SELECT * FROM l3_persona WHERE scope = 'project'").get()
+  assert.equal(project.project, 'demo')
+  // Each scope keeps its own batch counter; a rewrite resets only its own.
+  const counters = db.prepare("SELECT key, value FROM meta WHERE key LIKE 'l3-batches:%'").all()
+  const keys = counters.map((row) => row.key).sort()
+  assert.deepEqual(keys, ['l3-batches:demo', 'l3-batches:@global'].sort())
+  for (const row of counters) assert.equal(row.value, '0')
 })

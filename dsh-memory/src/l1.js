@@ -17,6 +17,7 @@ import { KINDS, KIND_WEIGHTS, deriveTitle, normalizeText, textHash } from './sto
 import { buildFtsQuery, extractTerms } from './recall.js'
 import { searchFts, searchLike } from './store.js'
 import { VECTOR_MODEL, embed, packVector } from './vector.js'
+import { indexMemoryFeatures } from './feature-index.js'
 
 /** Kinds the extractor may emit (v1 kinds stay valid for manual writes). */
 export const L1_KINDS = /** @type {const} */ ([
@@ -231,6 +232,8 @@ export function applyDecision(db, decision, ctx = {}) {
         now,
         targetId,
       )
+      // The text was rewritten: its stored lexical features are now stale.
+      indexMemoryFeatures(db, targetId, text)
       if (op === 'merge') {
         for (const id of decision.mergeIds ?? []) supersede(db, [id], targetId)
       }
@@ -278,7 +281,9 @@ export function insertFact(db, input) {
       packVector(embed(input.text)),
       VECTOR_MODEL,
     )
-  return { op: 'store', id: Number(result.lastInsertRowid), version: 1 }
+  const id = Number(result.lastInsertRowid)
+  indexMemoryFeatures(db, id, input.text)
+  return { op: 'store', id, version: 1 }
 }
 
 /**

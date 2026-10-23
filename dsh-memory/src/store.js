@@ -13,9 +13,10 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { VECTOR_MODEL, embed, packVector } from './vector.js'
+import { backfillFeatureIndex, ensureFeatureIndexModel, indexMemoryFeatures } from './feature-index.js'
 
 /** Schema version; bump when the layout changes and add a migration step. */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /**
  * Kinds of memory rows.
@@ -90,6 +91,13 @@ export function openDatabase(path) {
   } catch {
     /* vectors are an optimization; never block opening the database */
   }
+  // v3 → v4 backfill of the inverted lexical feature index used by the vector
+  // branch of recall. Same bounded-pass contract as the vectors.
+  try {
+    backfillFeatureIndex(db, { limit: 500 })
+  } catch {
+    /* the feature index is an optimization; never block opening the database */
+  }
   return db
 }
 
@@ -152,6 +160,11 @@ export function migrate(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS memory_hash_uniq ON memory(hash);
     CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory(scope, project, kind);
     CREATE INDEX IF NOT EXISTS memory_recent_idx ON memory(created_at DESC);
+    -- v4: newest-first is the vector fallback's scan order; without these indexes
+    -- SQLite sorts the whole table for ORDER BY updated_at DESC even though only
+    -- scanLimit rows are needed.
+    CREATE INDEX IF NOT EXISTS memory_updated_idx ON memory(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS memory_scope_updated_idx ON memory(scope, updated_at DESC);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
       title,
@@ -240,7 +253,26 @@ export function migrate(db) {
       updated_at INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS l3_persona_uniq ON l3_persona(scope, ifnull(project, ''));
+
+    -- ── v4: inverted lexical feature index (pre-filter for the vector branch) ──
+    -- One row per stored feature of a memory, keyed by the 32-bit hash of the
+    -- unhashed feature (see feature-index.js). Rebuilt from memory at open time.
+    CREATE TABLE IF NOT EXISTS memory_features (
+      memory_id INTEGER NOT NULL,
+      feature   INTEGER NOT NULL,
+      weight    REAL NOT NULL,
+      PRIMARY KEY(memory_id, feature)
+    );
+    CREATE INDEX IF NOT EXISTS memory_features_feature_idx ON memory_features(feature);
+
+    -- forgetMemories deletes from memory; feature rows must not be orphaned.
+    CREATE TRIGGER IF NOT EXISTS memory_features_ad AFTER DELETE ON memory BEGIN
+      DELETE FROM memory_features WHERE memory_id = old.id;
+    END;
   `)
+
+  // v4: a changed feature model invalidates every stored feature row.
+  ensureFeatureIndexModel(db)
 
   // v1 → v2: additive columns on the existing memory table.
   ensureColumn(db, 'memory', 'priority', 'INTEGER NOT NULL DEFAULT 50')
@@ -348,6 +380,11 @@ export function saveMemory(db, input, now = Date.now()) {
           SET kind = ?, scope = ?, project = ?, title = ?, tags = ?, updated_at = ?, pinned = MAX(pinned, ?)
         WHERE id = ?`,
     ).run(kind, scope, project, title, tags, now, input.pinned ? 1 : 0, existing.id)
+    // The text (and therefore the feature set) is unchanged — the hash is the
+    // dedupe key — but the row may predate the v4 index: repair it in place.
+    if (db.prepare('SELECT 1 FROM memory_features WHERE memory_id = ? LIMIT 1').get(existing.id) === undefined) {
+      indexMemoryFeatures(db, Number(existing.id), text)
+    }
     return { id: Number(existing.id), inserted: false }
   }
   const result = db
@@ -373,7 +410,9 @@ export function saveMemory(db, input, now = Date.now()) {
       packVector(embed(text)),
       VECTOR_MODEL,
     )
-  return { id: Number(result.lastInsertRowid), inserted: true }
+  const id = Number(result.lastInsertRowid)
+  indexMemoryFeatures(db, id, text)
+  return { id, inserted: true }
 }
 
 /**
@@ -544,7 +583,7 @@ export function forgetMemories(db, selector) {
 /**
  * Aggregate counters for `memory_stats` and logs.
  * @param {DatabaseSync} db
- * @returns {{ total: number, facts: number, episodes: number, projects: number, dbBytes: number }}
+ * @returns {{ total: number, facts: number, episodes: number, projects: number, vectorized: number, featureIndexed: number, dbBytes: number }}
  */
 export function stats(db) {
   const row = db
@@ -589,6 +628,11 @@ export function stats(db) {
     scenes: count('SELECT COUNT(*) AS n FROM l2_scenes'),
     personas: count('SELECT COUNT(*) AS n FROM l3_persona'),
     vectorized: count('SELECT COUNT(*) AS n FROM memory WHERE vec IS NOT NULL AND vec_model = ?', VECTOR_MODEL),
+    // Rows with at least one real feature (the feature-0 sentinel means "no
+    // indexable feature"), i.e. how much of the corpus the vector pre-filter sees.
+    featureIndexed: count(
+      'SELECT COUNT(*) AS n FROM memory m WHERE EXISTS (SELECT 1 FROM memory_features f WHERE f.memory_id = m.id AND f.feature <> 0)',
+    ),
     tokensSpent: Number(getMeta(db, 'l1_tokens_total') ?? 0),
     dbBytes,
   }

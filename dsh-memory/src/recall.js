@@ -9,8 +9,15 @@
  *
  * @module dsh-memory/recall
  */
-import { KIND_WEIGHTS, searchFts, searchLike, touchMemories } from './store.js'
+import { KIND_WEIGHTS, getByIds, searchFts, searchLike, touchMemories } from './store.js'
 import { VECTOR_MODEL, cosine, embed, unpackVector } from './vector.js'
+import { DEFAULT_FEATURE_LIMIT, candidateMemoryIds } from './feature-index.js'
+
+/** Minimum cosine for a vector-only candidate to count as related. */
+const VECTOR_MIN_COSINE = 0.15
+
+/** Candidate rows nominated by the inverted index before exact rescoring. */
+const PREFILTER_CANDIDATES = 64
 
 /** Latin/CJK aware token extraction. */
 const LATIN_RE = /[a-zA-Z0-9_][a-zA-Z0-9_.\-/]{1,}/g
@@ -153,6 +160,9 @@ export function estimateChars(text) {
  * @param {number} [options.minScore]
  * @param {number} [options.now]
  * @param {boolean} [options.touch]
+ * @param {{ enabled?: boolean, weight?: number, scanLimit?: number, prefilter?: boolean, featureLimit?: number }} [options.vector]
+ *   `prefilter: false` disables the inverted-index pass (bounded scan only);
+ *   `featureLimit` caps how many query features feed the pre-filter (default 96).
  * @returns {{ items: Array<import('./store.js').MemoryRow & { score: number }>, terms: string[], strategy: string }}
  */
 export function recall(db, query, options = {}) {
@@ -172,7 +182,18 @@ export function recall(db, query, options = {}) {
     ? Math.max(0, Math.min(1, Number(vectorOptions.weight)))
     : 0.1
   const scanLimit = Math.max(0, Math.min(5000, Number(vectorOptions.scanLimit) || 2000))
-  const queryVector = vectorEnabled ? embed(query) : null
+  // Query-side feature cap for the inverted-index pre-filter (see feature-index.js;
+  // probing is bounded internally, this only lets a caller ask for fewer).
+  const requestedFeatureLimit = Number(vectorOptions.featureLimit)
+  const featureLimit =
+    Number.isFinite(requestedFeatureLimit) && requestedFeatureLimit > 0
+      ? Math.floor(requestedFeatureLimit)
+      : DEFAULT_FEATURE_LIMIT
+  const prefilter = vectorOptions.prefilter !== false
+  const wanted = maxItems * 2
+  // A blank query has no features to compare; skipping the vector branch avoids
+  // a pointless bounded scan on turns that carry no text (attachment-only).
+  const queryVector = vectorEnabled && String(query ?? '').trim() !== '' ? embed(query) : null
   /** @type {Map<number, number>} */
   const vectorScores = new Map()
   const vectorScoreOf = (row) => {
@@ -203,26 +224,71 @@ export function recall(db, query, options = {}) {
       if (!candidates.has(row.id)) candidates.set(row.id, { row })
     }
   }
-  if (vectorEnabled && queryVector !== null && candidates.size < maxItems * 2 && scanLimit > 0) {
-    // Lexical pass is thin (2-char CJK, paraphrase, typo): scan the vectors we
-    // have and keep the closest ones. Bounded by scanLimit so the latency stays
-    // predictable; a real ANN index is out of scope.
-    const scopeSql = scope === 'global' ? "scope = 'global'" : "(scope = 'global' OR project = ?)"
-    const params = scope === 'global' ? [VECTOR_MODEL, scanLimit] : [VECTOR_MODEL, options.project ?? null, scanLimit]
-    const rows = db
-      .prepare(
-        `SELECT * FROM memory
-          WHERE superseded_by IS NULL AND vec IS NOT NULL AND vec_model = ? AND ${scopeSql}
-          LIMIT ?`,
-      )
-      .all(...params)
-    const nearest = rows
-      .map((row) => ({ row, score: vectorScoreOf(row) }))
-      .filter((entry) => entry.score >= 0.15)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxItems * 2)
-    for (const { row } of nearest) {
-      if (!candidates.has(row.id)) candidates.set(row.id, { row })
+  if (vectorEnabled && queryVector !== null && candidates.size < wanted) {
+    /**
+     * Keep the closest rows that clear the cosine floor, best first.
+     * `vectorScoreOf` caches per id, so a row scored by one pass is not rescored
+     * by the next one.
+     * @param {import('./store.js').MemoryRow[]} rows
+     */
+    const addNearest = (rows) => {
+      const nearest = rows
+        .map((row) => ({ row, score: vectorScoreOf(row) }))
+        .filter((entry) => entry.score >= VECTOR_MIN_COSINE)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, wanted)
+      for (const { row } of nearest) {
+        if (!candidates.has(row.id)) candidates.set(row.id, { row })
+      }
+    }
+
+    /** Rows the inverted index nominated (0 = it found no lexical neighbour). */
+    let prefilterNominated = 0
+
+    if (prefilter) {
+      // The stored vector is a lexical feature hash, so the *unhashed* features
+      // can nominate candidates through the inverted index. This is what rescues
+      // the cases the cheap passes miss (2-char terms, typos, partially shared
+      // phrases) without scanning the table. The nomination is only a heuristic:
+      // every nominated row is rescored with the exact cosine right here.
+      const ids = candidateMemoryIds(db, query, {
+        limit: Math.max(PREFILTER_CANDIDATES, wanted * 2),
+        scope,
+        project: options.project ?? null,
+        kinds,
+        featureLimit,
+      })
+      prefilterNominated = ids.length
+      if (ids.length > 0) addNearest(getByIds(db, ids))
+    }
+
+    // Scan only when the prefilter nominated nothing. With a *lexical* vector a
+    // real overlap always implies a shared feature, so a non-empty nomination
+    // already covers the related rows and the scan would only add hash-collision
+    // noise. A zero nomination means the query is outside the indexed features
+    // (or rows predate the v4 backfill): scan newest-first, bounded by scanLimit.
+    if (candidates.size < wanted && scanLimit > 0 && (!prefilter || prefilterNominated === 0)) {
+      // Two steps on purpose: the id-only scan carries no vector blobs (a
+      // SELECT * with the same ORDER BY is ~3x slower for the same rows), and
+      // rows that a previous pass already scored are never fetched again.
+      const scopeSql =
+        scope === 'global' ? "scope = 'global'" : scope === 'all' ? '1 = 1' : "(scope = 'global' OR project = ?)"
+      const params =
+        scope === 'global' || scope === 'all'
+          ? [VECTOR_MODEL, scanLimit]
+          : [VECTOR_MODEL, options.project ?? null, scanLimit]
+      const ids = db
+        .prepare(
+          `SELECT id FROM memory
+            WHERE superseded_by IS NULL AND vec IS NOT NULL AND vec_model = ? AND ${scopeSql}
+            ORDER BY updated_at DESC
+            LIMIT ?`,
+        )
+        .all(...params)
+      const fresh = ids
+        .map((row) => Number(row.id))
+        .filter((id) => !candidates.has(id) && !vectorScores.has(id))
+      if (fresh.length > 0) addNearest(getByIds(db, fresh))
     }
   }
 

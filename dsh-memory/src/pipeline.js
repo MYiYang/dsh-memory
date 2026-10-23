@@ -214,6 +214,17 @@ export function createPipeline(options) {
       } catch (error) {
         log('warn', `l3 persona consolidation failed: ${error instanceof Error ? error.message : String(error)}`)
       }
+      // Global persona: cross-project preferences ("how to treat the user"),
+      // built from global facts only. Its own try/catch and its own batch
+      // counter, so a failed or deferred global rewrite never costs the project
+      // persona, L1, or the other scope's schedule. Order: project, then global.
+      if (personaConfig.global !== false) {
+        try {
+          await runPersona(db, llm, personaConfig, { scope: 'global', now: now(), log, sessionId, signal })
+        } catch (error) {
+          log('warn', `l3 global persona consolidation failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
     }
     return { summary, used: usedIds.length, clipped: transcript.clipped, reason }
   }

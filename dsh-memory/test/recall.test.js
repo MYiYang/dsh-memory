@@ -190,6 +190,55 @@ test('vector scan rescues a candidate that FTS and LIKE both miss', () => {
   db.close()
 })
 
+test('the feature index rescues a 2-char latin term that FTS, LIKE and the bounded scan all miss', () => {
+  const db = openDatabase(':memory:')
+  const now = Date.now()
+  const target = saveMemory(
+    db,
+    { text: 'db 连接池上限是 20', kind: 'fact', scope: 'project', project: 'menm' },
+    now - 5000,
+  )
+  // Newest row shares no feature with the query, so with scanLimit = 1 the
+  // bounded fallback can only ever see this one.
+  saveMemory(db, { text: 'unrelated cooking recipe', kind: 'fact', scope: 'project', project: 'menm' }, now)
+
+  // `db` is 2 chars: trigram FTS cannot match it, and LIKE only covers CJK.
+  const lexicalOnly = recall(db, 'db', { project: 'menm', minScore: 0, touch: false })
+  assert.equal(lexicalOnly.items.length, 0)
+
+  const withVector = recall(db, 'db', {
+    project: 'menm',
+    minScore: 0,
+    touch: false,
+    vector: { enabled: true, weight: 0.35, scanLimit: 1, featureLimit: 12 },
+  })
+  assert.ok(
+    withVector.items.some((row) => row.id === target.id),
+    'the inverted index must nominate the row sharing the w:db feature',
+  )
+  assert.match(withVector.strategy, /\+vec$/)
+  db.close()
+})
+
+test('vector.prefilter === false keeps the bounded scan path', () => {
+  const db = openDatabase(':memory:')
+  const saved = saveMemory(db, { text: 'A', kind: 'fact', scope: 'project', project: 'menm' })
+  db.prepare('UPDATE memory SET vec = ?, vec_model = ? WHERE id = ?').run(
+    packVector(embed('目标查询短语')),
+    VECTOR_MODEL,
+    saved.id,
+  )
+  const result = recall(db, '目标查询短语', {
+    project: 'menm',
+    minScore: 0,
+    touch: false,
+    vector: { enabled: true, weight: 0.35, scanLimit: 100, prefilter: false },
+  })
+  assert.equal(result.items.length, 1)
+  assert.equal(result.items[0].id, saved.id)
+  db.close()
+})
+
 test('a weak bm25 hit never scores below a row without any lexical signal', () => {
   const now = Date.now()
   const row = { id: 1, kind: 'work_fact', scope: 'project', project: 'menm', text: 't', created_at: now, updated_at: now, use_count: 0, pinned: 0 }
@@ -213,5 +262,28 @@ test('a project scope without a project key sees global rows only', () => {
 
   const scoped = recall(db, '回答用中文', { scope: 'project', project: 'menm', minScore: 0, touch: false })
   assert.equal(scoped.items.length, 2, 'global + own project')
+  db.close()
+})
+
+test('scope=all lets the bounded vector fallback see every project', () => {
+  const db = openDatabase(':memory:')
+  const saved = saveMemory(db, { text: 'A', kind: 'fact', scope: 'project', project: 'other' })
+  // A semantic-looking vector the lexical passes cannot produce: only the
+  // vector fallback can find it, and scope=all must not restrict it to the
+  // caller's own project.
+  db.prepare('UPDATE memory SET vec = ?, vec_model = ? WHERE id = ?').run(
+    packVector(embed('目标查询短语')),
+    VECTOR_MODEL,
+    saved.id,
+  )
+  const result = recall(db, '目标查询短语', {
+    scope: 'all',
+    project: 'menm',
+    minScore: 0,
+    touch: false,
+    vector: { enabled: true, weight: 0.35, scanLimit: 100, prefilter: false },
+  })
+  assert.equal(result.items.length, 1)
+  assert.equal(result.items[0].id, saved.id)
   db.close()
 })

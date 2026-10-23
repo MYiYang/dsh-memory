@@ -78,7 +78,7 @@ agent/pre-step（每轮首 step）
 
 ---
 
-## 4. 数据模型（SQLite，schema v3）
+## 4. 数据模型（SQLite，schema v4）
 
 ### 4.1 L0
 
@@ -133,6 +133,17 @@ CREATE TABLE memory_history (
   text       TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+-- v4：倒排特征索引（向量预筛，见 §19/§23）
+-- 只存未哈希特征，key 是 fnv1a(feature)；不写 memory 表，不触发 FTS 同步。
+CREATE TABLE memory_features (
+  memory_id INTEGER NOT NULL,
+  feature   INTEGER NOT NULL,
+  weight    REAL NOT NULL,          -- 1 + ln(tf)
+  PRIMARY KEY(memory_id, feature)
+);
+CREATE INDEX memory_features_feature_idx ON memory_features(feature);
+-- AFTER DELETE ON memory → DELETE FROM memory_features WHERE memory_id = old.id
 ```
 
 kind 集合扩展（保留 v1 的 fact/note/episode 兼容）：
@@ -181,8 +192,9 @@ CREATE TABLE l3_persona (
 
 ### 4.4 迁移
 
-- `SCHEMA_VERSION = 2`；`migrate()` 先建 v1 表，再 `ensureColumn()` 逐列补（幂等），最后写版本。
-- v1 → v2 不删任何数据；旧 fact/episode 继续可召回（`superseded_by IS NULL`）。
+- `SCHEMA_VERSION = 4`；`migrate()` 先建 v1 表，再 `ensureColumn()` 逐列补（幂等），最后写版本。
+- v1 → v2/v3/v4 不删任何数据；旧 fact/episode 继续可召回（`superseded_by IS NULL`）。
+- v4 新增 `memory_features`（倒排特征索引）与删除触发器；旧行由 `openDatabase()` 每次最多补 500 行。
 
 ---
 
@@ -291,7 +303,10 @@ const model    = config.extraction.model    || selection?.model
   summary 过期 > 1 天 → 一次 LLM 归并：输入该场景全部有效事实（≤ 30 条），
   输出 `{summary, body}`（body ≤ 1200 字 Markdown，分「要点/约定/坑」）。
 - heat：`heat = heat * 0.5^(Δdays/halfLife=14) + 1`（每次更新/被召回命中 +1）。
-- 场景数量上限 `maxScenes=20`：超出按 heat 淘汰最低的（保留 persona 引用的除外）。
+- 场景数量上限 `maxScenes=20`：每批 `runScenes` 末尾按**衰减热度**（`effectiveHeat`）分桶淘汰——当前项目桶与 global 桶各自计数；
+  超出者删除，但 persona 正文里出现过的场景名会「加回」保留（不占 maxScenes 名额）。
+  被删场景写入 meta `l2-evicted:<project>`，下一批若没有 `updated_at > evictedAt` 的新事实就跳过，不再重建（防淘汰/重建抖动）；
+  一旦有新事实则删除记录并正常恢复。只删 `l2_scenes` 行，L1 事实不动。
 - 导航：按 heat 取 top 8，渲染
   `- 场景名（heat, N 条）: 一句话摘要`，总长 ≤ 600 字。
 - 失败：LLM 失败时保留旧 body，只更新 fact_count/heat。
@@ -308,7 +323,11 @@ const model    = config.extraction.model    || selection?.model
   输出五分类之一：`conflict | boundary_change | new_rule | reinforcement | none`。
   只有前三类才真正重写；`reinforcement/none` → 记录 deferred，省一次大调用。
 - 长度上限 `maxChars=1200`；超限截断并保留小标题结构。
-- 注入：稳定段（global + project 各一段）。
+- 两个 scope（§22 复核时曾以「core 层已覆盖」为由否决，v0.5.0 按用户要求落地）：
+  - **project**：事实池 `(scope='global' OR project=?)`，批次键 `l3-batches:<project>`，写 `scope='project'`；
+  - **global**：事实池只取 `scope='global'`，独立批次键 `l3-batches:@global`，写 `scope='global'/project=NULL`；
+    `persona.global:false` 可关闭。两者各自 gate，互不清零；`ctx.project` 为空时项目画像直接返回 `no-project`（不写幽灵行）。
+- 注入：稳定段（项目画像 + 全局画像各一段，`renderStableBlock` 按 scope 标标题）。
 
 ---
 
@@ -318,7 +337,9 @@ const model    = config.extraction.model    || selection?.model
 - 打分（v3）：
   `text 1.0 + vector*0.1 + recency 0.20 + usage 0.15 + project 0.15 + priority/100*0.20 + kindWeight 0.20 + pinned(0.35)`；
   其中 vector 只对 `vec_model='hash-ngram-v1-384'` 的行计算；无 bm25 的候选（LIKE/纯向量）统一拿 0.15 中性 text 分。
-- 向量候选生成：词法候选不足 `maxItems*2` 时，扫描最多 `vector.scanLimit` 条向量，余弦 ≥0.15 的补进候选。
+- 向量候选生成（v4）：词法候选不足 `maxItems*2` 时，先用倒排特征索引 `memory_features` 按「查询侧最稀有的特征」提名候选，
+  再对候选算精确 cosine（≥0.15）；预筛没有提名时才按 `updated_at DESC` 有界兜底扫描最多 `vector.scanLimit` 行。
+  预筛命中时不再兜底：向量是词法的，真实重叠必然共享特征，兜底只会引入哈希碰撞噪声（未补建索引的旧行由下一次 open 补齐）。
 - 稳定段（每会话首轮一次）：
   `<memory_context type="stable">` persona + 场景导航 `</memory_context>`，≤ 900 字。
 - 动态段（每轮）：
@@ -372,16 +393,19 @@ const model    = config.extraction.model    || selection?.model
     scenes:
       enabled: true
       minFacts: 3
-      maxScenes: 20
+      maxScenes: 20       # 超出的按衰减热度淘汰（persona 引用的保留）
       halfLifeDays: 14
     persona:
       enabled: true
       triggerEveryN: 10
       maxChars: 1200
+      global: true        # 额外维护全局画像（只吃 global 事实）
     vector:
       enabled: true
       weight: 0.1         # 向量分权重（实测 0.2+ 掉点，默认 0.1）
-      scanLimit: 2000     # 词法候选不足时的向量扫描上限
+      scanLimit: 2000     # 预筛没有提名时的有界兜底扫描上限
+      prefilter: true     # 倒排特征索引预筛
+      featureLimit: 96    # 预筛查询侧特征上限（存储固定 96/条）
     debug: false
 ```
 
@@ -412,14 +436,15 @@ const model    = config.extraction.model    || selection?.model
 
 ## 15. 测试策略（零依赖，node:test）
 
-- `store`：v1→v3 迁移幂等；l0 append/游标/幂等；L1 ops（store/update/merge/skip）与 version/history；superseded 过滤；场景 upsert/heat；persona put/get；向量写入与 backfill。
+- `store`：v1→v4 迁移幂等；l0 append/游标/幂等；L1 ops（store/update/merge/skip）与 version/history；superseded 过滤；场景 upsert/heat；persona put/get；向量写入与 backfill；特征索引表/触发器/覆盖统计。
 - `vector`：确定性、L2 归一化、相似/不相似、2 字中文重叠、pack/unpack 宽度、FNV-1a 稳定性。
-- `recall`：FTS/LIKE 候选、priority/kind 打分、向量加分与扫描补候选、stable/dynamic 注入块预算。
+- `feature-index`：topFeatures 确定性与上限、index/replace、候选按稀有特征提名、scope/kinds/superseded 过滤、backfill、删除触发器、空特征哨兵、模型变更清表。
+- `recall`：FTS/LIKE 候选、priority/kind 打分、向量加分、倒排预筛救回 2 字拉丁查询、`prefilter:false` 兜底路径、stable/dynamic 注入块预算。
 - `extract`：prompt 构造；JSON 容错（think/围栏/裸 priority/坏条）；op 决策启发式；输出白名单。
 - `scheduler`：阈值 1→2→4→8→5；idle；失败重试；dispose 取消。用注入的 `now` + 假定时器，不 sleep。
 - `llm`：假 llm 服务（脚本化响应）+ 超时/错误分支。
 - `plugin`：模拟多轮 → L0 入库 → 触发抽取 → 注入 stable+dynamic；注入 source kind 仍为 `plugin:dsh-memory`。
-- 回归：93 个测试全绿（v0.3.0）。
+- 回归：149 个测试全绿（v0.5.0；v0.3.0 时 93）。
 
 ---
 
@@ -441,7 +466,7 @@ const model    = config.extraction.model    || selection?.model
 ## 17. 待定/开放问题
 
 1. **抽取模型**：默认跟随会话模型（贵但质量好）；是否默认降级到便宜模型？→ 先跟随，配置可改。
-2. **L3 的 scope**：先做 project，global persona 只在明确跨项目偏好时生成（默认也生成，但事实池是 global facts）。
+2. **L3 的 scope**：已落地——project persona 事实池 = 本项目 + global 事实；global persona 只吃 global 事实、独立批次键与 gate（`persona.global`，默认 true）。
 3. **episode 是否保留**：v2 之后 episode 仅作 v1 兼容与「原文近邻」兜底，默认仍捕获（`capture` 开关）。
 4. **场景命名一致性**：LLM 每次命名可能漂移 → 用「已有场景名清单 + 相似度匹配」约束，超阈值才新建。
 5. **多会话并发抽取**：串行队列下按 session 轮转，饥饿保护（每 session 最多 pending 1 个 job）。
@@ -473,8 +498,8 @@ const model    = config.extraction.model    || selection?.model
 ### 与设计的偏差（有意/顺延）
 
 - `memory_search` 的 `layer` 过滤、`memory_scene` 工具：顺延（当前 5 个工具，README 为准）。
-- `maxScenes` 淘汰策略：未实现（当前只限制单批场景更新数）。
-- L3 只写**项目画像**（事实池含 global 事实）；独立 global persona 顺延。
+- `maxScenes` 淘汰策略：v0.3.0 未实现；**v0.5.0 已实现**（§8/§23）。
+- L3 只写**项目画像**（事实池含 global 事实）；**v0.5.0 已补全局画像**（§9/§23）。
 - L2 场景需要同一场景 ≥ `minFacts(3)` 条事实才会生成；真机测试里每个场景 1 条，故 scenes 为空（符合预期）。
 - 向量是**词法**向量（feature hashing），不是语义 embedding；语义向量仍列为后续（§19）。
 - L0 只存 user/assistant 文本与工具名，不存 tool 输出。
@@ -497,12 +522,24 @@ const model    = config.extraction.model    || selection?.model
 - 存储：`Float32Array(384)` → BLOB ≈ 1.5 KB/行；`vec_model='hash-ngram-v1-384'` 标记代数，换代时自动回填。
 - 写入：`saveMemory` / L1 `insertFact` / `applyDecision(update)` 都重算；`openDatabase` 分批回填旧行（每次最多 500）。
 
-### 检索
+### 检索（v4：倒排预筛）
 
 - 先跑 FTS（trigram bm25）+ LIKE；对候选算余弦，作为第 8 个信号进入 `scoreRow`（权重 `vector.weight`，默认 0.1）。
-- 词法候选 < `maxItems*2` 时（典型：2 字中文查询、词序变化），扫描最多 `vector.scanLimit` 条向量补齐候选。
+- 词法候选 < `maxItems*2` 时（典型：2 字中文查询、词序变化），用 `memory_features` 倒排索引提名候选：
+  查询侧取最多 48 个特征，按 document frequency 从稀有到常见探测（df≥256 视为无区分度，跳过），
+  选最多 12 个稀有特征做一次 `GROUP BY memory_id`，再对候选做精确 cosine（≥0.15）。
+- 预筛没有提名时才走有界兜底：先只取 id（`ORDER BY updated_at DESC LIMIT vector.scanLimit`），再 `getByIds`，
+  避免把向量 BLOB 带入排序；旧的「无 ORDER BY LIMIT 2000」会永远只扫到最老的行。
 - 纯向量/LIKE-only 候选没有 bm25，统一拿 0.15 的中性基础分——**不能因为启用了向量就惩罚另一条召回腿**（评测时发现并修复的真实 bug）。
 - `strategy` 会带 `+vec` 便于诊断。
+
+### 为什么用倒排预筛而不是 LSH/ANN
+
+- 这个向量本身就是**词法** feature hashing：两段文本有真实字词重叠 ⇔ 共享未哈希特征（哈希碰撞除外）。
+  把未哈希特征存进倒排表，用稀有特征提名候选，对真实重叠是**无损**的；哈希碰撞只会让候选多一点，最终分仍是精确 cosine。
+- LSH/ANN 会引入近似误差，还要处理重建、桶参数、删除；在这种特征空间里收益为负。真正需要 ANN 的是**语义 embedding**（384 维稠密、无共享特征可枚举），
+  而 dsh 目前没有 embedding 服务（§19 结论）。
+- 代价：`memory_features` 约 +0.3–1 KB/行；旧库渐进补建（每次 open 最多 500 行）；df 探测最多 48 次索引查询，10k 库实测 p90 ≈ 11ms。
 
 ### 实测（2026-10-22，真实库副本 28 条 / 17 条查询，脚本 `notes/vector-eval.mjs`）
 
@@ -636,3 +673,68 @@ recall(db, '你好啊', {scope:'global'})  → 0 条候选（FTS trigram 命中 
 | M16 | 无文字轮 `userTextOf` 回退到上一轮问题 → 用旧问题检索（实测 2900 字符） | 本轮有人类消息就用它（哪怕是空串） |
 
 回归：112 → 117 项测试全绿（新增 recall 的弱 bm25/无项目键、core 的会话去重/附件轮、layers 的候选 kind 三组用例）。
+
+## 23. v0.5.0：向量召回规模化 + L2 淘汰 + L3 全局画像（2026-10-23，源码）
+
+同时清掉 README「限制与后续」里长期挂着的两条：暴力向量扫描、maxScenes 不淘汰 / 只有项目画像。
+
+### 23.1 向量召回：倒排特征预筛替代暴力扫描
+
+**问题**：旧代码在词法候选不足时执行
+
+```sql
+SELECT * FROM memory
+ WHERE superseded_by IS NULL AND vec IS NOT NULL AND vec_model = ?
+   AND (scope='global' OR project = ?)
+ LIMIT ?              -- vector.scanLimit，默认 2000，且没有 ORDER BY
+```
+
+SQLite 的 `LIMIT` 在这里等于「按 rowid 取最老的 2000 行」：大库时新记忆永远进不了向量候选。
+基准（12,001 行、query `db`、scanLimit=2000）：旧代码 **found=false / 18.9ms**，目标行（rowid 12001）根本不在扫描范围。
+
+**实现**（schema v4）：
+
+- 新表 `memory_features(memory_id, feature, weight, PRIMARY KEY(memory_id, feature))` + `feature` 索引 + `AFTER DELETE` 清理触发器。
+  `feature = fnv1a(未哈希特征)`；`weight = 1+ln(tf)`；每条记忆固定存 96 个最强特征（`FEATURE_INDEX_MODEL` 的一部分；`vector.featureLimit` 只约束查询侧预筛）。
+- 写入路径都在同一事务里维护：`saveMemory`（含重复 hash 的补索引）、L1 `insertFact`、`applyDecision(update/merge)`；
+  `openDatabase()` 每次最多补 500 行（`feature-index-model` 变化时整表清空重建）。
+- `candidateMemoryIds()`：查询侧取最多 48 个特征逐个求 document frequency（`df >= 256` 视为无区分度丢弃），
+  选最稀有的 12 个跑一次 `GROUP BY memory_id`；SQL 强制 `INDEXED BY memory_features_feature_idx`
+  （否则 SQLite 从 memory 侧驱动，10k 库同查询 106ms vs 5ms）。
+- `recall()`：预筛 → 精确 cosine（≥0.15）→ 仅当预筛「零提名」时才做有界兜底
+  （先 `SELECT id ORDER BY updated_at DESC LIMIT scanLimit`，再 `getByIds`；避免向量 BLOB 进入排序）。
+  预筛命中后不再兜底：词法向量的真实重叠必然共享特征，兜底只会带进哈希碰撞噪声；未补建的旧行由下一次 open 补齐。
+- schema v4 同时补了 `memory_updated_idx(updated_at DESC)` 与 `memory_scope_updated_idx(scope, updated_at DESC)`，
+  让兜底扫描按索引取最近 N 行，不再对整表做 ORDER BY 排序。
+- `stats()` 新增 `featureIndexed`；`memory_stats` 输出 `feat=N/total`。
+
+**基准**（12,001 行、query `db`）：新代码 **found=true / 12.0ms**；10k 库特征预筛 p50≈0ms、p90≈11ms（398k 特征行）。
+`memory_features` 约 +0.3–1 KB/行；写入成本 1.69 vs 1.66 ms/行（基本持平）。
+
+### 23.2 L2 maxScenes 淘汰（含防抖）
+
+- `profile.pruneScenes(db, { maxScenes, project, now, halfLifeDays, protectReferenced })`：
+  当前项目桶与 global 桶**分别**按 `effectiveHeat` 降序保留前 N；persona 正文引用到的场景名（≥2 字）即使越界也加回保留；
+  删除只动 `l2_scenes`，L1 事实不动；返回 `{ deleted, kept, protected, removed }`。
+- `runScenes` 每批结束都执行淘汰（即使本批 0 更新），返回 `{ updated, skipped, pruned }`。
+- **防淘汰/重建抖动**：被删场景名 + 时间写入 meta `l2-evicted:<projectKey>`（≤200 条、≤90 天、空则删键）。
+  下一批若该场景没有 `updated_at > evictedAt` 的新事实，直接 skipped、不调 LLM；有新事实才恢复重建并清条目。
+  场景行被其他写入方重建时视为淘汰作废，不误跳过。
+
+### 23.3 L3 全局画像
+
+- `runPersona` 增加 `ctx.scope`：project（默认，行为不变）与 global。
+- global 画像：事实池只取 `scope='global' AND superseded_by IS NULL`；批次键 `l3-batches:@global`；
+  `getPersona/putPersona(scope='global', project=NULL)`；JEV-lite 门控同逻辑；日志区分 `(project|global vN)`。
+- 注入侧无需改动：`listPersonas` 早已按 project→global 返回，`renderStableBlock` 按 scope 渲染「项目画像/全局画像」。
+- `ctx.project` 为空时 project 模式直接返回 `no-project`，不再写读不回来的幽灵画像。
+- `pipeline` 先项目后全局，各自 try/catch；`persona.global:false` 可关闭。
+- 与 §22「否决新增全局人格」的关系：§22 否决的是**用全局画像替代 core 长期约定层**（规则类内容 core 更便宜、每轮必到）；
+  本次实现的是**跨项目背景/决策摘要**，只吃 global 事实、独立 gate，与 core 互补，默认开启但可关。
+
+### 23.4 回归
+
+- DSH 插件测试：**117 → 149 项全绿**（新增 feature-index 13、recall 3、store 3、profile 4、consolidate 8、wiring 1）。
+- 迁移验证（真实库副本 139 条）：v3→v4 open 64ms，`schema=4`、`feat=139/139`、11,921 特征行；
+  5 条真实查询召回 0.85–6ms，命中包含 pinned #104。
+- 命令：`node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)`。

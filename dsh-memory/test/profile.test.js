@@ -1,12 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { migrate } from '../src/store.js'
+import { migrate, saveMemory } from '../src/store.js'
 import {
   effectiveHeat,
   getPersona,
   listPersonas,
   listScenes,
+  pruneScenes,
   putPersona,
   sceneNavigation,
   touchScenes,
@@ -87,4 +88,73 @@ test('persona insert and rewrite bump version; listPersonas puts project first',
   assert.equal(rows[1].scope, 'global')
   assert.equal(getPersona(store, { scope: 'project', project: 'menm' }).version, 2)
   assert.equal(getPersona(store, { scope: 'global' }).body, '偏好中文')
+})
+
+test('pruneScenes keeps the top maxScenes by decayed heat, not raw heat', () => {
+  const store = db()
+  const now = 100 * 86_400_000
+  upsertScene(store, { scope: 'project', project: 'menm', name: '热场景', heatDelta: 9, now })
+  // Raw heat 4 beats 温场景's 2, but 60 days of decay drops it to ~0.2.
+  upsertScene(store, { scope: 'project', project: 'menm', name: '冷场景', heatDelta: 3, now: now - 60 * 86_400_000 })
+  upsertScene(store, { scope: 'project', project: 'menm', name: '温场景', heatDelta: 1, now })
+  const result = pruneScenes(store, { maxScenes: 2, project: 'menm', now })
+  assert.deepEqual(result, { deleted: 1, kept: 2, protected: [], removed: ['冷场景'] })
+  const names = listScenes(store, { project: 'menm', now }).map((row) => row.name)
+  assert.deepEqual(names.sort(), ['温场景', '热场景'].sort())
+})
+
+test('pruneScenes keeps a cold scene the project or global persona still references', () => {
+  const store = db()
+  const now = 100 * 86_400_000
+  upsertScene(store, { scope: 'project', project: 'menm', name: '热场景', heatDelta: 9, now })
+  upsertScene(store, { scope: 'project', project: 'menm', name: '温场景', heatDelta: 1, now })
+  upsertScene(store, { scope: 'project', project: 'menm', name: '冷场景', now: now - 60 * 86_400_000 })
+  upsertScene(store, { scope: 'global', project: null, name: '全局热', heatDelta: 4, now })
+  upsertScene(store, { scope: 'global', project: null, name: '全局中', heatDelta: 2, now })
+  upsertScene(store, { scope: 'global', project: null, name: '全局冷', now: now - 60 * 86_400_000 })
+  putPersona(store, { scope: 'project', project: 'menm', body: '## 项目约定\n- 详见「冷场景」', now })
+  putPersona(store, { scope: 'global', body: '## 环境与工具\n- 参考全局冷', now })
+  const result = pruneScenes(store, { maxScenes: 2, project: 'menm', now })
+  assert.equal(result.deleted, 0)
+  assert.equal(result.kept, 6)
+  assert.deepEqual(result.protected.sort(), ['全局冷', '冷场景'].sort())
+  assert.equal(listScenes(store, { project: 'menm', now }).length, 6)
+})
+
+test('pruneScenes caps project and global buckets independently and never deletes L1 facts', () => {
+  const store = db()
+  const now = 100 * 86_400_000
+  for (const [name, delta] of [['项目一', 9], ['项目二', 5], ['项目三', 0]]) {
+    upsertScene(store, { scope: 'project', project: 'menm', name, heatDelta: delta, now })
+  }
+  for (const [name, delta] of [['全局一', 9], ['全局二', 5], ['全局三', 0]]) {
+    upsertScene(store, { scope: 'global', project: null, name, heatDelta: delta, now })
+  }
+  upsertScene(store, { scope: 'project', project: 'other', name: '别人一', now })
+  upsertScene(store, { scope: 'project', project: 'other', name: '别人二', now })
+  saveMemory(store, { text: '场景修剪不应删除 L1 事实', scope: 'project', project: 'menm' }, now)
+  const result = pruneScenes(store, { maxScenes: 2, project: 'menm', now })
+  assert.equal(result.deleted, 2) // one per bucket, never the other project's
+  assert.equal(result.kept, 4)
+  assert.deepEqual(result.removed.sort(), ['全局三', '项目三'].sort())
+  const menm = listScenes(store, { project: 'menm', now }).map((row) => row.name)
+  assert.ok(menm.includes('项目一'))
+  assert.ok(menm.includes('全局一'))
+  assert.ok(!menm.includes('项目三'))
+  assert.ok(!menm.includes('全局三'))
+  const other = listScenes(store, { project: 'other', now }).filter((row) => row.scope === 'project')
+  assert.equal(other.length, 2)
+  assert.equal(store.prepare('SELECT COUNT(*) AS n FROM memory').get().n, 1)
+})
+
+test('pruneScenes reports the removed scene names once, even when both buckets share a name', () => {
+  const store = db()
+  const now = 100 * 86_400_000
+  upsertScene(store, { scope: 'project', project: 'menm', name: '热场景', heatDelta: 9, now })
+  upsertScene(store, { scope: 'project', project: 'menm', name: '同名场景', now })
+  upsertScene(store, { scope: 'global', project: null, name: '全局热', heatDelta: 9, now })
+  upsertScene(store, { scope: 'global', project: null, name: '同名场景', now })
+  const result = pruneScenes(store, { maxScenes: 1, project: 'menm', now })
+  assert.equal(result.deleted, 2)
+  assert.deepEqual(result.removed, ['同名场景'])
 })

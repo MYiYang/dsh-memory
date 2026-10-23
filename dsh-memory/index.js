@@ -106,11 +106,20 @@ function resolveConfig(raw) {
       enabled: persona.enabled !== false,
       triggerEveryN: number(persona.triggerEveryN, 10, 1, 100),
       maxChars: number(persona.maxChars, 1200, 200, 8000),
+      // L3 also maintains a cross-project profile built from global facts.
+      // It has its own batch counter and gate, so it never starves the project one.
+      global: persona.global !== false,
     },
     vector: {
       enabled: vector.enabled !== false,
       weight: number(vector.weight, 0.1, 0, 1),
       scanLimit: number(vector.scanLimit, 2000, 0, 5000),
+      // Inverted n-gram feature index used as a lexical prefilter before the
+      // exact cosine rerank; false forces the bounded brute-force scan only.
+      prefilter: vector.prefilter !== false,
+      // Query-side feature cap for the pre-filter probe (stored features are
+      // fixed at 96 by feature-index.js; probing is capped again at 48).
+      featureLimit: number(vector.featureLimit, 96, 16, 96),
     },
     // Bundled skills shipped inside this package (`./skills`).
     skills: {
@@ -672,7 +681,7 @@ export function apply(ctx, rawConfig) {
             text:
               `memories=${s.total} facts=${s.facts} episodes=${s.episodes} superseded=${s.superseded} ` +
               `kinds={${kinds}} l0=${s.l0Pending}/${s.l0Total} scenes=${s.scenes} personas=${s.personas} ` +
-              `vec=${s.vectorized}/${s.total} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath}`,
+              `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath}`,
           }
         },
       }),

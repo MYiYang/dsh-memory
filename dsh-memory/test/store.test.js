@@ -1,6 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { openDatabase, saveMemory, searchFts, searchLike, forgetMemories, stats, listRecent, textHash } from '../src/store.js'
+import {
+  SCHEMA_VERSION,
+  openDatabase,
+  saveMemory,
+  searchFts,
+  searchLike,
+  forgetMemories,
+  getMeta,
+  migrate,
+  stats,
+  listRecent,
+  textHash,
+} from '../src/store.js'
 
 function freshDb() {
   return openDatabase(':memory:')
@@ -97,4 +109,48 @@ test('stats counts kinds and projects; listRecent orders by updated_at', () => {
 
 test('textHash normalizes whitespace and case', () => {
   assert.equal(textHash('Hello   World'), textHash(' hello world '))
+})
+
+test('schema v4 adds the feature index table and stays idempotent', () => {
+  const db = freshDb()
+  assert.equal(SCHEMA_VERSION, 4)
+  assert.equal(getMeta(db, 'schema_version'), '4')
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
+  assert.ok(tables.includes('memory_features'), 'missing memory_features table')
+  const objects = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')").all().map((row) => row.name)
+  assert.ok(objects.includes('memory_features_feature_idx'), 'missing feature index')
+  assert.ok(objects.includes('memory_features_ad'), 'missing delete trigger')
+
+  saveMemory(db, { text: '部署流程用 pnpm' })
+  const before = Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features').get().n)
+  assert.ok(before > 0, 'a save writes feature rows')
+
+  // A second migration pass must not clear, duplicate or downgrade anything.
+  migrate(db)
+  assert.equal(getMeta(db, 'schema_version'), '4')
+  assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features').get().n), before)
+  db.close()
+})
+
+test('stats reports how much of the corpus the feature index covers', () => {
+  const db = freshDb()
+  saveMemory(db, { text: '部署流程用 pnpm' })
+  saveMemory(db, { text: '数据库端口 3306' })
+  const s = stats(db)
+  assert.equal(s.total, 2)
+  assert.equal(s.featureIndexed, 2)
+  db.close()
+})
+
+test('re-saving a deduplicated row repairs a missing feature index', () => {
+  const db = freshDb()
+  const first = saveMemory(db, { text: '部署流程用 pnpm' })
+  // Simulate a row created before the v4 index existed.
+  db.prepare('DELETE FROM memory_features WHERE memory_id = ?').run(first.id)
+  const again = saveMemory(db, { text: '部署流程用 pnpm' })
+  assert.equal(again.inserted, false)
+  assert.equal(again.id, first.id)
+  const indexed = Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features WHERE memory_id = ?').get(first.id).n)
+  assert.ok(indexed > 0, 'the dedupe path must not leave the row unindexed')
+  db.close()
 })
