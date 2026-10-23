@@ -27,6 +27,7 @@ import { listPersonas, sceneNavigation } from './src/profile.js'
 import { createScheduler } from './src/scheduler.js'
 import { createPipeline } from './src/pipeline.js'
 import { createLlmClient } from './src/llm.js'
+import { runPersona } from './src/consolidate.js'
 import { registerBundledSkills } from './src/skills.js'
 
 export const name = 'memory'
@@ -110,6 +111,10 @@ function resolveConfig(raw) {
       // longer than 1.4× the target is rewritten on the spot ("compact").
       targetChars: number(persona.targetChars, 700, 120, 8000),
       globalTargetChars: number(persona.globalTargetChars, 240, 120, 8000),
+      // The persona rewrite is the longest JSON answer this plugin asks for;
+      // reasoning tokens eat the budget first, so it gets its own (bigger) caps.
+      personaMaxTokens: number(persona.personaMaxTokens, 3000, 400, 16000),
+      personaTimeoutMs: number(persona.personaTimeoutMs, 120000, 5000, 600000),
       // L3 also maintains a cross-project profile built from global facts.
       // It has its own batch counter and gate, so it never starves the project one.
       global: persona.global !== false,
@@ -285,10 +290,13 @@ export function apply(ctx, rawConfig) {
   let pipeline = null
   /** @type {ReturnType<typeof createScheduler>|null} */
   let scheduler = null
+  /** @type {ReturnType<typeof createLlmClient>|null} */
+  let llmClient = null
   if (dbReady && config.layers.l1 && config.extraction.enabled) {
     try {
       const llm = createLlmClient(ctx, config.extraction, log)
       if (llm.available) {
+        llmClient = llm
         pipeline = createPipeline({ db: getDb(), llm, config, log })
         scheduler = createScheduler({
           db: getDb(),
@@ -737,6 +745,66 @@ export function apply(ctx, rawConfig) {
           )
           return {
             text: `extract reason=${reason} sessions=${targets.length} pending=${after}/${before} summary=${summary}`,
+          }
+        },
+      }),
+    )
+
+    disposers.push(
+      ctx.tools.register({
+        name: 'memory_compact',
+        description:
+          'Rewrite the project and/or global persona right now, bypassing the batch threshold and the JEV gate. Use it to shrink a bloated persona (it competes for the stable block budget with the scene navigation) or to refresh it on demand. Costs one model call per scope.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            scope: {
+              type: 'string',
+              enum: ['project', 'global', 'both'],
+              description: 'Which persona to rewrite. Default both.',
+            },
+          },
+        },
+        output: textOutput(),
+        execute: async (args, exec) => {
+          if (llmClient === null || llmClient.available !== true) {
+            return { text: 'persona rewrite disabled (llm unavailable or extraction off)' }
+          }
+          const session = exec?.agent?.session
+          const project = projectOf(session)
+          const wanted = args?.scope === 'project' || args?.scope === 'global' ? args.scope : 'both'
+          const before = listPersonas(getDb(), { project })
+          /** @type {string[]} */
+          const parts = []
+          if (wanted !== 'global') {
+            if (project === null) {
+              parts.push('project=no-active-project')
+            } else {
+              const result = await runPersona(
+                getDb(),
+                llmClient,
+                { ...config.persona, force: true },
+                { project, scope: 'project', log, sessionId: session?.id },
+              )
+              parts.push(`project=${JSON.stringify(result)}`)
+            }
+          }
+          if (wanted !== 'project') {
+            const result = await runPersona(
+              getDb(),
+              llmClient,
+              { ...config.persona, force: true },
+              { scope: 'global', log, sessionId: session?.id },
+            )
+            parts.push(`global=${JSON.stringify(result)}`)
+          }
+          const after = listPersonas(getDb(), { project })
+          const sizes = after
+            .map((row) => `${row.scope}/${row.project ?? '-'} v${row.version} ${String(row.body ?? '').length}`)
+            .join(', ')
+          return {
+            text: `compact ${parts.join(' ')} | before=${before.map((row) => String(row.body ?? '').length).join('/')} after=${sizes}`,
           }
         },
       }),

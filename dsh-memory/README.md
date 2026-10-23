@@ -93,6 +93,8 @@
       maxChars: 1200            # 硬上限（超出直接截断）
       targetChars: 700          # 生成目标长度；超过 1.4 倍即视为膨胀，当场重写压缩
       globalTargetChars: 240    # 全局画像的生成目标（它与长期约定重复，宜更短）
+      personaMaxTokens: 3000    # 画像重写的输出预算（reasoning 先吃预算，别调太小）
+      personaTimeoutMs: 120000  # 画像重写超时（默认 2 分钟）
       global: true              # 额外维护跨项目全局画像（只吃 global 事实）
     vector:
       enabled: true             # 关掉就只用 FTS/LIKE
@@ -118,6 +120,7 @@
 | `memory_forget` | `ids?` / `query?` | 删除错误/过期记忆 |
 | `memory_stats` | — | 分层计数、L0 待抽取数、场景/画像数、token 花费、库大小 |
 | `memory_extract` | `all?`, `sessionId?` | **手动**补跑抽取（调试/恢复）；`all:true` 处理所有还有 L0 待抽取的会话（最多 20 个，最老积压优先） |
+| `memory_compact` | `scope?`（`project`/`global`/`both`） | **手动**重写画像，跳过批次阈值与 JEV 门控；用于把膨胀的画像压回去，或按需刷新 |
 
 ## 工作方式
 

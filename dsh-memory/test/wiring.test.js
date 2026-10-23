@@ -126,6 +126,34 @@ test('memory_extract tool forces a run and reports status', async () => {
   assert.match(result.text, /extract reason=ok/)
 })
 
+test('memory_compact rewrites the persona on demand, bypassing the gate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-wiring6-'))
+  const dbPath = join(dir, 'memory.db')
+  const { ctx, tools, calls } = fakeCtx([], { persona: '## 用户偏好\n- 中文（刷新手）' })
+  apply(ctx, {
+    dbPath,
+    capture: false,
+    extraction: { everyN: 100, idleMs: 60_000, provider: 'fake', model: 'fake' },
+    scenes: { enabled: false },
+    // The batch threshold is far away, so only `force` can explain a rewrite.
+    persona: { enabled: true, triggerEveryN: 100, targetChars: 120, maxChars: 400 },
+  })
+  const db = openDatabase(dbPath)
+  saveMemory(db, { kind: 'persona', text: '用户偏好中文回答', priority: 90, project: 'demo' })
+  // Oversized on purpose: the compact path must not need the JEV gate either.
+  const { putPersona } = await import('../src/profile.js')
+  putPersona(db, { scope: 'project', project: 'demo', body: '长'.repeat(500), now: 1 })
+
+  const session = { id: 'session-compact', header: { cwd: 'F:\\work\\demo' }, events: [] }
+  const result = await tools.get('memory_compact').execute({ scope: 'project' }, { agent: { session } })
+  assert.match(result.text, /project=\{"rewritten":true/)
+  assert.equal(calls.length, 1)
+  assert.match(String(calls[0].system), /画像整理器/)
+  const stored = db.prepare("SELECT * FROM l3_persona WHERE scope = 'project' AND project = 'demo'").get()
+  assert.equal(stored.version, 2)
+  assert.match(stored.body, /中文（刷新手）/)
+})
+
 test('memory_extract all drains the backlog of inactive sessions after a restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-wiring5-'))
   const dbPath = join(dir, 'memory.db')

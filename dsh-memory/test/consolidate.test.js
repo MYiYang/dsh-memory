@@ -291,3 +291,32 @@ test('the persona prompt asks for the target length and forbids duplication', ()
   // Without a target the old contract still holds.
   assert.match(buildPersonaPrompt([], {}, 800).user, /不超过 800 字/)
 })
+
+test('force rewrites the persona regardless of the batch threshold', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  putPersona(db, { scope: 'project', project: 'menm', body: '## 用户偏好\n- 中文', now: 1 })
+  const llm = fakeLlm([JSON.stringify({ body: '## 用户偏好\n- 中文（强制）' })])
+  const result = await runPersona(db, llm, { triggerEveryN: 50, force: true }, { project: 'menm', now: 2 })
+  assert.equal(result.reason, 'written')
+  assert.equal(result.version, 2)
+  assert.equal(llm.calls.length, 1) // no gate call
+  assert.equal(getMeta(db, 'l3-last-reason'), 'menm:written')
+  assert.match(getMeta(db, 'l3-last-detail'), /"forced":true/)
+})
+
+test('an unusable persona answer is recorded instead of failing silently', async () => {
+  const db = setup()
+  fact(db, '用户偏好中文回答', { kind: 'persona', priority: 90 })
+  putPersona(db, { scope: 'project', project: 'menm', body: '## 用户偏好\n- 中文', now: 1 })
+  const llm = fakeLlm(['这段不是 JSON'])
+  const result = await runPersona(db, llm, { force: true }, { project: 'menm', now: 2 })
+  assert.equal(result.reason, 'empty')
+  assert.equal(getMeta(db, 'l3-last-reason'), 'menm:empty')
+  const detail = JSON.parse(getMeta(db, 'l3-last-detail'))
+  assert.equal(detail.ok, true)
+  assert.equal(detail.chars, '这段不是 JSON'.length)
+  // The old persona must survive a failed rewrite untouched.
+  assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).body, '## 用户偏好\n- 中文')
+  assert.equal(getPersona(db, { scope: 'project', project: 'menm' }).version, 1)
+})

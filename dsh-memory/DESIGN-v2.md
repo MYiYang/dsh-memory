@@ -849,3 +849,34 @@ v2（891 字）按现存事实重写为「项目定位 / 架构 / 操作约定 /
 
 **回归**：154 → **156** 项全绿（新增「膨胀画像跳过门控直接压」「prompt 携带目标长度与压缩要求」两条）。
 配置默认值同步进 README 的配置示例。
+
+### 23.9 自动压缩首轮实测未生效：静默失败与手动压缩工具（2026-10-23 11:22–11:40）
+
+**自检过程**：确认进程（11:21:55 启动）晚于 `consolidate.js`（11:17:34）与 `index.js`（11:17:40），即 0.5.2 已加载；
+把 menm 项目画像人工写到 **1448 字**（越过 `1.4 × 700 = 980` 的膨胀线），再用 `memory_extract {all:true}` 触发一批真实
+pipeline（L1 `reason=ok`，store 9；L2 三个场景 11:23:05 正常改写）。
+
+**结果**：画像**没有被压**——仍是 v5/1448，但 `l3-batches:menm` 2→3、`@global` 1→2，说明 `runPersona` 确实跑过。
+也就是说压缩分支要么没进、要么进了却静默失败：
+
+- 同类调用（L2 场景，`maxTokens=700`）成功，而画像这条 `maxTokens=1200`、prompt 最长，最可能被 reasoning 吃掉预算或超时；
+- 更糟的是**失败无痕**：`askJson` 只返回 `{value:null}`，`runPersona` 直接 `return 'empty'`，meta 里什么都不留，
+  事后只能靠猜。这正是这次排查卡住的原因。
+
+**0.5.3 改法**（观测优先，其次才是调参）：
+
+1. `askJson()` 返回完整诊断：`ok / error / finish / chars / head`（前 240 字）。
+2. `runPersona` 每条返回路径都写 meta：`l3-last-at`、`l3-last-reason`（形如 `menm:written` / `@global:deferred` /
+   `menm:empty` / `menm:gate:none`）、`l3-last-detail`（JSON：ok/error/chars/head/batches）；膨胀分支额外写
+   `l3-last-compact`。失败时 `log('warn', ...)` 带原因，不再静默。
+3. 画像专用预算：`persona.personaMaxTokens`（默认 **3000**）、`persona.personaTimeoutMs`（默认 **120 秒**），
+   与 L1 的 2400 同理——推理模型的 reasoning 先吃输出预算，最长的 JSON 最容易被截断。
+4. 新工具 **`memory_compact`**（`scope: project|global|both`）：跳过批次阈值与 JEV 门控，立刻重写画像，
+   并回传前后长度。它既是「按需压缩」的开关，也是验证压缩链路最短的路径（不必等 10 个批次）。
+5. `runPersona` 支持 `force`（上面那个工具用的就是它），强制重写时不问门控。
+
+**回归**：156 → **159** 项全绿（新增「force 无视阈值直接重写」「画像答案不可用时留下诊断而非静默」「memory_compact
+工具按需压缩」三条；`plugin.test.js` 的工具清单同步加上 `memory_compact`）。
+
+**自检残留已清**：测试用的 1448 字画像已改回 `v6/650`；备份在 `.tmp/memory-backup-20261023-112230/`。
+加载 0.5.3 后，用 `memory_compact` 直接重跑一次自检即可定论。

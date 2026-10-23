@@ -58,7 +58,7 @@ test('plugin declares its services and loads with a temp database', () => {
   assert.equal(name, 'memory')
   assert.ok(handlers.has('session/event'))
   assert.ok(handlers.has('agent/pre-step'))
-  assert.deepEqual([...tools.keys()].sort(), ['memory_extract', 'memory_forget', 'memory_save', 'memory_search', 'memory_stats'])
+  assert.deepEqual([...tools.keys()].sort(), ['memory_compact', 'memory_extract', 'memory_forget', 'memory_save', 'memory_search', 'memory_stats'])
   assert.ok(logs.some(([level, message]) => level === 'info' && message.includes('memory db ready')))
 })
 

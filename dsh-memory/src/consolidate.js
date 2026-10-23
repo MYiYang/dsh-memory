@@ -144,7 +144,8 @@ export function buildGatePrompt(persona, facts) {
 }
 
 /**
- * One model round-trip; returns parsed JSON or null.
+ * One model round-trip; returns the parsed JSON plus enough diagnostics to tell
+ * "the model said nothing usable" from "the model said something else".
  * @param {any} llm
  * @param {{ system: string, user: string }} prompt
  * @param {{ maxTokens?: number, timeoutMs?: number, signal?: AbortSignal, sessionId?: string }} [options]
@@ -158,8 +159,17 @@ async function askJson(llm, prompt, options = {}) {
     signal: options.signal,
     sessionId: options.sessionId,
   })
-  if (!response?.ok) return { value: null, usage: response?.usage ?? null }
-  return { value: parseJsonLoose(response.text), usage: response.usage ?? null }
+  const ok = response?.ok === true
+  const text = String(response?.text ?? '')
+  return {
+    value: ok ? parseJsonLoose(text) : null,
+    usage: response?.usage ?? null,
+    ok,
+    error: response?.error ?? null,
+    reason: response?.reason ?? null,
+    chars: text.length,
+    head: text.slice(0, 240),
+  }
 }
 
 /** Record consolidation token usage against the shared counter. */
@@ -365,11 +375,22 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
   const now = ctx.now ?? Date.now()
   const scope = ctx.scope === 'global' ? 'global' : 'project'
   const project = scope === 'project' ? (ctx.project ?? null) : null
+  const label = scope === 'global' ? '@global' : project
+  /** Record the outcome: without this a silent no-op is undiagnosable. */
+  const finish = (reason, extra = {}) => {
+    setMeta(db, 'l3-last-at', String(now))
+    setMeta(db, 'l3-last-reason', `${label}:${reason}`)
+    if (Object.keys(extra).length > 0) setMeta(db, 'l3-last-detail', JSON.stringify({ at: now, scope, project, reason, ...extra }))
+    return { rewritten: false, reason }
+  }
+  // `force` is the manual path (memory_compact): rewrite now, skip both the
+  // batch threshold and the JEV gate.
+  const force = config.force === true
   // A project persona without a project key can never be read back: every read
   // path filters on `project = ?` (listPersonas included), so the row would sit
   // in the database as a ghost while never being injected. Bail out before the
   // batch counter moves, so a cwd-less session cannot push it either.
-  if (scope === 'project' && project === null) return { rewritten: false, reason: 'no-project' }
+  if (scope === 'project' && project === null) return finish('no-project')
   const triggerEveryN = Math.max(1, config.triggerEveryN ?? 10)
   const maxChars = Math.max(200, config.maxChars ?? 1200)
   // The generator aims at `targetChars`; `maxChars` stays the hard cap. Without
@@ -381,6 +402,10 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
       scope === 'global' ? config.globalTargetChars ?? 240 : config.targetChars ?? 700,
     ),
   )
+  // Reasoning models spend output budget before the JSON answer; a persona body
+  // is the longest thing this plugin asks for, so it needs the most headroom.
+  const personaTokens = Math.max(400, config.personaMaxTokens ?? 3_000)
+  const personaTimeoutMs = Math.max(5_000, config.personaTimeoutMs ?? 120_000)
   // Keep `l3-batches:<project>` unchanged for projects (existing installs have
   // it); the global persona gets its own key so the two never reset each other.
   const batchKey = scope === 'global' ? 'l3-batches:@global' : `l3-batches:${project}`
@@ -406,19 +431,20 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
               LIMIT ?`,
           )
           .all(project, CONSOLIDATE_LIMITS.personaFacts)
-  if (facts.length === 0) return { rewritten: false, reason: 'no-facts' }
+  if (facts.length === 0) return finish('no-facts')
 
   const current = getPersona(db, { scope, project })
-  if (current !== undefined) {
+  if (current !== undefined && !force) {
     // An oversized persona is rewritten immediately: it does not fit the stable
     // budget, so whether the new facts are "worth" a rewrite no longer matters.
     const bloatLimit = Math.floor(targetChars * 1.4)
     if (current.body.length > bloatLimit) {
+      setMeta(db, 'l3-last-compact', JSON.stringify({ at: now, scope, project, chars: current.body.length, limit: bloatLimit }))
       log('debug', `l3 compact (${scope} ${current.body.length} > ${bloatLimit} chars)`)
     } else {
-      if (batches < triggerEveryN) return { rewritten: false, reason: 'deferred' }
+      if (batches < triggerEveryN) return finish('deferred', { batches, triggerEveryN, chars: current.body.length })
       const gate = await askJson(llm, buildGatePrompt(current, facts), {
-        maxTokens: 120,
+        maxTokens: 400,
         timeoutMs: config.timeoutMs,
         sessionId: ctx.sessionId,
         signal: ctx.signal,
@@ -427,21 +453,25 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
       const decision = typeof gate.value?.decision === 'string' ? gate.value.decision : 'none'
       if (!['conflict', 'boundary_change', 'new_rule'].includes(decision)) {
         log('debug', `l3 gate deferred (${decision})`)
-        return { rewritten: false, reason: `gate:${decision}` }
+        return finish(`gate:${decision}`, { ok: gate.ok, error: gate.error, chars: gate.chars, head: gate.head })
       }
     }
   }
 
   const prompt = buildPersonaPrompt(facts, current ?? {}, { maxChars, targetChars }, scope)
-  const { value, usage } = await askJson(llm, prompt, {
-    maxTokens: 1_200,
-    timeoutMs: config.timeoutMs,
+  const answer = await askJson(llm, prompt, {
+    maxTokens: personaTokens,
+    timeoutMs: personaTimeoutMs,
     sessionId: ctx.sessionId,
     signal: ctx.signal,
   })
-  track(db, usage)
-  const body = value && typeof value.body === 'string' ? value.body.trim() : ''
-  if (body === '') return { rewritten: false, reason: 'empty' }
+  track(db, answer.usage)
+  const body = answer.value && typeof answer.value.body === 'string' ? answer.value.body.trim() : ''
+  if (body === '') {
+    const detail = { ok: answer.ok, error: answer.error, finish: answer.reason, chars: answer.chars, head: answer.head }
+    log('warn', `l3 persona rewrite produced nothing usable (${scope}): ok=${answer.ok} error=${answer.error ?? '-'} chars=${answer.chars}`)
+    return finish('empty', detail)
+  }
   const result = putPersona(db, {
     scope,
     project,
@@ -449,6 +479,9 @@ export async function runPersona(db, llm, config = {}, ctx = {}) {
     now,
   })
   setMeta(db, batchKey, 0)
-  log('info', `l3 persona rewritten (${scope} v${result.version})`)
+  setMeta(db, 'l3-last-at', String(now))
+  setMeta(db, 'l3-last-reason', `${label}:written`)
+  setMeta(db, 'l3-last-detail', JSON.stringify({ at: now, scope, project, reason: 'written', chars: body.length, forced: force }))
+  log('info', `l3 persona rewritten (${scope} v${result.version}${force ? ', forced' : ''})`)
   return { rewritten: true, version: result.version, reason: 'written' }
 }
