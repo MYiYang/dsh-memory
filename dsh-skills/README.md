@@ -61,7 +61,7 @@ Copy-Item -Recurse -Force .\dsh-skills\* $dst
   name: '@deepseek-ai/dsh-skill-filesystem'
   config:
     customSkillDirs:
-      - 'F:/ssdwork/vscode/work/menm/dsh-skills'
+      - 'F:/path/to/dsh-skills'
 ```
 
 ## 写一个新技能

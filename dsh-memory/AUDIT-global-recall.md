@@ -1,6 +1,6 @@
 # 审计：为什么「标成全局」的记忆，跨会话 / 跨项目还是会忘
 
-> 对象：`dsh-memory` v0.4.2 · 真实记忆库 `C:\Users\17915\.dsh\memory\memory.db`（130 条）
+> 对象：`dsh-memory` v0.4.2 · 真实记忆库 `C:\Users\<you>\.dsh\memory\memory.db`（130 条）
 > 日期：2026-10-23 · 方法：真实库快照 + 代码路径阅读 + 可复现实验（脚本见 §7）
 
 ## 0. 结论先行
@@ -204,7 +204,7 @@ project row updated with project=null: {"id":3,"scope":"global","project":null} 
 
 ```powershell
 # 快照（真实库 WAL 未 checkpoint，直接 copy 会拿到旧内容）
-python -c "import sqlite3;src=sqlite3.connect(r'C:\Users\17915\.dsh\memory\memory.db');dst=sqlite3.connect(r'.tmp/live-curated.db');src.backup(dst)"
+python -c "import sqlite3;src=sqlite3.connect(r'C:\Users\<you>\.dsh\memory\memory.db');dst=sqlite3.connect(r'.tmp/live-curated.db');src.backup(dst)"
 
 # 注入回放：真实库快照 + 新注入链路，打印第一轮实际注入的消息
 node notes/core-inject-replay.mjs

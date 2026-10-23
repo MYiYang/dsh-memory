@@ -43,10 +43,10 @@ test('extractJsonSlice is string-aware and repairJson fixes usual slips', () => 
 
 test('repairJson fixes unescaped Windows paths and raw control chars in strings', () => {
   // The model pastes paths verbatim; `\U` / `\.` / `\m` are not valid JSON escapes.
-  const windowsPath = '{"memories":[{"kind":"work_fact","text":"库在 C:\\Users\\17915\\.dsh\\memory.db","priority":60}]}'
+  const windowsPath = '{"memories":[{"kind":"work_fact","text":"库在 C:\\Users\\someone\\.dsh\\memory.db","priority":60}]}'
   const parsedPath = parseExtraction(windowsPath)
   assert.equal(parsedPath.reason, 'ok')
-  assert.equal(parsedPath.memories[0].text, '库在 C:\\Users\\17915\\.dsh\\memory.db')
+  assert.equal(parsedPath.memories[0].text, '库在 C:\\Users\\someone\\.dsh\\memory.db')
 
   // Literal newlines inside a string are invalid JSON too.
   const withNewline = '{"memories":[{"kind":"work_fact","text":"第一行\n第二行"}]}'
@@ -181,12 +181,12 @@ test('normalizeMemoryItem rejects empty or non-object entries', () => {
 test('parseExtraction salvages a JSON answer truncated by the output budget', () => {
   // Exactly what a reasoning model emits when maxTokens runs out mid-array.
   const truncated =
-    '{"memories":[{"kind":"work_fact","text":"记忆库在 C:\\Users\\17915\\.dsh\\memory.db","priority":65,"scene":"记忆库"},' +
+    '{"memories":[{"kind":"work_fact","text":"记忆库在 C:\\Users\\someone\\.dsh\\memory.db","priority":65,"scene":"记忆库"},' +
     '{"kind":"work_method","text":"测试要逐文件跑 node --test，整套会 EP'
   const salvaged = parseExtraction(truncated)
   assert.equal(salvaged.reason, 'ok')
   assert.equal(salvaged.memories.length, 1)
-  assert.equal(salvaged.memories[0].text, '记忆库在 C:\\Users\\17915\\.dsh\\memory.db')
+  assert.equal(salvaged.memories[0].text, '记忆库在 C:\\Users\\someone\\.dsh\\memory.db')
   // The cut-off second element must not survive as a half-written fact.
   assert.ok(!salvaged.memories.some((entry) => entry.text.includes('EP')))
 
