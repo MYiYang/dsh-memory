@@ -8,22 +8,23 @@
 - 插件做什么、配置、评测数据：[dsh-memory/README.md](dsh-memory/README.md)
 - **安装（三种路径）**：[dsh-memory/INSTALL.md](dsh-memory/INSTALL.md)
 - 设计与实现细节：[dsh-memory/DESIGN-v2.md](dsh-memory/DESIGN-v2.md)
+- **全局记忆失效审计**（为什么「标了全局」还会忘）：[dsh-memory/AUDIT-global-recall.md](dsh-memory/AUDIT-global-recall.md)
 - **发版指南**：[PUBLISH.md](PUBLISH.md)
 
 ## 安装（给人看的三个入口）
 
-已发布版本：[v0.4.0](https://github.com/MYiYang/dsh-memory/releases/tag/v0.4.0)
+已发布版本：[v0.4.2](https://github.com/MYiYang/dsh-memory/releases/tag/v0.4.2)
 
 ```powershell
 # A. CLI：直装 Release 里的 tarball（再把 dsh-memory 加进 profile 的 dsh.profile.bundles 后重启）
-dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.4.0/dsh-memory-0.4.0.tgz
+dsh plugin --profile web add https://github.com/MYiYang/dsh-memory/releases/download/v0.4.2/dsh-memory-0.4.2.tgz
 
 # B. GUI：侧栏「插件」→「添加插件」→ 粘上面这条 URL（自动选入 bundles，不用手改 JSON）
 
-# C. 离线：下 [dsh-memory-0.4.0.zip](https://github.com/MYiYang/dsh-memory/releases/download/v0.4.0/dsh-memory-0.4.0.zip)
+# C. 离线：下 [dsh-memory-0.4.2.zip](https://github.com/MYiYang/dsh-memory/releases/download/v0.4.2/dsh-memory-0.4.2.zip)
 #    → 解压 → 先干跑看动作，再加 -Apply 真装 → 重启 DSH
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz
-pwsh -File .\install.ps1 -From .\dsh-memory-0.4.0.tgz -Apply
+pwsh -File .\install.ps1 -From .\dsh-memory-0.4.2.tgz
+pwsh -File .\install.ps1 -From .\dsh-memory-0.4.2.tgz -Apply
 ```
 
 | 场景 | 一句话 |
@@ -49,8 +50,8 @@ git remote add origin https://github.com/<you>/<repo>.git; git push -u origin ma
 # 1) 改版本号 dsh-memory/package.json 的 version
 node scripts\sync-skills.mjs --check          # 技能镜像是否最新
 node scripts\build-release.mjs                # 本地先构建一遍（dist\）
-git add -A; git commit -m "release v0.4.0"
-git tag -a v0.4.0 -m "dsh-memory 0.4.0"
+git add -A; git commit -m "release v<ver>"
+git tag -a v<ver> -m "dsh-memory <ver>"
 git push origin main --tags                   # 触发 .github/workflows/release.yml
 ```
 
