@@ -158,13 +158,102 @@ export function repairJson(text) {
 }
 
 /**
+ * Track string/bracket state of a JSON document.
+ * @param {string} text
+ * @returns {{ inString: boolean, trailingEscape: boolean, stack: string[] }}
+ */
+function scanJsonState(text) {
+  let inString = false
+  let trailingEscape = false
+  /** @type {string[]} */
+  const stack = []
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (trailingEscape) trailingEscape = false
+      else if (ch === '\\') trailingEscape = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{' || ch === '[') stack.push(ch)
+    else if (ch === '}' || ch === ']') stack.pop()
+  }
+  return { inString, trailingEscape, stack }
+}
+
+/**
+ * Close a truncated JSON document: terminate an open string, drop a dangling
+ * separator, then append the brackets still missing. Returns null when the
+ * text cannot be closed into something parseable-looking.
+ *
+ * A model that runs out of output budget mid-answer produces exactly this
+ * shape (`{"memories":[{"text":"…`) and strict parsing throws the whole batch
+ * away — the partial facts are worth keeping.
+ *
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function closeTruncatedJson(text) {
+  let out = String(text ?? '').replace(/\s+$/, '')
+  if (out === '') return null
+  if (!/^[{[]/.test(out)) return null
+  let { inString, trailingEscape, stack } = scanJsonState(out)
+  if (inString) {
+    if (trailingEscape) out += '\\'
+    out += '"'
+    const rest = scanJsonState(out)
+    stack = rest.stack
+    inString = false
+  }
+  out = out.replace(/[,:]\s*$/, '')
+  for (let i = stack.length - 1; i >= 0; i--) out += stack[i] === '{' ? '}' : ']'
+  return out
+}
+
+/**
+ * Salvage a truncated JSON answer: try the tail as-is, then progressively cut
+ * back to earlier closing brackets (which drops the incomplete last element).
+ *
+ * @param {string} text
+ * @returns {unknown|null}
+ */
+export function salvageTruncatedJson(text) {
+  const source = String(text ?? '')
+  const start = source.search(/[{[]/)
+  if (start < 0) return null
+  const tail = stripNoise(source.slice(start))
+  if (tail === '') return null
+  // Only cut at a closing bracket: the element that ended there is complete, so
+  // no half-written fact can slip into the store. Longest prefix first, so a
+  // document truncated just before its final `]` keeps every element.
+  /** @type {number[]} */
+  const cuts = []
+  for (let i = tail.length - 1; i >= 0 && cuts.length < 40; i--) {
+    const ch = tail[i]
+    if (ch === '}' || ch === ']') cuts.push(i)
+  }
+  for (const cut of cuts) {
+    const closed = closeTruncatedJson(tail.slice(0, cut + 1))
+    if (closed === null) continue
+    for (const attempt of [closed, repairJson(closed)]) {
+      try {
+        return JSON.parse(attempt)
+      } catch {
+        /* try the next, shorter candidate */
+      }
+    }
+  }
+  return null
+}
+
+/**
  * Find the first balanced JSON value (object or array) in `text`.
  * String-aware so braces inside strings do not end the scan early.
  * @param {string} text
  * @returns {string|null}
  */
-export function extractJsonSlice(text) {
-  const source = String(text ?? '')
+export function extractJsonSlice(text) {  const source = String(text ?? '')
   let start = -1
   for (let i = 0; i < source.length; i++) {
     const ch = source[i]
@@ -232,7 +321,8 @@ export function extractJsonSlices(text) {
 export function parseJsonCandidates(text) {
   /** @type {unknown[]} */
   const values = []
-  for (const slice of extractJsonSlices(text)) {
+  const slices = extractJsonSlices(text)
+  for (const slice of slices) {
     try {
       values.push(JSON.parse(slice))
       continue
@@ -245,6 +335,16 @@ export function parseJsonCandidates(text) {
       /* not JSON after all */
     }
   }
+  // A response cut off by the output budget has no balanced slice at all, so the
+  // loop above finds nothing. Salvage the tail after the last complete slice (or
+  // the whole source when there is none).
+  const source = stripNoise(text)
+  const lastSlice = slices[slices.length - 1]
+  const remainder = lastSlice === undefined ? source : source.slice(source.lastIndexOf(lastSlice) + lastSlice.length)
+  if (remainder.includes('{') || remainder.includes('[')) {
+    const salvaged = salvageTruncatedJson(remainder)
+    if (salvaged !== null) values.push(salvaged)
+  }
   return values
 }
 
@@ -255,14 +355,14 @@ export function parseJsonCandidates(text) {
  */
 export function parseJsonLoose(text) {
   const slice = extractJsonSlice(stripNoise(text))
-  if (slice === null) return null
+  if (slice === null) return salvageTruncatedJson(text)
   try {
     return JSON.parse(slice)
   } catch {
     try {
       return JSON.parse(repairJson(slice))
     } catch {
-      return null
+      return salvageTruncatedJson(text)
     }
   }
 }

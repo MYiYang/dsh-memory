@@ -803,3 +803,29 @@ v2（891 字）按现存事实重写为「项目定位 / 架构 / 操作约定 /
 压缩后实测：cores 298 + 项目 661 + 全局 214 + 导航 468 ≈ **1641 / 1800**，渲染出的 stable block
 （含 intro）1791 字，**场景导航恢复注入且无 `…` 截断**。`stableMaxChars` 未改动，无需重启；两张画像都走
 `putPersona` 正常递增版本，旧版仍在 `.tmp/memory-backup-20261023-110526/` 备份里。
+
+### 23.7 输出预算截断导致的 `parse` 失败与救援（2026-10-23 11:15）
+
+**症状**：本轮那篇长回答（表格 + 大量事实）被抽取时连续两次 `l1-last-reason=parse`（`extract_attempts 1→2`，
+`l1_calls_total 30→31`），同一批数据在 10:53 之前却能成功——说明不是输入格式问题，而是**这次输出被截断**。
+
+**根因**：`maxTokens=1200` 是整段输出的预算，而 deepseek 推理模型先吐 reasoning，reasoning 同样计入输出预算。
+这批提示词可抽 10 条事实，答案 JSON 写到数组中间就被截断，`extractJsonSlice` 找不到配平的括号 → 无切片 →
+`parseJsonCandidates` 返回空 → `reason=parse`。0.5.0 的 `repairStringEscapes` 只救「括号配平但转义非法」，
+救不了「根本没有闭合」，所以这次仍然失败。
+
+**修复**：
+
+1. `closeTruncatedJson()` / `salvageTruncatedJson()`：只在一个**完整元素的闭合括号**处回退（最长前缀优先），
+   补齐缺失的 `]` / `}` 再解析；若截断发生在第一个元素内部（没有任何完整元素可回退）则**拒绝救援**——
+   宁可让这一批失败重试，也不把半句话当事实存进库。`parseJsonCandidates` 在「无配平切片」时改为救援
+   最后一个切片之后的尾巴；`parseJsonLoose` 同样兜底，去重/门控的 JSON 一并受益。
+2. `maxTokens` 默认 1200 → **2400**（`PIPELINE_DEFAULTS` 与 `index.js` 的配置默认同步），给 reasoning 留余量。
+3. `parse` 失败时把原始输出写进 meta `l1-last-raw`（`chars` / `finish` / `head` 前 1200 字）。此前这种失败
+   事后完全不可诊断，只能猜是截断、散文还是结构不对。
+
+**回归**：153 → **154** 项全绿，新增用例覆盖「数组中间被截断」「示例 JSON 之后的最终答案被截断」
+「无可回退元素时拒绝救援」。
+
+**处置**：待抽取的 L0 turn #33（本轮回答）已把 `extract_attempts` 归零，避免被旧解析器的两次失败提前丢弃；
+重启加载新代码后走真实 pipeline 重试。

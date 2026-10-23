@@ -8,6 +8,7 @@ import {
   applyDecisions,
   buildDedupePrompt,
   buildExtractionPrompt,
+  closeTruncatedJson,
   extractJsonSlice,
   normalizeMemoryItem,
   parseDedupe,
@@ -15,6 +16,7 @@ import {
   parseJsonLoose,
   repairJson,
   repairStringEscapes,
+  salvageTruncatedJson,
   stripNoise,
   withCandidates,
 } from '../src/extract.js'
@@ -174,4 +176,33 @@ test('normalizeMemoryItem rejects empty or non-object entries', () => {
   assert.equal(normalizeMemoryItem(null), null)
   assert.equal(normalizeMemoryItem({ text: '   ' }), null)
   assert.equal(normalizeMemoryItem({ text: 'ok', kind: 'work_task', priority: 42 }).priority, 42)
+})
+
+test('parseExtraction salvages a JSON answer truncated by the output budget', () => {
+  // Exactly what a reasoning model emits when maxTokens runs out mid-array.
+  const truncated =
+    '{"memories":[{"kind":"work_fact","text":"记忆库在 C:\\Users\\17915\\.dsh\\memory.db","priority":65,"scene":"记忆库"},' +
+    '{"kind":"work_method","text":"测试要逐文件跑 node --test，整套会 EP'
+  const salvaged = parseExtraction(truncated)
+  assert.equal(salvaged.reason, 'ok')
+  assert.equal(salvaged.memories.length, 1)
+  assert.equal(salvaged.memories[0].text, '记忆库在 C:\\Users\\17915\\.dsh\\memory.db')
+  // The cut-off second element must not survive as a half-written fact.
+  assert.ok(!salvaged.memories.some((entry) => entry.text.includes('EP')))
+
+  // A complete example followed by a truncated real answer: keep the real one.
+  const exampleFirst =
+    '先看格式：{"memories":[]}\n最终答案：{"memories":[{"kind":"persona","text":"称呼用户为官人","priority":90,"scene":"称呼"},{"kind":"work_fact","text":"未写完'
+  const picked = parseExtraction(exampleFirst)
+  assert.equal(picked.reason, 'ok')
+  assert.equal(picked.memories.length, 1)
+  assert.equal(picked.memories[0].text, '称呼用户为官人')
+
+  // Prose with no JSON at all is still a parse failure.
+  assert.equal(parseExtraction('这段对话里没有值得记住的事实。').reason, 'parse')
+  // A truncated string literal is closed, and a dangling key/value pair dropped.
+  assert.equal(closeTruncatedJson('{"memories":[{"text":"abc'), '{"memories":[{"text":"abc"}]}')
+  // No complete element to cut back to: refuse rather than store a half fact.
+  assert.equal(salvageTruncatedJson('{"memories":[{"kind":"work_fact","text":"未写完'), null)
+  assert.equal(salvageTruncatedJson('no json here'), null)
 })

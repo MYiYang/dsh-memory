@@ -28,7 +28,9 @@ export const PIPELINE_DEFAULTS = {
   maxInputChars: 8_000,
   maxMemories: 10,
   maxAttempts: 3,
-  maxTokens: 1_200,
+  // Reasoning models spend part of the budget before the answer; 1_200 tokens
+  // was enough to truncate a 10-fact answer mid-JSON (see DESIGN §23.7).
+  maxTokens: 2_400,
   timeoutMs: 60_000,
 }
 
@@ -163,6 +165,18 @@ export function createPipeline(options) {
     if (parsed.reason !== 'ok') {
       const discarded = penalize(usedIds, parsed.reason)
       setMeta(db, 'l1-last-reason', parsed.reason)
+      // Keep the head of the unparseable answer: without it a `parse` failure is
+      // undiagnosable after the fact (truncation vs. prose vs. wrong shape).
+      setMeta(
+        db,
+        'l1-last-raw',
+        JSON.stringify({
+          at: now(),
+          chars: response.text.length,
+          finish: response.reason ?? null,
+          head: response.text.slice(0, 1_200),
+        }),
+      )
       return { skipped: true, reason: parsed.reason, discarded }
     }
 

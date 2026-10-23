@@ -94,7 +94,7 @@ function resolveConfig(raw) {
       maxMemories: number(extraction.maxMemories, 10, 1, 50),
       maxAttempts: number(extraction.maxAttempts, 3, 1, 10),
       timeoutMs: number(extraction.timeoutMs, 60_000, 1_000, 300_000),
-      maxTokens: number(extraction.maxTokens, 1200, 64, 8192),
+      maxTokens: number(extraction.maxTokens, 2400, 64, 8192),
     },
     scenes: {
       enabled: scenes.enabled !== false,
