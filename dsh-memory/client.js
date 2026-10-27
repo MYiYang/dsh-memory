@@ -224,7 +224,7 @@ window.__ModuleLoader__.load({
       'group.extraction.description': '用模型把原始对话提炼成事实记忆。',
       'group.scenes.description': 'L2：把相关事实聚合成场景。',
       'group.persona.description': 'L3：跨会话的项目与全局画像。',
-      'group.vector.description': '词法向量召回与混排权重。',
+      'group.vector.description': '向量模型（内置词法或外部嵌入）、召回与混排权重。',
       'group.storage.description': '数据库文件位置，改动需要重启。',
       'group.advanced.description': '调试开关与技能注册。',
 
@@ -267,6 +267,13 @@ window.__ModuleLoader__.load({
       'persona.personaTimeoutMs': '超时（毫秒）',
       'persona.personaReasoningEffort': '推理强度',
       'vector.enabled': '启用向量召回',
+      'vector.provider': '向量模型',
+      'vector.model': '模型名',
+      'vector.dims': '向量维度',
+      'vector.baseUrl': '接口地址',
+      'vector.apiKeyRef': '密钥引用',
+      'vector.minCosine': '语义相似度阈值',
+      'vector.timeoutMs': '嵌入超时（毫秒）',
       'vector.weight': '向量权重',
       'vector.scanLimit': '扫描上限',
       'vector.prefilter': '预过滤',
@@ -315,9 +322,18 @@ window.__ModuleLoader__.load({
       'persona.personaTimeoutMs.description': '人设生成的超时时间。',
       'persona.personaReasoningEffort.description': '人设生成使用的推理强度，留空跟随默认。',
       'vector.enabled.description': '在全文检索之外加一路词法向量召回。',
+      'vector.provider.description':
+        '内置词法：进程内 384 维哈希向量，不联网（默认）。外部嵌入接口：用下面配置的模型算语义向量，字面不重合也能召回。',
+      'vector.model.description': 'provider=openai 时生效。如 text-embedding-3-small、bge-m3、nomic-embed-text（Ollama 需带 :tag 也可）。',
+      'vector.dims.description': 'provider=openai 时生效。0 = 自动：先查内置模型维度表，再读上次探测缓存，最后向接口探测一次。',
+      'vector.baseUrl.description': 'provider=openai 时生效。OpenAI 兼容的 /embeddings 地址；留空用 https://api.openai.com/v1，不以 /embeddings 结尾时自动补。',
+      'vector.apiKeyRef.description':
+        'provider=openai 时生效。填环境变量名（如 OPENAI_API_KEY，经 DSH 凭据解析）；不像标识符的值按字面密钥使用（会明文存入 settings.json）。',
+      'vector.minCosine.description': 'provider=openai 时生效。语义召回下限：bge/nomic 类约 0.45–0.55，OpenAI text-embedding-3 约 0.7。',
+      'vector.timeoutMs.description': 'provider=openai 时生效。单次嵌入请求的超时；召回时的查询嵌入最多等 5 秒。',
       'vector.weight.description': '向量得分在混合排序中的权重。',
       'vector.scanLimit.description': '一次召回最多扫描多少条记录。',
-      'vector.prefilter.description': '先用倒排特征粗筛再精算。',
+      'vector.prefilter.description': '先用倒排特征粗筛再精算（仅内置词法向量）。',
       'vector.featureLimit.description': '查询时最多使用多少个特征。',
       'storage.dbPath.description': '留空使用 $DSH_HOME/memory/memory.db；改动需要重启。',
       'debug.description': '输出详细日志，便于排查问题。',
@@ -327,10 +343,21 @@ window.__ModuleLoader__.load({
       // ── enum options ────────────────────────────────────────────────────
       'option.recall.scope.project': '当前项目',
       'option.recall.scope.global': '全局',
+      'option.vector.provider.hash': '内置词法（默认）',
+      'option.vector.provider.openai': '外部嵌入接口',
       'option.persona.personaReasoningEffort.low': '低',
       'option.persona.personaReasoningEffort.medium': '中',
       'option.persona.personaReasoningEffort.high': '高',
       'option.persona.personaReasoningEffort.max': '最高',
+
+      // ── vector model runtime line ───────────────────────────────────────
+      vectorModelLabel: '向量模型',
+      vectorEmbeddedLabel: '已嵌入',
+      vectorPendingLabel: '待回填',
+      vectorDimsFromConfig: '维度来自配置',
+      vectorDimsFromKnown: '维度来自模型表',
+      vectorDimsFromCache: '维度来自缓存',
+      vectorDimsFromProbed: '维度来自探测',
     }
 
     const en = {
@@ -507,7 +534,7 @@ window.__ModuleLoader__.load({
       'group.extraction.description': 'Distill raw turns into fact memories with the model.',
       'group.scenes.description': 'L2: group related facts into scenes.',
       'group.persona.description': 'L3: cross-session project and global profiles.',
-      'group.vector.description': 'Lexical-vector recall and its blended weight.',
+      'group.vector.description': 'Vector model (built-in lexical or an embedding endpoint), recall, and blended weight.',
       'group.storage.description': 'Database file location; changes need a restart.',
       'group.advanced.description': 'Debug logging and skill registration.',
 
@@ -550,6 +577,13 @@ window.__ModuleLoader__.load({
       'persona.personaTimeoutMs': 'Timeout (ms)',
       'persona.personaReasoningEffort': 'Reasoning effort',
       'vector.enabled': 'Enable vector recall',
+      'vector.provider': 'Vector model',
+      'vector.model': 'Model',
+      'vector.dims': 'Dimensions',
+      'vector.baseUrl': 'Endpoint',
+      'vector.apiKeyRef': 'API key reference',
+      'vector.minCosine': 'Similarity floor',
+      'vector.timeoutMs': 'Embedding timeout (ms)',
       'vector.weight': 'Vector weight',
       'vector.scanLimit': 'Scan limit',
       'vector.prefilter': 'Pre-filter',
@@ -597,10 +631,22 @@ window.__ModuleLoader__.load({
       'persona.personaMaxTokens.description': 'Token ceiling for persona generation.',
       'persona.personaTimeoutMs.description': 'Time budget for persona generation.',
       'persona.personaReasoningEffort.description': 'Reasoning effort for persona generation; empty follows the default.',
-      'vector.enabled.description': 'Add lexical-vector recall on top of full-text search.',
+      'vector.enabled.description': 'Add vector recall on top of full-text search.',
+      'vector.provider.description':
+        'Built-in lexical: an in-process 384-dim feature hash, no network (default). External endpoint: semantic vectors from the model below, so wording does not have to match.',
+      'vector.model.description': 'When provider=openai. For example text-embedding-3-small, bge-m3, nomic-embed-text (Ollama tags allowed).',
+      'vector.dims.description':
+        'When provider=openai. 0 = auto: known-model table, then the cached probe, then one live probe.',
+      'vector.baseUrl.description':
+        'When provider=openai. OpenAI-compatible /embeddings endpoint; empty uses https://api.openai.com/v1, and /embeddings is appended when missing.',
+      'vector.apiKeyRef.description':
+        'When provider=openai. An environment variable name (e.g. OPENAI_API_KEY) resolved through DSH credentials; anything that is not an identifier is used literally (stored in plain text).',
+      'vector.minCosine.description':
+        'When provider=openai. Similarity floor: ~0.45–0.55 for bge/nomic, ~0.7 for OpenAI text-embedding-3.',
+      'vector.timeoutMs.description': 'When provider=openai. Per-request timeout; the per-turn query embedding waits at most 5s.',
       'vector.weight.description': 'Weight of the vector score in the blended ranking.',
       'vector.scanLimit.description': 'Maximum records one recall may scan.',
-      'vector.prefilter.description': 'Coarse-filter by inverted features before scoring.',
+      'vector.prefilter.description': 'Coarse-filter by inverted features before scoring (built-in lexical vector only).',
       'vector.featureLimit.description': 'Maximum features used per query.',
       'storage.dbPath.description': 'Empty uses $DSH_HOME/memory/memory.db; changing it needs a restart.',
       'debug.description': 'Emit verbose logs for troubleshooting.',
@@ -610,10 +656,21 @@ window.__ModuleLoader__.load({
       // ── enum options ────────────────────────────────────────────────────
       'option.recall.scope.project': 'This project',
       'option.recall.scope.global': 'Global',
+      'option.vector.provider.hash': 'Built-in lexical (default)',
+      'option.vector.provider.openai': 'External embedding endpoint',
       'option.persona.personaReasoningEffort.low': 'Low',
       'option.persona.personaReasoningEffort.medium': 'Medium',
       'option.persona.personaReasoningEffort.high': 'High',
       'option.persona.personaReasoningEffort.max': 'Max',
+
+      // ── vector model runtime line ───────────────────────────────────────
+      vectorModelLabel: 'Vector model',
+      vectorEmbeddedLabel: 'Embedded',
+      vectorPendingLabel: 'Pending',
+      vectorDimsFromConfig: 'width from settings',
+      vectorDimsFromKnown: 'width from model table',
+      vectorDimsFromCache: 'width from cache',
+      vectorDimsFromProbed: 'width probed',
     }
 
     /**
@@ -1169,6 +1226,11 @@ window.__ModuleLoader__.load({
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+/* A failing embedding endpoint is a hint, not an alarm: it explains why recall
+   looks lexical while a model is configured. */
+.dm_dataSummaryError {
+  color: var(--dsw-alias-state-error-primary);
 }
 .dm_modalBackdrop {
   position: fixed;
@@ -3254,6 +3316,49 @@ body[data-ds-dark-theme] .dm_stat {
                 ),
               ),
             ),
+            renderVectorRuntime(),
+          )
+        }
+
+        /**
+         * One line under the tiles: which vector model is live, how much of the
+         * corpus it has covered, and why it is idle if it is. Only shown for a
+         * configured model — the built-in algorithm needs no status.
+         */
+        const renderVectorRuntime = () => {
+          const runtime = state !== null && state.runtime !== null && typeof state.runtime === 'object' ? state.runtime.vector : null
+          if (runtime === null || typeof runtime !== 'object' || runtime.provider !== 'openai') return null
+          const dimsNote =
+            runtime.dims === null || runtime.dims === undefined
+              ? ''
+              : ' @' +
+                String(runtime.dims) +
+                ' · ' +
+                (runtime.dimsSource === 'config'
+                  ? tr('vectorDimsFromConfig', '')
+                  : runtime.dimsSource === 'known'
+                    ? tr('vectorDimsFromKnown', '')
+                    : runtime.dimsSource === 'cache'
+                      ? tr('vectorDimsFromCache', '')
+                      : runtime.dimsSource === 'probed'
+                        ? tr('vectorDimsFromProbed', '')
+                        : '')
+          const modelName = typeof runtime.tag === 'string' && runtime.tag !== '' ? runtime.tag : String(runtime.model || tr('emptyValue', '(empty)'))
+          return h(
+            'div',
+            { className: 'dm_dataSummary' },
+            h('span', { className: 'dm_dataSummaryItem', title: runtime.endpoint === null ? undefined : String(runtime.endpoint) }, tr('vectorModelLabel', 'Vector model') + ': ' + modelName + dimsNote),
+            h(
+              'span',
+              { className: 'dm_dataSummaryItem' },
+              tr('vectorEmbeddedLabel', 'Embedded') + ' ' + formatCount(runtime.embedded) + '/' + formatCount(runtime.total),
+            ),
+            runtime.pending > 0
+              ? h('span', { className: 'dm_dataSummaryItem' }, tr('vectorPendingLabel', 'Pending') + ' ' + formatCount(runtime.pending))
+              : null,
+            typeof runtime.lastError === 'string' && runtime.lastError !== ''
+              ? h('span', { className: 'dm_dataSummaryItem dm_dataSummaryError' }, runtime.lastError)
+              : null,
           )
         }
 

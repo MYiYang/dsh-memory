@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-layered",
-  "version": "0.7.0",
-  "description": "Layered cross-session memory for DeepSeek Harness: L0 raw turns, L1 LLM-extracted facts with conflict resolution, L2 scenes with maxScenes eviction, L3 project + global persona, hybrid FTS + local 384-dim lexical vectors with an inverted pre-filter, plus recall injection and memory_search / memory_save / memory_extract tools",
+  "version": "0.8.0",
+  "description": "Layered cross-session memory for DeepSeek Harness: L0 raw turns, L1 LLM-extracted facts with conflict resolution, L2 scenes with maxScenes eviction, L3 project + global persona, hybrid FTS + vectors (built-in 384-dim lexical hashing by default, or a configurable OpenAI-compatible embedding model with auto dimensions), plus recall injection and memory_search / memory_save / memory_extract tools",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -23,6 +23,9 @@
     "./consolidate": "./src/consolidate.js",
     "./vector": "./src/vector.js",
     "./feature-index": "./src/feature-index.js",
+    "./embedding": "./src/embedding.js",
+    "./embedding-store": "./src/embedding-store.js",
+    "./embed-worker": "./src/embed-worker.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -37,6 +40,7 @@
     "INSTALL.md",
     "LICENSE",
     "DESIGN-v2.md",
+    "ANALYSIS-vector-model.md",
     "AUDIT-global-recall.md"
   ],
   "icon": "./icon.svg",
@@ -44,7 +48,7 @@
     "node": ">=22.16.0"
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "sync-skills": "node ../scripts/sync-skills.mjs"
   },
   "keywords": [

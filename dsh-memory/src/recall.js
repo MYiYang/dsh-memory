@@ -4,19 +4,29 @@
  *
  * Scoring is deliberately simple and explainable:
  *   textScore (bm25, normalized) + recency + usage + project + kind weight.
- * No embedding provider is required; if one is added later, only `scoreRow`
- * needs an extra signal.
+ *
+ * Two vector channels share that score:
+ *   - **lexical** (default): the in-process 384-dim feature hash from vector.js,
+ *     optionally pre-filtered by the inverted feature index. No service.
+ *   - **semantic** (opt-in): a configured embedding model. The *query* vector is
+ *     computed by the caller (it needs an HTTP round trip, and the pre-step can
+ *     await it) and passed in as `vector.queryVector` + `vector.model`; the
+ *     stored vectors are read from SQLite here, so this module stays synchronous.
+ *     Everything below the floor `vector.minCosine` contributes nothing, which is
+ *     what makes a failing or misconfigured model degrade to the lexical branch
+ *     instead of poisoning the ranking.
  *
  * @module dsh-memory/recall
  */
 import { KIND_WEIGHTS, getByIds, searchFts, searchLike, touchMemories } from './store.js'
 import { VECTOR_MODEL, cosine, embed, unpackVector } from './vector.js'
 import { DEFAULT_FEATURE_LIMIT, candidateMemoryIds } from './feature-index.js'
+import { hasEmbeddingTable, loadEmbeddings, semanticCandidates } from './embedding-store.js'
 
 /** Minimum cosine for a vector-only candidate to count as related. */
 const VECTOR_MIN_COSINE = 0.15
 
-/** Candidate rows nominated by the inverted index before exact rescoring. */
+/** Candidate rows nominated by the inverted index (or the semantic scan) before exact rescoring. */
 const PREFILTER_CANDIDATES = 64
 
 /** Latin/CJK aware token extraction. */
@@ -160,9 +170,13 @@ export function estimateChars(text) {
  * @param {number} [options.minScore]
  * @param {number} [options.now]
  * @param {boolean} [options.touch]
- * @param {{ enabled?: boolean, weight?: number, scanLimit?: number, prefilter?: boolean, featureLimit?: number }} [options.vector]
+ * @param {{ enabled?: boolean, weight?: number, scanLimit?: number, prefilter?: boolean, featureLimit?: number,
+ *   queryVector?: Float32Array|null, model?: string|null, minCosine?: number }} [options.vector]
  *   `prefilter: false` disables the inverted-index pass (bounded scan only);
  *   `featureLimit` caps how many query features feed the pre-filter (default 96).
+ *   `queryVector` + `model` switch the vector branch to a **configured model**:
+ *   the caller embeds the query asynchronously and passes both in (see
+ *   ANALYSIS-vector-model.md §4.7); `minCosine` is that channel's floor.
  * @returns {{ items: Array<import('./store.js').MemoryRow & { score: number }>, terms: string[], strategy: string }}
  */
 export function recall(db, query, options = {}) {
@@ -191,16 +205,42 @@ export function recall(db, query, options = {}) {
       : DEFAULT_FEATURE_LIMIT
   const prefilter = vectorOptions.prefilter !== false
   const wanted = maxItems * 2
-  // A blank query has no features to compare; skipping the vector branch avoids
+
+  // ── Which vector channel runs ────────────────────────────────────────────
+  // A configured model is identified by `model` (its tag) plus the precomputed
+  // query vector; the built-in channel is the default and needs neither.
+  const semanticQuery =
+    vectorEnabled && vectorOptions.queryVector instanceof Float32Array ? vectorOptions.queryVector : null
+  const semanticModel =
+    semanticQuery === null || typeof vectorOptions.model !== 'string' ? null : vectorOptions.model.trim()
+  const semantic =
+    semanticQuery !== null && semanticModel !== null && semanticModel !== '' && semanticModel !== VECTOR_MODEL
+  const requestedMinCosine = Number(vectorOptions.minCosine)
+  const minCosine = Number.isFinite(requestedMinCosine) ? Math.max(0, Math.min(1, requestedMinCosine)) : 0.5
+
+  // A blank query has no features to compare; skipping the lexical branch avoids
   // a pointless bounded scan on turns that carry no text (attachment-only).
-  const queryVector = vectorEnabled && String(query ?? '').trim() !== '' ? embed(query) : null
+  const lexicalQuery =
+    !semantic && vectorEnabled && String(query ?? '').trim() !== '' ? embed(query) : null
   /** @type {Map<number, number>} */
   const vectorScores = new Map()
+  /** @type {Map<number, Float32Array>} */
+  const semanticVectors = new Map()
   const vectorScoreOf = (row) => {
-    if (queryVector === null || row.vec_model !== VECTOR_MODEL) return 0
+    if (semantic) {
+      const stored = semanticVectors.get(row.id)
+      if (stored === undefined || stored.length !== semanticQuery.length) return 0
+      const raw = cosine(semanticQuery, stored)
+      // Absolute, explainable mapping: at the floor the signal contributes
+      // nothing, at cosine 1 it contributes the full weight. Deliberately not
+      // per-batch min-max — the same memory must not score differently just
+      // because another candidate joined the pool.
+      return Math.max(0, Math.min(1, (raw - minCosine) / Math.max(1e-6, 1 - minCosine)))
+    }
+    if (lexicalQuery === null || row.vec_model !== VECTOR_MODEL) return 0
     let value = vectorScores.get(row.id)
     if (value === undefined) {
-      value = cosine(queryVector, unpackVector(row.vec))
+      value = cosine(lexicalQuery, unpackVector(row.vec))
       vectorScores.set(row.id, value)
     }
     return value
@@ -224,7 +264,34 @@ export function recall(db, query, options = {}) {
       if (!candidates.has(row.id)) candidates.set(row.id, { row })
     }
   }
-  if (vectorEnabled && queryVector !== null && candidates.size < wanted) {
+  if (semantic) {
+    // Semantic nomination: bounded scan over the newest visible rows that carry
+    // a vector for this tag. No inverted pre-filter here by design — a semantic
+    // match usually shares no character n-gram with the query, so nominating by
+    // features would miss exactly the rows the model was configured for.
+    if (hasEmbeddingTable(db) && scanLimit > 0) {
+      const scanned = semanticCandidates(db, {
+        model: semanticModel,
+        dims: semanticQuery.length,
+        limit: scanLimit,
+        scope,
+        project: options.project ?? null,
+        kinds,
+      })
+      const nearest = scanned
+        .map((entry) => ({ id: entry.id, vector: entry.vector, score: cosine(semanticQuery, entry.vector) }))
+        .filter((entry) => entry.score >= minCosine && entry.vector.length === semanticQuery.length)
+        .sort((a, b) => b.score - a.score || a.id - b.id)
+        .slice(0, Math.max(PREFILTER_CANDIDATES, wanted * 2))
+      for (const entry of nearest) semanticVectors.set(entry.id, entry.vector)
+      const freshIds = nearest.map((entry) => entry.id).filter((id) => !candidates.has(id))
+      if (freshIds.length > 0) {
+        for (const row of getByIds(db, freshIds)) {
+          if (!candidates.has(row.id)) candidates.set(row.id, { row })
+        }
+      }
+    }
+  } else if (vectorEnabled && lexicalQuery !== null && candidates.size < wanted) {
     /**
      * Keep the closest rows that clear the cosine floor, best first.
      * `vectorScoreOf` caches per id, so a row scored by one pass is not rescored
@@ -292,6 +359,17 @@ export function recall(db, query, options = {}) {
     }
   }
 
+  // Lexical candidates may carry a semantic vector too: load whatever the scan
+  // did not already touch, so every candidate is scored with the same signal no
+  // matter which pass nominated it.
+  if (semantic && hasEmbeddingTable(db)) {
+    const missing = [...candidates.keys()].filter((id) => !semanticVectors.has(id))
+    if (missing.length > 0) {
+      const loaded = loadEmbeddings(db, { model: semanticModel, dims: semanticQuery.length, ids: missing })
+      for (const [id, vector] of loaded) semanticVectors.set(id, vector)
+    }
+  }
+
   const scored = [...candidates.values()]
     .map(({ row, bm25 }) => ({
       ...row,
@@ -327,7 +405,9 @@ export function recall(db, query, options = {}) {
   }
 
   const base = ftsQuery !== '' ? (likeTerms.length > 0 ? 'fts+like' : 'fts') : 'like'
-  const strategy = vectorEnabled ? `${base}+vec` : base
+  // `+sem` vs `+vec` tells the log (and the tests) which channel actually ran:
+  // a configured model that fell back to the lexical vector is still `+vec`.
+  const strategy = vectorEnabled ? `${base}+${semantic ? 'sem' : 'vec'}` : base
   return { items: picked, terms: tokens, strategy }
 }
 

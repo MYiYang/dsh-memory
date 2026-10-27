@@ -111,15 +111,18 @@ test('textHash normalizes whitespace and case', () => {
   assert.equal(textHash('Hello   World'), textHash(' hello world '))
 })
 
-test('schema v4 adds the feature index table and stays idempotent', () => {
+test('schema v5 adds the feature index and embedding tables and stays idempotent', () => {
   const db = freshDb()
-  assert.equal(SCHEMA_VERSION, 4)
-  assert.equal(getMeta(db, 'schema_version'), '4')
+  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(getMeta(db, 'schema_version'), '5')
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
   assert.ok(tables.includes('memory_features'), 'missing memory_features table')
+  assert.ok(tables.includes('memory_embeddings'), 'missing memory_embeddings table')
   const objects = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')").all().map((row) => row.name)
   assert.ok(objects.includes('memory_features_feature_idx'), 'missing feature index')
   assert.ok(objects.includes('memory_features_ad'), 'missing delete trigger')
+  assert.ok(objects.includes('memory_embeddings_model_idx'), 'missing embedding model index')
+  assert.ok(objects.includes('memory_embeddings_ad'), 'missing embedding delete trigger')
 
   saveMemory(db, { text: '部署流程用 pnpm' })
   const before = Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features').get().n)
@@ -127,7 +130,7 @@ test('schema v4 adds the feature index table and stays idempotent', () => {
 
   // A second migration pass must not clear, duplicate or downgrade anything.
   migrate(db)
-  assert.equal(getMeta(db, 'schema_version'), '4')
+  assert.equal(getMeta(db, 'schema_version'), '5')
   assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features').get().n), before)
   db.close()
 })

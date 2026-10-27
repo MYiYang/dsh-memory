@@ -183,6 +183,34 @@ test('validateUnset 只接受字段目录里的 key 列表', () => {
   assert.equal(notArray.errors[0].message, 'unset must be an array of keys')
 })
 
+test('向量模型字段：默认走内置词法，数值钳位，未知 provider 落回 hash', () => {
+  const fresh = resolveConfig({})
+  assert.equal(fresh.vector.provider, 'hash', '不配置就必须还是内置词法')
+  assert.equal(fresh.vector.model, '')
+  assert.equal(fresh.vector.dims, 0, '0 = 自动解析维度')
+  assert.equal(fresh.vector.baseUrl, '')
+  assert.equal(fresh.vector.apiKeyRef, '')
+  assert.equal(fresh.vector.minCosine, 0.5)
+  assert.equal(fresh.vector.timeoutMs, 5000)
+
+  // A provider this build does not implement must not reach the runtime.
+  assert.equal(resolveConfig({ vector: { provider: 'huggingface' } }).vector.provider, 'hash')
+  assert.equal(resolveConfig({ vector: { provider: 'openai' } }).vector.provider, 'openai')
+
+  assert.equal(validatePatch({ 'vector.provider': 'openai' }).flat['vector.provider'], 'openai')
+  assert.equal(validatePatch({ 'vector.provider': 'anthropic' }).ok, false)
+  assert.equal(validatePatch({ 'vector.dims': -1 }).flat['vector.dims'], 0)
+  assert.equal(validatePatch({ 'vector.dims': 99999 }).flat['vector.dims'], 4096)
+  assert.equal(validatePatch({ 'vector.dims': 1536.4 }).flat['vector.dims'], 1536)
+  assert.equal(validatePatch({ 'vector.minCosine': 0.65 }).flat['vector.minCosine'], 0.65)
+  assert.equal(validatePatch({ 'vector.minCosine': 9 }).flat['vector.minCosine'], 1)
+  assert.equal(validatePatch({ 'vector.timeoutMs': 1 }).flat['vector.timeoutMs'], 500)
+  assert.equal(validatePatch({ 'vector.apiKeyRef': '  OPENAI_API_KEY  ' }).flat['vector.apiKeyRef'], 'OPENAI_API_KEY')
+  // Text fields stay strings and are trimmed like every other text field.
+  assert.equal(validatePatch({ 'vector.model': 42 }).ok, false)
+  assert.equal(validatePatch({ 'vector.baseUrl': '   ' }).flat['vector.baseUrl'], '')
+})
+
 // ── 合并与来源 ──────────────────────────────────────────────────────────────
 
 test('mergeRaw：settings > loader > 默认值，且不修改任何输入', () => {
@@ -407,7 +435,7 @@ test('buildGroups 输出 8 组、字段元数据齐全、重启项带 active', (
     }
     // enum 字段带 options，且默认值是合法选项
     const enums = fields.filter((field) => field.type === 'enum')
-    assert.deepEqual(enums.map((field) => field.key).sort(), ['persona.personaReasoningEffort', 'recall.scope'])
+    assert.deepEqual(enums.map((field) => field.key).sort(), ['persona.personaReasoningEffort', 'recall.scope', 'vector.provider'])
     for (const field of enums) {
       assert.ok(Array.isArray(field.options) && field.options.length > 0)
       assert.ok(field.options.includes(field.default), `${field.key} 的默认值不在 options 里`)

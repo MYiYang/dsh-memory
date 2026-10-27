@@ -195,6 +195,13 @@ test('apply 注册 /memory/api 前缀路由，state 返回设置页需要的全�
     assert.equal(state.stats.total, 0)
     assert.equal(state.runtime.extraction.available, false, 'stub ctx 没有 llm 服务')
     assert.equal(typeof state.runtime.skills.enabled, 'boolean')
+    // 默认没配模型：仍然是内置词法，且不需要任何外部服务
+    assert.equal(state.runtime.vector.provider, 'hash')
+    assert.equal(state.runtime.vector.enabled, true)
+    assert.equal(state.runtime.vector.tag, 'hash-ngram-v1-384')
+    assert.equal(state.runtime.vector.dims, 384)
+    assert.equal(state.runtime.vector.embedded, 0)
+    assert.equal(state.runtime.vector.lastError, null)
 
     assert.deepEqual(
       state.groups.map((group) => group.id),
@@ -508,6 +515,60 @@ test('connection.requestRejection 拒绝请求时返回 403，且不透露方法
     const writeAttempt = await harness.request('POST', '/memory/api/save', { patch: { 'capture': false } })
     assert.equal(writeAttempt.status, 403)
     assert.equal(existsSync(harness.settingsPath), false, '被拒的请求不能产生副作用')
+  } finally {
+    cleanup(harness.dir)
+  }
+})
+
+// ── 向量模型 ───────────────────────────────────────────────────────────────
+
+test('切换向量模型：热更新、落盘、state 反映解析后的 tag 与维度', async () => {
+  const harness = createHarness()
+  try {
+    // 默认内置词法：诊断接口不联网就报出 384 维
+    const builtin = await harness.request('POST', '/memory/api/embeddingTest', {})
+    assert.equal(builtin.status, 200)
+    assert.equal(builtin.json.value.ok, true)
+    assert.equal(builtin.json.value.provider, 'hash')
+    assert.equal(builtin.json.value.dims, 384)
+
+    const saved = await harness.request('POST', '/memory/api/save', {
+      patch: {
+        'vector.provider': 'openai',
+        'vector.model': 'toy-embed',
+        'vector.dims': 8,
+        'vector.minCosine': 0.6,
+      },
+    })
+    assert.equal(saved.status, 200)
+    assert.deepEqual(
+      [...saved.json.value.applied].sort(),
+      ['vector.dims', 'vector.minCosine', 'vector.model', 'vector.provider'],
+      '向量模型字段都应热更新',
+    )
+    assert.deepEqual(saved.json.value.restartRequired, [])
+
+    const state = saved.json.value.state
+    assert.equal(state.runtime.vector.provider, 'openai')
+    assert.equal(state.runtime.vector.model, 'toy-embed')
+    assert.equal(state.runtime.vector.dims, 8)
+    assert.equal(state.runtime.vector.dimsSource, 'config')
+    assert.equal(state.runtime.vector.tag, 'openai:toy-embed@8')
+    assert.equal(state.runtime.vector.available, true)
+    const provider = flattenFields(state).find((field) => field.key === 'vector.provider')
+    assert.equal(provider.value, 'openai')
+    assert.equal(provider.source, 'settings')
+
+    // 只写用户改过的 key，不是整份默认值
+    const stored = JSON.parse(readFileSync(harness.settingsPath, 'utf8')).settings
+    assert.equal(stored.vector.provider, 'openai')
+    assert.equal(stored.vector.model, 'toy-embed')
+    assert.equal(stored.vector.dims, 8)
+
+    // 切回内置词法：不重启，tag 立刻回到 384 维哈希
+    const back = await harness.request('POST', '/memory/api/save', { patch: { 'vector.provider': 'hash' } })
+    assert.equal(back.json.value.state.runtime.vector.provider, 'hash')
+    assert.equal(back.json.value.state.runtime.vector.tag, 'hash-ngram-v1-384')
   } finally {
     cleanup(harness.dir)
   }

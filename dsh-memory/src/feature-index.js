@@ -255,6 +255,10 @@ export function backfillFeatureIndex(db, options = {}) {
 /**
  * Build the visibility filter shared by the df probe and the candidate query.
  *
+ * Also exported for the semantic scan (embedding-store.js): both branches must
+ * agree on what "visible" means, or the hybrid score would mix rows one of the
+ * two halves could never have returned.
+ *
  * Mirrors store.searchFts: a `project` scope without a project key sees global
  * rows only (a session without a cwd must not read other projects' rows), and
  * `all` adds no restriction.
@@ -264,7 +268,7 @@ export function backfillFeatureIndex(db, options = {}) {
  * @param {string[]|undefined} kinds
  * @returns {{ clause: string, params: Array<string|null> }}
  */
-function visibilityClause(scope, project, kinds) {
+export function visibilityClause(scope, project, kinds) {
   /** @type {string[]} */
   const clauses = []
   /** @type {Array<string|null>} */

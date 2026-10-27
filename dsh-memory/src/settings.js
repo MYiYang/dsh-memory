@@ -140,6 +140,22 @@ export function resolveConfig(raw) {
       // Query-side feature cap for the pre-filter probe (stored features are
       // fixed at 96 by feature-index.js; probing is capped again at 48).
       featureLimit: number(vector.featureLimit, 96, 16, 96),
+      // ── vector model (see ANALYSIS-vector-model.md) ──────────────────────
+      // `hash` keeps the in-process lexical vector, which is what runs when the
+      // user configures nothing. `openai` sends text to a compatible
+      // `/embeddings` endpoint and stores the result in memory_embeddings.
+      provider: vector.provider === 'openai' ? 'openai' : 'hash',
+      model: text(vector.model),
+      // 0 = auto: known-model table → cached probe → one live probe.
+      dims: number(vector.dims, 0, 0, 4096),
+      baseUrl: text(vector.baseUrl),
+      // A credential *reference* (env var name) resolved through the host
+      // credentials service; a value that is not an identifier is used literally.
+      apiKeyRef: text(vector.apiKeyRef),
+      // Absolute cosine floor: unrelated pairs score ~0.7 on some model
+      // families and ~0.4 on others, so this cannot have one universal default.
+      minCosine: number(vector.minCosine, 0.5, 0, 1),
+      timeoutMs: number(vector.timeoutMs, 5_000, 500, 60_000),
     },
     // Bundled skills shipped inside this package (`./skills`).
     skills: {
@@ -217,8 +233,19 @@ export const FIELDS = [
   { key: 'persona.personaTimeoutMs', path: ['persona', 'personaTimeoutMs'], group: 'persona', type: 'number', min: 5000, max: 600000, step: 5000, live: true },
   { key: 'persona.personaReasoningEffort', path: ['persona', 'personaReasoningEffort'], group: 'persona', type: 'enum', options: ['', 'low', 'medium', 'high', 'max'], live: true },
 
-  // ── Retrieval (lexical vectors) ──────────────────────────────────────────
+  // ── Retrieval (vector model + lexical vectors) ───────────────────────────
   { key: 'vector.enabled', path: ['vector', 'enabled'], group: 'vector', type: 'boolean', live: true },
+  // Which vector model to use: the built-in lexical hash (default) or a
+  // configured OpenAI-compatible endpoint. Everything below `provider` is
+  // ignored by the `hash` provider, which is what keeps "configure nothing"
+  // byte-for-byte the old behaviour.
+  { key: 'vector.provider', path: ['vector', 'provider'], group: 'vector', type: 'enum', options: ['hash', 'openai'], live: true },
+  { key: 'vector.model', path: ['vector', 'model'], group: 'vector', type: 'text', live: true },
+  { key: 'vector.dims', path: ['vector', 'dims'], group: 'vector', type: 'number', min: 0, max: 4096, step: 1, live: true },
+  { key: 'vector.baseUrl', path: ['vector', 'baseUrl'], group: 'vector', type: 'text', live: true },
+  { key: 'vector.apiKeyRef', path: ['vector', 'apiKeyRef'], group: 'vector', type: 'text', live: true },
+  { key: 'vector.minCosine', path: ['vector', 'minCosine'], group: 'vector', type: 'number', min: 0, max: 1, step: 0.05, live: true },
+  { key: 'vector.timeoutMs', path: ['vector', 'timeoutMs'], group: 'vector', type: 'number', min: 500, max: 60000, step: 500, live: true },
   { key: 'vector.weight', path: ['vector', 'weight'], group: 'vector', type: 'number', min: 0, max: 1, step: 0.05, live: true },
   { key: 'vector.scanLimit', path: ['vector', 'scanLimit'], group: 'vector', type: 'number', min: 0, max: 5000, step: 100, live: true },
   { key: 'vector.prefilter', path: ['vector', 'prefilter'], group: 'vector', type: 'boolean', live: true },

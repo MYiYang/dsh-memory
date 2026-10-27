@@ -14,9 +14,10 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { VECTOR_MODEL, embed, packVector } from './vector.js'
 import { backfillFeatureIndex, ensureFeatureIndexModel, indexMemoryFeatures } from './feature-index.js'
+import { ensureEmbeddingSchema } from './embedding-store.js'
 
 /** Schema version; bump when the layout changes and add a migration step. */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
 /**
  * Kinds of memory rows.
@@ -273,6 +274,11 @@ export function migrate(db) {
 
   // v4: a changed feature model invalidates every stored feature row.
   ensureFeatureIndexModel(db)
+
+  // v4 → v5: vectors of a *configured* embedding model, kept beside `memory.vec`
+  // (which stays the built-in lexical vector). Purely additive: an older build
+  // opening this file simply ignores the table.
+  ensureEmbeddingSchema(db)
 
   // v1 → v2: additive columns on the existing memory table.
   ensureColumn(db, 'memory', 'priority', 'INTEGER NOT NULL DEFAULT 50')

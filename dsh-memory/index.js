@@ -20,14 +20,16 @@ import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve as resolvePath } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { openDatabase, saveMemory, forgetMemories, stats, getMeta, coreMemories, touchMemories } from './src/store.js'
+import { openDatabase, saveMemory, forgetMemories, stats, getMeta, setMeta, coreMemories, touchMemories } from './src/store.js'
 import { recall, renderMemoryBlock, renderStableBlock } from './src/recall.js'
 import { captureTurn, extractText } from './src/capture.js'
 import { appendTurn, pendingSessionIds } from './src/l0.js'
 import { listPersonas, sceneNavigation } from './src/profile.js'
 import { createScheduler } from './src/scheduler.js'
 import { createPipeline } from './src/pipeline.js'
-import { createLlmClient } from './src/llm.js'
+import { createLlmClient, safeService } from './src/llm.js'
+import { createEmbeddingClient } from './src/embedding.js'
+import { createEmbeddingWorker } from './src/embed-worker.js'
 import { runPersona } from './src/consolidate.js'
 import { registerBundledSkills } from './src/skills.js'
 import {
@@ -295,6 +297,157 @@ export function apply(ctx, rawConfig) {
     }
   }, 'dsh-memory: pipeline')
 
+  // ── Vector model: the built-in lexical vector, or a configured endpoint ───
+  // The client owns "which model, which width, which tag"; the worker owns
+  // "who still needs a vector". Both are rebuilt when the settings change, so a
+  // model swap never needs a restart (ANALYSIS-vector-model.md §4.6).
+  /** @type {ReturnType<typeof createEmbeddingClient>|null} */
+  let embeddingClient = null
+  /** @type {ReturnType<typeof createEmbeddingWorker>|null} */
+  let embeddingWorker = null
+
+  /**
+   * Resolve `vector.apiKeyRef` through the host credential service, then the
+   * environment. Per call, never cached: a rotated key must reach the next
+   * request (the same rule the DSH credential seam documents).
+   * @param {string} ref
+   * @returns {Promise<string|null>}
+   */
+  const resolveEmbeddingSecret = async (ref) => {
+    try {
+      const credentials = safeService(ctx, 'credentials')
+      if (credentials !== undefined && credentials !== null && typeof credentials.resolve === 'function') {
+        const resolved = await credentials.resolve(ref)
+        if (typeof resolved === 'string' && resolved !== '') return resolved
+        if (resolved !== null && typeof resolved === 'object' && typeof resolved.value === 'string' && resolved.value !== '') {
+          return resolved.value
+        }
+      }
+    } catch {
+      /* no credential service (headless) or an unconfigured ref: try the env */
+    }
+    const fromEnv = process.env[ref]
+    return typeof fromEnv === 'string' && fromEnv.trim() !== '' ? fromEnv.trim() : null
+  }
+
+  /** (Re)build the runtime for the current configuration. Never throws. */
+  const buildEmbeddingRuntime = () => {
+    try {
+      embeddingWorker?.dispose?.()
+    } catch {
+      /* ignore */
+    }
+    embeddingWorker = null
+    embeddingClient = null
+    if (!dbReady) return
+    try {
+      embeddingClient = createEmbeddingClient(config.vector, {
+        resolveSecret: resolveEmbeddingSecret,
+        metaGet: (key) => getMeta(getDb(), key),
+        metaSet: (key, value) => setMeta(getDb(), key, value),
+        log,
+      })
+      // The lexical provider keeps its vectors in `memory.vec`; there is nothing
+      // to backfill and no tag to prune.
+      if (embeddingClient.provider !== 'openai') return
+      embeddingWorker = createEmbeddingWorker({
+        db: getDb(),
+        getClient: () => (config.vector.enabled ? embeddingClient : null),
+        log,
+      })
+      embeddingWorker.note(500)
+      log('debug', `vector model: ${JSON.stringify(embeddingClient.describe())}`)
+    } catch (error) {
+      log('warn', `vector model disabled: ${messageOf(error)}`)
+      embeddingClient = null
+      embeddingWorker = null
+    }
+  }
+  buildEmbeddingRuntime()
+
+  ctx.effect(() => {
+    return () => {
+      try {
+        embeddingWorker?.dispose?.()
+      } catch {
+        /* ignore */
+      }
+    }
+  }, 'dsh-memory: vector model')
+
+  /**
+   * Embed one *query* for the semantic branch, or return null.
+   *
+   * Null means "run the lexical channel exactly as before": the built-in
+   * provider, a disabled vector branch, a model that is not ready, or an
+   * endpoint that failed. The pre-step awaits this once per turn; the client
+   * caps it at 5s and caches repeats.
+   *
+   * @param {string} text
+   * @returns {Promise<{ vector: Float32Array, model: string }|null>}
+   */
+  const queryVectorFor = async (text) => {
+    if (!config.vector.enabled) return null
+    const client = embeddingClient
+    if (client === null || client.provider !== 'openai' || client.available !== true) return null
+    const value = String(text ?? '').trim()
+    if (value === '') return null
+    // Nothing embedded yet: a round trip cannot change the result, and the first
+    // turn after enabling the model should not pay for it.
+    if (embeddingWorker !== null && embeddingWorker.hasVectors() !== true) return null
+    try {
+      const result = await client.embedOne(value)
+      if (result.ok !== true || result.vector === null) {
+        log('debug', `query embedding unavailable: ${result.error}`)
+        return null
+      }
+      const tag = client.tag
+      if (typeof tag !== 'string' || tag === '') return null
+      return { vector: result.vector, model: tag }
+    } catch (error) {
+      log('debug', `query embedding failed: ${messageOf(error)}`)
+      return null
+    }
+  }
+
+  /**
+   * Merge a query embedding into the recall options.
+   * @param {{ vector: Float32Array, model: string }|null} query
+   */
+  const recallVector = (query) =>
+    query === null ? config.vector : { ...config.vector, queryVector: query.vector, model: query.model }
+
+  /** Ask the backfill to look for new rows soon (cheap, coalesced). */
+  const nudgeEmbeddings = (delay) => {
+    try {
+      embeddingWorker?.note?.(delay)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Snapshot for the settings page: what the vector model is actually doing. */
+  const embeddingState = () => {
+    const client = embeddingClient
+    const worker = embeddingWorker?.state?.() ?? null
+    const described = client?.describe?.() ?? null
+    return {
+      enabled: config.vector.enabled,
+      provider: client?.provider ?? config.vector.provider,
+      model: client?.model || null,
+      dims: client?.dims ?? null,
+      dimsSource: client?.dimsSource ?? null,
+      tag: client?.tag ?? null,
+      endpoint: client?.endpoint || null,
+      available: client?.available === true,
+      keyRef: described?.keyRef ?? null,
+      embedded: worker?.counts?.embedded ?? 0,
+      pending: worker?.counts?.pending ?? 0,
+      total: worker?.counts?.total ?? 0,
+      lastError: worker?.lastError ?? (client?.available === false ? client?.error : null),
+    }
+  }
+
   /** Per-session turn accumulators + injection bookkeeping. */
   const sessions = new Map()
   const stateOf = (sessionId) => {
@@ -358,6 +511,9 @@ export function apply(ctx, rawConfig) {
               })
             : null
           if (saved?.inserted) log('debug', `captured turn ${state.turn} as #${saved.id}`)
+          // The captured episode is a memory row like any other; give a
+          // configured vector model a chance to embed it (coalesced, async).
+          if (saved?.inserted) nudgeEmbeddings(1_500)
           if (config.layers.l0) {
             const appended = appendTurn(getDb(), {
               sessionId: session.id,
@@ -451,6 +607,11 @@ export function apply(ctx, rawConfig) {
       // Lexical halves need text to match against. A turn without any human text
       // (attachment-only, command) still gets the stable half above and stops here.
       if (query !== '') {
+        // One embedding for both recall passes: the global channel and the
+        // project channel ask the same question. Null (built-in model, disabled
+        // branch, failed endpoint) means "use the lexical channel".
+        const semanticQuery = await queryVectorFor(query)
+        const vectorOptions = recallVector(semanticQuery)
         // Global preferences: re-checked *every* turn, not once per session. The
         // old once-per-session latch meant a first turn like「你好啊」（zero lexical
         // overlap）closed the channel for the whole session. Rows already shown
@@ -462,7 +623,7 @@ export function apply(ctx, rawConfig) {
             maxItems: 3,
             maxChars: Math.max(200, Math.floor(config.maxChars / 3)),
             minScore: config.minScore,
-            vector: config.vector,
+            vector: vectorOptions,
           })
           if (globals.items.length > 0) {
             // Drop rows already rendered in the stable block (a pinned preference
@@ -486,7 +647,7 @@ export function apply(ctx, rawConfig) {
           maxItems: config.maxItems,
           maxChars: config.maxChars,
           minScore: config.minScore,
-          vector: config.vector,
+          vector: vectorOptions,
         })
         const fresh = hits.items.filter((row) => !rendered.has(row.id))
         if (fresh.length > 0) {
@@ -556,13 +717,17 @@ export function apply(ctx, rawConfig) {
         execute: async (args, exec) => {
           const scope = args?.scope === 'global' || args?.scope === 'all' ? args.scope : 'project'
           const limit = Math.max(1, Math.min(20, Number(args?.limit ?? 8)))
-          const result = recall(getDb(), String(args?.query ?? ''), {
+          const query = String(args?.query ?? '')
+          // A tool call may wait for one round trip: recall quality beats the
+          // few hundred milliseconds, and `null` still falls back to lexical.
+          const semanticQuery = await queryVectorFor(query)
+          const result = recall(getDb(), query, {
             scope: scope === 'all' ? 'all' : scope,
             project: projectFromExec(exec),
             maxItems: limit,
             maxChars: 6000,
             minScore: 0,
-            vector: config.vector,
+            vector: recallVector(semanticQuery),
           })
           if (result.items.length === 0) return { text: 'no memory found' }
           const lines = result.items.map(
@@ -623,6 +788,9 @@ export function apply(ctx, rawConfig) {
             scope === 'global' && args?.pinned !== true
               ? ' — global = visible in every project; add pinned=true if it must apply to every reply'
               : ''
+          // A configured model needs a vector for this row before it can be
+          // recalled semantically; ask the backfill instead of blocking the save.
+          nudgeEmbeddings(200)
           return { text: `${result.inserted ? 'saved' : 'updated'} memory #${result.id} (${scope})${hint}` }
         },
       }),
@@ -663,11 +831,20 @@ export function apply(ctx, rawConfig) {
           const kinds = Object.entries(s.byKind)
             .map(([kind, count]) => `${kind}:${count}`)
             .join(',')
+          // A configured model has its own coverage counter: `vec=` is the
+          // built-in lexical vector and stays at 100%, `sem=` is the model.
+          const vector = embeddingState()
+          const sem =
+            vector.provider === 'openai'
+              ? ` sem=${vector.embedded}/${vector.total}` +
+                (vector.tag === null ? '' : ` model=${vector.tag}`) +
+                (vector.lastError === null ? '' : ` semError=${JSON.stringify(String(vector.lastError).slice(0, 80))}`)
+              : ''
           return {
             text:
               `memories=${s.total} facts=${s.facts} episodes=${s.episodes} superseded=${s.superseded} ` +
               `kinds={${kinds}} l0=${s.l0Pending}/${s.l0Total} scenes=${s.scenes} personas=${s.personas} ` +
-              `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath} settings=${settingsPath}`,
+              `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total}${sem} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath} settings=${settingsPath}`,
           }
         },
       }),
@@ -854,7 +1031,7 @@ export function apply(ctx, rawConfig) {
           scheduled: pipeline !== null,
         },
         skills: { enabled: config.skills.enabled, dir: config.skills.dir },
-        vector: { enabled: config.vector.enabled },
+        vector: embeddingState(),
       },
       groups: buildGroups(effective, config, loaderRaw, storedSettings),
     }
@@ -895,10 +1072,12 @@ export function apply(ctx, rawConfig) {
     storedSettings = nextStored
     settingsError = null
     const { applied, restartRequired } = applyLiveConfig(config, next)
-    // These two copy their values at construction (see src/pipeline.js,
-    // src/scheduler.js); everything else reads the shared config object.
+    // These three copy their values at construction (see src/pipeline.js,
+    // src/scheduler.js, src/embedding.js); everything else reads the shared
+    // config object.
     pipeline?.refresh()
     scheduler?.configure({ everyN: config.extraction.everyN, idleMs: config.extraction.idleMs })
+    buildEmbeddingRuntime()
     return { state: createState(), applied, unset: unset.keys, restartRequired }
   }
 
@@ -938,6 +1117,7 @@ export function apply(ctx, rawConfig) {
     const { applied, restartRequired } = applyLiveConfig(config, next)
     pipeline?.refresh()
     scheduler?.configure({ everyN: config.extraction.everyN, idleMs: config.extraction.idleMs })
+    buildEmbeddingRuntime()
     return { state: createState(), applied, restartRequired, reset: true }
   }
 
@@ -964,11 +1144,42 @@ export function apply(ctx, rawConfig) {
       save: (payload) => saveSettings(payload),
       reset: (payload) => resetSettings(payload),
       reveal: () => revealStorage(),
+      // Diagnostics for the vector model: one real request, so a wrong URL, a
+      // wrong key and a wrong width are distinguishable from the page (or a CLI
+      // curl) instead of only showing up as "semantic recall finds nothing".
+      embeddingTest: async () => {
+        const client = embeddingClient
+        if (client === null) throw new MemoryApiError('not-ready', 'the vector model is not initialized')
+        if (client.provider !== 'openai') {
+          return { ok: true, provider: 'hash', model: null, dims: client.dims, dimsSource: client.dimsSource, tag: client.tag, endpoint: null, ms: 0, error: null }
+        }
+        const started = Date.now()
+        const probed = await client.probe()
+        return {
+          ok: probed.ok === true,
+          provider: client.provider,
+          model: client.model,
+          dims: probed.ok === true ? probed.dims : client.dims,
+          dimsSource: client.dimsSource,
+          tag: client.tag,
+          endpoint: client.endpoint,
+          ms: probed.ms ?? Math.max(0, Date.now() - started),
+          error: probed.error ?? null,
+        }
+      },
       // Settings → Memory → 记忆数据: the row-level CRUD surface.
       memories: (payload) => listMemories(requireDb(), payload),
       memory: (payload) => getMemory(requireDb(), payload?.id),
-      memoryCreate: (payload) => createMemory(requireDb(), payload),
-      memoryUpdate: (payload) => updateMemory(requireDb(), payload),
+      memoryCreate: (payload) => {
+        const created = createMemory(requireDb(), payload)
+        nudgeEmbeddings(200)
+        return created
+      },
+      memoryUpdate: (payload) => {
+        const updated = updateMemory(requireDb(), payload)
+        nudgeEmbeddings(200)
+        return updated
+      },
       memoryDelete: (payload) => deleteMemories(requireDb(), payload),
     },
     admits: (req) => {
@@ -1006,5 +1217,10 @@ export function apply(ctx, rawConfig) {
     log('warn', `settings api not mounted: ${messageOf(error)}`)
   }
 
-  log('debug', `loaded (db=${config.dbPath}, maxItems=${config.maxItems}, scope=${config.scope})`)
+  const loadedVector = embeddingState()
+  log(
+    'debug',
+    `loaded (db=${config.dbPath}, maxItems=${config.maxItems}, scope=${config.scope}, ` +
+      `vector=${loadedVector.provider}${loadedVector.tag === null ? '' : `:${loadedVector.tag}`})`,
+  )
 }

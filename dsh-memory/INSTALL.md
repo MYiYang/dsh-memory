@@ -2,7 +2,7 @@
 
 给 **DeepSeek Harness (dsh)** 加分层跨会话记忆的本地插件。一个包同时带 **4 个 dsh 技能**（`dsh-plugin-dev`、`memory-curator`、`repo-audit`、`windows-pwsh-ops`），装一次两样都有。
 
-零外部依赖：存储用 Node 自带的 `node:sqlite`（FTS5），向量是进程内 384 维**词法**特征哈希，不需要 Docker / Redis / 向量库 / embedding API，也不联网。
+零外部依赖：存储用 Node 自带的 `node:sqlite`（FTS5），向量默认是进程内 384 维**词法**特征哈希，不需要 Docker / Redis / 向量库 / embedding API，也不联网；只有在设置里显式配置外部向量模型后才会请求你填的那个接口。
 
 - 插件做什么、参数与评测数据：见 [README.md](README.md)
 - 设计细节：见 [DESIGN-v2.md](DESIGN-v2.md)
@@ -36,7 +36,7 @@
 
 1. 打开 dsh Web，左侧边栏 →「**插件**」；
 2. 页头按钮「**添加插件**」（或箭头「选择添加插件方式」→「安装第三方插件」），打开安装对话框；
-3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.7.0`），回车；
+3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.8.0`），回车；
    - 对话框也接受 **Git 地址、压缩包 URL、本地绝对路径**；
    - 安装进度对话框里可以「查看安装任务」「取消安装」；
 4. 等它跑完 → **重启 DSH**。
@@ -57,7 +57,7 @@ dsh plugin --profile web add dsh-memory-layered
 
 | spec 形式 | 例子 |
 | --- | --- |
-| registry 包名（可带版本/标签） | `dsh-memory-layered@0.7.0` |
+| registry 包名（可带版本/标签） | `dsh-memory-layered@0.8.0` |
 | git https 地址 | `https://github.com/<you>/<repo>` |
 | tarball URL | `https://github.com/<you>/<repo>/releases/download/v<ver>/dsh-memory-layered-<ver>.tgz` |
 | 本地目录 | `file:F:\path\to\dsh-memory` 或 `link:F:\path\to\dsh-memory` |
@@ -76,7 +76,7 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "dsh-memory-layered": "^0.7.0"
+    "dsh-memory-layered": "^0.8.0"
   },
   "dsh": {
     "profile": {

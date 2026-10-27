@@ -8,11 +8,11 @@
 - **L1 原子事实**：按 warm-up 阈值异步调用 LLM 抽取，带 kind / priority / version / 冲突消解（store / update / merge / skip）；
 - **L2 场景块**：把同类事实归并成 Markdown 场景（summary + heat + 热度衰减），生成「场景导航」；
 - **L3 画像**：项目画像 + 跨项目全局画像（偏好/约定/决策/环境），由 JEV-lite 判决门控，只在值得时重写；
-- **召回**：稳定段（画像 + 场景导航，每会话一次）+ 动态段（本轮命中的 L1 事实）两段注入；检索是 **FTS5 + 本地 384 维词法向量** 的混合（倒排特征预筛 + 精确余弦，无需 embedding 服务）；
+- **召回**：稳定段（画像 + 场景导航，每会话一次）+ 动态段（本轮命中的 L1 事实）两段注入；检索是 **FTS5 + 向量** 的混合（倒排特征预筛 + 精确余弦）。向量默认是**本地 384 维词法向量**（无需 embedding 服务），也可以在设置里换成任意 OpenAI 兼容的嵌入模型（见 [向量模型](#向量模型可选)）；
 - **工具**：`memory_search` / `memory_save` / `memory_forget` / `memory_stats` / `memory_extract`。
 
-零外部依赖：存储用 Node 自带 `node:sqlite`（FTS5 + trigram），向量是进程内 **feature hashing**（字符 n-gram + 英文词，384 维 Float32），
-不需要 Redis / Docker / 向量库，也不需要 embedding API。设计文档见 [DESIGN-v2.md](DESIGN-v2.md)。
+零外部依赖：存储用 Node 自带 `node:sqlite`（FTS5 + trigram），默认向量是进程内 **feature hashing**（字符 n-gram + 英文词，384 维 Float32），
+不需要 Redis / Docker / 向量库，也不需要 embedding API；只有你显式配置外部向量模型时才会联网。设计文档见 [DESIGN-v2.md](DESIGN-v2.md)。
 
 ## 它做什么
 
@@ -56,7 +56,7 @@
 
 在 profile patch 里覆盖；**patch 的 config 是整行替换、不深合并**，要覆盖就写全：
 
-> 运行时改参数不用改这里：装好后 **设置 → 记忆** 能改同一批 46 个参数并立即生效（5 个字段要重启），优先级 默认 < YAML < 设置页。详见 [设置页（记忆）](#设置页记忆)。
+> 运行时改参数不用改这里：装好后 **设置 → 记忆** 能改同一批 53 个参数并立即生效（5 个字段要重启），优先级 默认 < YAML < 设置页。详见 [设置页（记忆）](#设置页记忆)。
 
 ```yaml
 - id: memory
@@ -103,9 +103,16 @@
       global: true              # 额外维护跨项目全局画像（只吃 global 事实）
     vector:
       enabled: true             # 关掉就只用 FTS/LIKE
+      provider: hash            # hash = 内置词法（默认，零依赖）；openai = 上面配的嵌入接口
+      model: ''                 # 如 text-embedding-3-small / bge-m3 / nomic-embed-text
+      dims: 0                   # 0 = 自动：模型表 → 探测缓存 → 现场探测一次
+      baseUrl: ''               # 留空 = https://api.openai.com/v1（自动补 /embeddings）
+      apiKeyRef: ''             # 环境变量名（经 DSH 凭据解析）；不像标识符按字面密钥
+      minCosine: 0.5            # 语义召回下限（bge/nomic 约 0.45–0.55，OpenAI 约 0.7）
+      timeoutMs: 5000           # 单次嵌入超时；查询侧最多等 5 秒
       weight: 0.1               # 向量分权重（实测 0.2+ 会掉点，默认 0.1）
-      scanLimit: 2000           # 预筛没有命中时的有界兜底扫描行数
-      prefilter: true           # 倒排特征索引预筛（memory_features）
+      scanLimit: 2000           # 语义通道的有界扫描行数 / 词法预筛没命中时的兜底行数
+      prefilter: true           # 倒排特征索引预筛（memory_features，仅内置词法向量）
       featureLimit: 96          # 预筛查询侧最多用多少个特征（存储固定 96/条）
     skills:
       enabled: true             # 关掉就不注册包内技能
@@ -127,12 +134,12 @@
 | 存储位置 | 存储目录 + 复制路径 + 打开目录；目录里的文件（名称、体积、修改时间）与数据库体积；「当前数据库路径」（运行中的库）与「设置文件路径」（还没创建时标「尚未创建」） |
 | 统计 | 记忆总数、事实、片段、待提炼、场景、人设、词元消耗 |
 | 记忆数据 | 一行摘要 + **管理数据** 按钮：弹窗里直接对记忆条目做搜索 / 新增 / 编辑 / 删除（见下节） |
-| 参数 | 8 张分组卡（合计 46 项），每行「标题 + 说明 + 控件 + 来源徽标（默认/YAML/设置页）+ 未保存徽标 + 重启生效徽标 + 行内恢复默认」 |
+| 参数 | 8 张分组卡（合计 53 项），每行「标题 + 说明 + 控件 + 来源徽标（默认/YAML/设置页）+ 未保存徽标 + 重启生效徽标 + 行内恢复默认」 |
 | 操作条 | 页头「刷新」；有改动时出现「保存（n）」「撤销」；常驻「恢复 YAML 基线」 |
 
 ### 能改什么
 
-46 个字段分 8 组，组的顺序就是页面上的顺序：
+53 个字段分 8 组，组的顺序就是页面上的顺序：
 
 | 分组 | 代表字段（`key`） | 管什么 |
 | --- | --- | --- |
@@ -141,7 +148,7 @@
 | `extraction`（提炼） | `extraction.enabled` `extraction.everyN` `extraction.idleMs` `extraction.maxInputChars` `extraction.maxMemories` `extraction.maxAttempts` `extraction.timeoutMs` `extraction.maxTokens`、`extraction.provider` `extraction.model` | 抽取节奏、单批上限、LLM 预算与路由 |
 | `scenes`（场景） | `scenes.enabled` `scenes.minFacts` `scenes.maxScenes` `scenes.halfLifeDays` | L2 场景归并与热度淘汰 |
 | `persona`（人设） | `persona.enabled` `persona.global` `persona.triggerEveryN` `persona.maxChars` `persona.targetChars` `persona.globalTargetChars` `persona.personaMaxTokens` `persona.personaTimeoutMs` `persona.personaReasoningEffort` | L3 画像（项目 + 全局）的节奏与长度 |
-| `vector`（向量） | `vector.enabled` `vector.weight` `vector.scanLimit` `vector.prefilter` `vector.featureLimit` | 词法向量召回 |
+| `vector`（向量） | `vector.enabled` `vector.provider` `vector.model` `vector.dims` `vector.baseUrl` `vector.apiKeyRef` `vector.minCosine` `vector.timeoutMs` `vector.weight` `vector.scanLimit` `vector.prefilter` `vector.featureLimit` | 向量模型（内置词法 / 外部嵌入）、语义阈值与混排权重 |
 | `storage`（存储） | `storage.dbPath` | 数据库路径（重启才生效） |
 | `advanced`（高级） | `debug`、`skills.enabled` `skills.dir` | 调试开关、包内技能注册 |
 
@@ -166,7 +173,7 @@
 
 ### 保存是立即生效还是重启
 
-- **立即生效**（`live:true`，46 个里 41 个）：保存时直接改插件内存里那份 config —— 召回、捕获、工具都闭包读同一个对象，下一次触发就用新值；抽取节奏额外通过 `pipeline.refresh()` 与 `scheduler.configure()` 同步到已创建的对象上。已排队的 idle 定时器保留原延迟，下一轮结束才按新值重新计时（保存时清掉它会丢掉这次兜底触发）。
+- **立即生效**（`live:true`，53 个里 48 个）：保存时直接改插件内存里那份 config —— 召回、捕获、工具都闭包读同一个对象，下一次触发就用新值；抽取节奏额外通过 `pipeline.refresh()` 与 `scheduler.configure()` 同步到已创建的对象上。已排队的 idle 定时器保留原延迟，下一轮结束才按新值重新计时（保存时清掉它会丢掉这次兜底触发）。
 - **需要重启**（`live:false`，保存响应里的 `restartRequired` 会列出来，行上也有「重启生效」徽标）：
 
 | key | 为什么必须重启 |
@@ -184,7 +191,7 @@
 ### 配置优先级
 
 ```text
-resolveConfig 内置默认值（46 个字段各一份）
+resolveConfig 内置默认值（53 个字段各一份）
   < profile 的 cordis.patch.yml（loader 行 config）
     < $DSH_HOME/memory/settings.json（设置页写的）
 ```
@@ -197,7 +204,7 @@ resolveConfig 内置默认值（46 个字段各一份）
 
 | 文件 | 位置 | 说明 |
 | --- | --- | --- |
-| 数据库 | `$DSH_HOME/memory/memory.db`（缺省 `~/.dsh/memory/memory.db`，可用 `storage.dbPath` 改） | schema v4、WAL 模式；同目录还有 `-wal` / `-shm` |
+| 数据库 | `$DSH_HOME/memory/memory.db`（缺省 `~/.dsh/memory/memory.db`，可用 `storage.dbPath` 改） | schema v5、WAL 模式；同目录还有 `-wal` / `-shm` |
 | 设置文件 | `$DSH_HOME/memory/settings.json` | **固定**在这个目录，与 `storage.dbPath` 无关——否则「把库挪到别处」这条设置会把自己弄丢；删掉即回基线 |
 | 技能 | 包内 `skills/`（`skills.dir` 可改） | 加载时注册进宿主，不落盘 |
 
@@ -228,9 +235,10 @@ resolveConfig 内置默认值（46 个字段各一份）
 
 | 端点 | 请求体 | 响应 `value` 要点 |
 | --- | --- | --- |
-| `POST /memory/api/state` | `{}` | `plugin{name,version,dbReady,startedAt}`、`storage{home,dir,dbPath,settingsPath,settingsExists,files[],totalBytes,error}`、`stats{total,facts,episodes,superseded,projects,byKind,l0Total,l0Pending,scenes,personas,vectorized,featureIndexed,tokensSpent,dbBytes}`、`runtime{extraction{available,provider,model,scheduled},skills{enabled,dir},vector{enabled}}`、`groups[].fields[]` |
+| `POST /memory/api/state` | `{}` | `plugin{name,version,dbReady,startedAt}`、`storage{home,dir,dbPath,settingsPath,settingsExists,files[],totalBytes,error}`、`stats{total,facts,episodes,superseded,projects,byKind,l0Total,l0Pending,scenes,personas,vectorized,featureIndexed,tokensSpent,dbBytes}`、`runtime{extraction{available,provider,model,scheduled},skills{enabled,dir},vector{enabled,provider,model,dims,dimsSource,tag,endpoint,available,keyRef,embedded,pending,total,lastError}}`、`groups[].fields[]` |
 | `POST /memory/api/save` | `{"patch":{"recall.maxItems":8},"unset":["scenes.maxScenes"]}` | `{state, applied[], unset[], restartRequired[]}` |
 | `POST /memory/api/reset` | `{}` 或 `{"keys":["recall.maxItems"]}`（省略 `keys` = 全部） | `{state, applied[], restartRequired[], reset:true}` |
+| `POST /memory/api/embeddingTest` | `{}` | `{ok,provider,model,dims,dimsSource,tag,endpoint,ms,error}`：**真发一次嵌入请求**，用来区分「地址错 / key 错 / 维度错」；`provider=hash` 时不联网，直接回 384 |
 | `POST /memory/api/reveal` | `{}` | `{opened,dir,error?}`：在系统文件管理器里打开**数据库所在目录**（Windows `explorer.exe`、macOS `open`、其他 `xdg-open`）；spawn 本身失败才回 `opened:false`，文件管理器异步启动失败只记日志 |
 | `POST /memory/api/memories` | `{query?,kind?,scope?,project?,includeSuperseded?,sort?,page?,pageSize?}` | 一页记忆 + 下拉筛选数据：`{items[],total,page,pageSize,pages,sort,includeSuperseded,facets{kinds[],scopes[],projects[],total}}`；`query` 是子串搜索（LIKE，2 字中文也能命中）；默认隐藏 `superseded_by` 非空的行，`includeSuperseded:true` 才带出来；`sort ∈ updated\|created\|priority\|id`，`pageSize` 上限 100 |
 | `POST /memory/api/memory` | `{id}` | `{item,history[]}`：单行 + 最近 10 条旧正文（`version/op/text/createdAt`） |
@@ -283,6 +291,55 @@ resolveConfig 内置默认值（46 个字段各一份）
 - **弹窗用 portal 挂到 `<body>`**：设置面板可能处于滚动/变换容器里，`react-dom` 可用时用 `createPortal`，不可用时退化为 `position:fixed`。
 
 > 改完一条，页面顶部的统计卡会重新拉 `state`，计数立刻更新；弹窗自己的列表也会按当前筛选/页码重读。
+
+## 向量模型（可选）
+
+> 一句话：**不配就用内置词法（默认），配了就用你指定的模型**；配置只影响「语义」那一路，词法那一路永远在，模型挂了也不会让召回全废。
+
+### 不配置（默认）
+
+`vector.provider: hash`，走 `src/vector.js` 的 384 维 feature hashing：进程内计算，不联网、不需要 key、不增加启动耗时，老数据继续命中。它编码的是**字词重叠**（字符 2/3/4-gram + 英文词），不理解同义词。
+
+### 配置成外部模型
+
+设置 → 记忆 → 向量：
+
+| 字段 | 填什么 | 例子 |
+| --- | --- | --- |
+| `vector.provider` | `openai` = OpenAI 兼容的 `/embeddings` | `openai` |
+| `vector.model` | 模型名 | `text-embedding-3-small` / `BAAI/bge-m3` / `nomic-embed-text:latest` |
+| `vector.dims` | `0` = 自动；填了就当**声明/校验** | 自动 / `1536` |
+| `vector.baseUrl` | 兼容地址，含 `/v1`；不以 `/embeddings` 结尾会自动补 | `http://127.0.0.1:11434/v1` |
+| `vector.apiKeyRef` | 环境变量名（经 DSH 凭据解析）；不像标识符的值按字面密钥（会明文进 settings.json） | `OPENAI_API_KEY` |
+| `vector.minCosine` | 语义召回下限（模型相关） | bge/nomic `0.5`，OpenAI `0.7` |
+| `vector.timeoutMs` | 单次请求超时 | `5000` |
+
+维度解析顺序（`vector.dims = 0` 时）：**内置模型维度表 → 库内探测缓存 → 现场探测一次**（把探测结果写回缓存）。已知表覆盖 `text-embedding-3-*`、`ada-002`、`bge-*`、`nomic-embed-text`、`mxbai-embed-large`、`all-minilm`、`jina-embeddings-v*`、`text2vec`、`m3e-*`、`gte-*`、`text-embedding-v*` 等；表里没有的模型会在第一次调用时按返回长度自动确定。返回长度与声明维度不一致 → `dimension-mismatch`，不写库也不静默截断。
+
+> `dimensions` 请求参数**不发送**：OpenAI `text-embedding-3-*` 支持截断，但多数兼容服务会 400。所以 `vector.dims` 只做声明与校验，不改模型输出宽度。
+
+### 它怎么跑起来
+
+- **写入不等待**：保存记忆仍然是同步的（照旧写 `memory.vec` 词法向量），外部模型的向量由后台 worker 分批补齐（32 条/请求、256 行/轮），失败按 5s→10s→…→5min 退避。刚保存的条目在几秒内即可被语义召回。
+- **查询一次**：每轮 pre-step 把用户这句话嵌入一次（最多等 5 秒，最近 32 条文本有缓存）；失败就退回词法，日志 debug 一行，不打断回合。
+- **召回**：语义通道按 `vector.scanLimit`「从新到旧」有界扫一遍（无语义意义的字面预筛在这里会漏，所以不用倒排），`cos >= minCosine` 才算候选；分数归一为 `(cos - minCosine) / (1 - minCosine)`，再按 `vector.weight` 混进原打分。
+- **存储**：`memory_embeddings(memory_id, model, dims, text_hash, vec)`，`model` 是 tag（如 `openai:text-embedding-3-small@1536`）。换模型/改维度 ⇒ 新 tag ⇒ 旧行不再参与打分；**新模型跑通后**才清掉旧 tag 并重算（配错了不会毁掉原来那份），正文被改（`hash` 变）也会重算。
+
+### 降级矩阵
+
+| 情况 | 结果 |
+| --- | --- |
+| 没配 / 配回 `hash` | 完全等于旧行为，零网络请求 |
+| `model` 为空、key 缺失（401/403）、5xx、超时 | 语义通道不可用，召回走词法；设置页统计下方显示最后一条错误 |
+| 维度无法解析 | 同上，直到把 `vector.dims` 或服务修好 |
+| 数据库被旧版插件打开 | 新表不存在时所有语义访问直接跳过，插件照常工作 |
+
+### 成本与排障
+
+- 1 万条记忆、32 条/请求 ≈ 313 次回填请求；1536 维 ≈ 6 KB/行，只保留当前 tag。
+- 每次召回会临时读最多 `vector.scanLimit` 行向量（2000 × 1536 × 4B ≈ 12 MB 上限，打分后丢弃）；语料很大时把这个数调小。
+- `memory_stats` 的 `sem=x/y model=<tag>` 是覆盖率；`POST /memory/api/embeddingTest` 会真发一次请求，返回 `{ ok, dims, model, tag, endpoint, ms, error }`——用它区分「地址错、key 错、维度错」。
+- 详细设计取舍见 [ANALYSIS-vector-model.md](ANALYSIS-vector-model.md)。
 
 ## 工具
 
@@ -400,6 +457,9 @@ agent/pre-step（每轮首 step）
 | `memory_stats` 的 `vec=` 小于总数 | 旧行还没回填（每次 open 最多补 500 行）或写入路径没跑 v3 | 重启一次让它继续回填；或 `enabled: false` 临时关掉向量 |
 | `memory_stats` 的 `feat=` 小于总数 | 特征索引还在渐进补建（每次 open 最多 500 行） | 重启一次继续；不影响召回，未索引行仍走有界兜底 |
 | 向量把不相关记忆排上来 | 词法哈希碰撞或权重过高 | 调低 `vector.weight`（如 0.2）或 `enabled: false` |
+| 配了向量模型但召回没变化 | 模型没就绪（key/地址/维度），或语料还没回填完 | 看设置页「统计」下那行的「已嵌入 x/y」与红字错误；`POST /memory/api/embeddingTest` 真发一次请求；`memory_stats` 看 `sem=` |
+| 语义召回把不相关记忆排上来 | `vector.minCosine` 对该模型太低（OpenAI 系整体分偏高） | 调高 `minCosine`（OpenAI 约 0.7，bge/nomic 约 0.5）或调低 `vector.weight` |
+| 回填很慢 / 日志刷 `embedding backfill failed` | 接口不可用或限流，worker 正在按 5s→5min 退避 | 修好 key/地址后保存一次设置即可 `refresh`；或临时切回 `vector.provider: hash` |
 
 ## 开发与测试
 
@@ -407,7 +467,7 @@ agent/pre-step（每轮首 step）
 
 ```powershell
 cd dsh-memory
-# 全量：214 项，0 fail（settings 32 项 + 记忆数据 CRUD 18 项）
+# 全量：265 项，0 fail（含 embedding / embedding-store / embed-worker / 语义召回 / 端到端语义注入 / 设置页渲染）
 node --test --test-isolation=none (Get-ChildItem .\test\*.test.js | ForEach-Object FullName)
 # 单文件
 node test/recall.test.js
@@ -417,7 +477,10 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 
 模块：
 
-- `src/store.js` — schema v1→v4 迁移、memory 表、FTS、meta、stats、向量/特征索引回填
+- `src/store.js` — schema v1→v5 迁移、memory 表、FTS、meta、stats、向量/特征索引回填
+- `src/embedding.js` — 向量模型运行时（内置词法 / OpenAI 兼容嵌入、维度解析、tag、查询缓存）
+- `src/embedding-store.js` — `memory_embeddings` 表（按 tag 读写、pending、有界语义扫描、计数、级联删除）
+- `src/embed-worker.js` — 语义向量后台回填（分批、退避、换模型清旧 tag）
 - `src/vector.js` — 384 维词法向量（feature hashing、pack/unpack、cosine）
 - `src/feature-index.js` — 倒排特征索引（向量预筛、df 探测、渐进补建）
 - `src/l0.js` — L0 原文、游标、pending、transcript 预算
@@ -430,7 +493,7 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 - `src/consolidate.js` — 场景归并、画像重写（项目/全局）、JEV-lite 判决
 - `src/recall.js` — 查询词、FTS/LIKE + 倒排预筛 + 向量混合打分、稳定/动态注入块
 - `src/capture.js` — v1 episode 捕获（兼容保留）
-- `src/settings.js` — 字段目录（46 个 key）、`resolveConfig` 归一化、校验/深合并/来源、原地应用
+- `src/settings.js` — 字段目录（53 个 key）、`resolveConfig` 归一化、校验/深合并/来源、原地应用
 - `src/settings-store.js` — `settings.json` 读写（原子替换、损坏隔离）、存储目录描述
 - `src/data.js` — 记忆条目 CRUD（分页/筛选、hash 冲突、版本历史、向量与特征重算）
 - `src/api.js` — `POST /memory/api/*` 路由（POST-only、64 KB 上限、稳定错误码）
@@ -440,9 +503,10 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 
 ## 限制与后续
 
-- 向量是**词法向量**（字符 n-gram hashing），不是语义 embedding：同义词、跨语言改写仍然召回不到；
-  要语义得接真的 embedding 服务（dsh 目前没有），或用 LLM 做查询扩展。
-- 向量召回已改为「倒排特征索引预筛 → 精确余弦 → 有界兜底」，不再对整表暴力扫描。
+- 默认向量是**词法向量**（字符 n-gram hashing），不是语义 embedding：同义词、跨语言改写仍然召回不到；
+  要语义就在设置里配一个 OpenAI 兼容的嵌入模型（见 [向量模型](#向量模型可选)）——dsh 内核本身没有 embedding 服务，这条路是插件自己发 HTTP。
+- 语义通道**不做 ANN**：每次召回按 `vector.scanLimit` 有界扫描 + 精确余弦，万级语料足够；更大规模要么调小扫描窗口，要么换方案。
+  词法通道仍是「倒排特征索引预筛 → 精确余弦 → 有界兜底」。
   **没有引入 LSH/ANN**：向量本身就是词法哈希，倒排预筛对真实字词重叠是无损的（哈希碰撞只影响候选排序，最终分仍是精确 cosine），
   ANN 的近似误差在这个特征空间没有收益。代价：`memory_features` 约 +0.3–1 KB/条；大库升级后每次 open 补 500 行，
   未补齐的行仍由兜底扫描覆盖。2 字中文/短拉丁查询的 LIKE 兜底仍是全表扫描（10k 行约百毫秒级），是下一步可优化项。

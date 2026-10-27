@@ -23,7 +23,7 @@
 ### 不做（v2 明确排除）
 
 - **语义 embedding**：dsh 没有 embedding 服务，v2 先用本地 **384 维词法向量（feature hashing）** 做混合召回；
-  真正的语义向量留给后续（见 §18/§19）。
+  真正的语义向量留给后续（见 §18/§19）。**v0.8.0 已补上可选的 OpenAI 兼容嵌入模型，见 §26。**
 - 多租户团队共享（Team/Agent ACL）：单机单用户。
 - 腾讯的 Offload（上下文压缩）、Skill、Wiki、CodeGraph：不在本插件范围。
 - 原文级 L0 全量消息（含 tool 输出）：只存 user/assistant 文本 + 工具名，避免 tool 输出撑爆库。
@@ -78,7 +78,7 @@ agent/pre-step（每轮首 step）
 
 ---
 
-## 4. 数据模型（SQLite，schema v4）
+## 4. 数据模型（SQLite，schema v4；v5 追加 `memory_embeddings`，见 §26）
 
 ### 4.1 L0
 
@@ -1202,3 +1202,48 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:<port>/memory/api/reset -Co
 
 > 已知限制：会话里没有浏览器控制能力，无法替用户点击真实 GUI；真实宿主的路由受连接信任闸门保护（CLI 无 cookie → 403），
 > 因此端到端证据由「真实 apply() + 真实 POST 穿过 handler」的路由测试承担，客户端由真实 React 的浏览器渲染承担。
+---
+
+## 26. v0.8.0：可配置向量模型（2026-10-27，源码）
+
+完整分析见 [ANALYSIS-vector-model.md](ANALYSIS-vector-model.md)，这里只记决策与证据。
+
+### 26.1 需求
+
+设置页能配置向量模型；不配 = 今天的内置词法；配了 = 走配置的模型；维度可填，也可从模型读默认。
+
+### 26.2 关键决策
+
+| 决策 | 取舍 |
+| --- | --- |
+| **独立 `memory_embeddings` 表**，不接管 `memory.vec` | `vec` 只有一个 `vec_model` 取值，混入不同模型/维度会互串；独立表让「换模型 = 换 tag」，无需迁移、可随时回退 |
+| **写入路径保持同步**，外部向量由后台 worker 补 | `saveMemory`/`createMemory`/`l1` 三处都是同步调用，改成 async 会波及工具链与全部测试；异步补齐把「网络慢/挂」隔离成召回质量问题 |
+| **`recall()` 保持同步**，查询向量由 pre-step 算好传入 | 只有查询侧需要一次 HTTP；在 async 的 pre-step 里 await 一次，比把 `recall` 改成 async 的改动面小一个数量级 |
+| **绝对阈值 + 线性归一** `(cos-floor)/(1-floor)` | 不做按批 min-max：同一行不该因为别的候选加入而改变分数；代价是 `minCosine` 必须按模型家族调 |
+| **不发送 `dimensions` 参数** | 多数 OpenAI 兼容服务会 400；`vector.dims` 只做声明与校验 |
+| **维度 tag 化** `openai:<model>@<dims>` | 改维度也必须让旧行失效，否则会把不可比的向量混算 |
+| **语义通道不用倒排预筛** | 倒排按字词重合提名，正好漏掉语义匹配；改为 `scanLimit` 有界扫描（与词法兜底同一取舍） |
+
+### 26.3 新增/改动模块
+
+- `src/embedding.js` — 模型运行时：`hash`（内置）与 `openai`（兼容接口）两种实现，维度解析（配置 → 模型表 → 探测缓存 → 现场探测）、tag、密钥引用解析（`ctx.credentials` → `process.env` → 字面值）、查询缓存、L2 归一化、永不抛错。
+- `src/embedding-store.js` — `memory_embeddings(memory_id, model, dims, text_hash, vec, created_at)`（`WITHOUT ROWID` + 删除触发器）、pending 查询（`text_hash <> memory.hash` 即过期）、按 tag 取向量、有界语义扫描、计数、清其它模型。
+- `src/embed-worker.js` — 32 条/请求、256 行/轮、失败指数退避（5s→5min）、换 tag 清旧行、`unref` 定时器、`drainOnce()` 可测。
+- `src/recall.js` — 语义分支（提名 + `minCosine` + 归一打分）、`strategy` 增加 `+sem`；词法分支一字未改。
+- `src/settings.js` — 7 个新字段（全部 `live:true`），`resolveConfig` 默认 `provider: 'hash'` / `dims: 0`。
+- `index.js` — 模型运行时的构建/重建、pre-step 与 `memory_search` 的查询嵌入、写入后的 nudge、`runtime.vector` 状态、`embeddingTest` 诊断端点、`memory_stats` 的 `sem=`。
+- `src/store.js` — `SCHEMA_VERSION` 4→5，`ensureEmbeddingSchema`。
+- `client.js` — 新字段的中英词典、统计卡下的「向量模型」状态行（含最后一条错误）。
+
+### 26.4 验证证据（2026-10-27）
+
+| 层 | 手段 | 结果 |
+| --- | --- | --- |
+| 维度/接口 | `test/embedding.test.js`（19 例：归一化、已知表、探测与缓存、密钥（含凭据对象解包）、HTTP 错误、超时、维度不一致、缓存） | pass |
+| 存储 | `test/embedding-store.test.js`（8 例：宽/模型隔离、pending 顺序、过期、作用域扫描、清旧模型、级联删除、计数） | pass |
+| 回填 | `test/embed-worker.test.js`（9 例：分批、失败退避与恢复、换 tag 清行、配错不毁旧向量、内置/不可用跳过、维度解析、dispose、调度） | pass |
+| 召回 | `test/recall-semantic.test.js`（8 例：无字面重合命中、阈值、排序、无向量不增益、词法回归、关闭、宽度不匹配、tag 隔离） | pass |
+| 端到端 | `test/semantic-e2e.test.js`：真实 `apply()` + 本地假 `/v1/embeddings` → `memory_save` → worker 回填 → 下一轮 pre-step 语义注入；关掉服务后退回词法 | pass |
+| 设置层 | `test/settings.test.js` / `test/settings-route.test.js`：新字段默认值/钳位/枚举、热更新、落盘、`runtime.vector`、`embeddingTest` | pass |
+| 页面渲染 | `test/client-render.test.js`：用 ~40 行 hook runtime + `vm` 跑**真实** `client.js`，断言向量模型行（tag/维度/已嵌入 x/y/错误红字）与内置模式下不渲染该行 | pass |
+| 全量回归 | `node --test --test-isolation=none test/*.test.js` | **265/265 pass** |
