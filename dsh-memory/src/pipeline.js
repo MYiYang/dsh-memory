@@ -245,7 +245,15 @@ export function createPipeline(options) {
     const personaConfig = options.config?.persona
     if (personaConfig?.enabled === true) {
       try {
-        await runPersona(db, llm, personaConfig, { project, now: now(), log, sessionId, signal })
+        await runPersona(db, llm, personaConfig, {
+          project,
+          now: now(),
+          log,
+          sessionId,
+          signal,
+          // Credential seam for the optional remote judgment backend.
+          resolveSecret: options.resolveSecret,
+        })
       } catch (error) {
         log('warn', `l3 persona consolidation failed: ${error instanceof Error ? error.message : String(error)}`)
       }
@@ -255,7 +263,14 @@ export function createPipeline(options) {
       // persona, L1, or the other scope's schedule. Order: project, then global.
       if (personaConfig.global !== false) {
         try {
-          await runPersona(db, llm, personaConfig, { scope: 'global', now: now(), log, sessionId, signal })
+          await runPersona(db, llm, personaConfig, {
+            scope: 'global',
+            now: now(),
+            log,
+            sessionId,
+            signal,
+            resolveSecret: options.resolveSecret,
+          })
         } catch (error) {
           log('warn', `l3 global persona consolidation failed: ${error instanceof Error ? error.message : String(error)}`)
         }

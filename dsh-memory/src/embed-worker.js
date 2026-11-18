@@ -310,9 +310,22 @@ export function createEmbeddingWorker(options) {
     /**
      * Is there anything at all to compare a query against? The pre-step uses
      * this to skip a pointless round trip right after the model was enabled.
+     *
+     * The memoized counters are up to {@link COUNTS_TTL_MS} old, so a row the
+     * worker wrote a moment ago can still read as "nothing embedded" and make
+     * the turn skip semantic recall entirely (observed as a flaky e2e: the row
+     * is in the table, the cached count is not). One primary-key touch settles
+     * it; it only runs on the "cached count is zero" path.
      */
     hasVectors() {
-      return counts(getClient()?.tag ?? lastTag).embedded > 0
+      const tag = getClient()?.tag ?? lastTag
+      if (counts(tag).embedded > 0) return true
+      try {
+        if (!hasEmbeddingTable(db)) return false
+        return db.prepare('SELECT 1 AS ok FROM memory_embeddings LIMIT 1').get() !== undefined
+      } catch {
+        return false
+      }
     },
     /** Snapshot for the settings page and the debug log. */
     state() {

@@ -27,10 +27,11 @@ import { appendTurn, pendingSessionIds } from './src/l0.js'
 import { listPersonas, sceneNavigation } from './src/profile.js'
 import { createScheduler } from './src/scheduler.js'
 import { createPipeline } from './src/pipeline.js'
+import { createStartupSweeper } from './src/sweep.js'
 import { createLlmClient, safeService } from './src/llm.js'
 import { createEmbeddingClient } from './src/embedding.js'
 import { createEmbeddingWorker } from './src/embed-worker.js'
-import { runPersona } from './src/consolidate.js'
+import { readGateStats, readPatchStats, runPersona } from './src/consolidate.js'
 import { registerBundledSkills } from './src/skills.js'
 import {
   applyLiveConfig,
@@ -44,6 +45,7 @@ import {
   resolveSettingsPath,
   toNested,
   validatePatch,
+  validateJevConfig,
   validateUnset,
 } from './src/settings.js'
 import { clearSettingsFile, describeStorage, messageOf, readSettingsFile, revealDirectory, writeSettingsFile } from './src/settings-store.js'
@@ -255,6 +257,8 @@ export function apply(ctx, rawConfig) {
   let pipeline = null
   /** @type {ReturnType<typeof createScheduler>|null} */
   let scheduler = null
+  /** @type {ReturnType<typeof createStartupSweeper>|null} */
+  let sweeper = null
   /** @type {ReturnType<typeof createLlmClient>|null} */
   let llmClient = null
   if (dbReady) {
@@ -262,12 +266,25 @@ export function apply(ctx, rawConfig) {
       const llm = createLlmClient(ctx, config.extraction, log)
       if (llm.available) {
         llmClient = llm
-        pipeline = createPipeline({ db: getDb(), llm, config, log })
+                // Lazy: the resolver is defined further down this closure, and the gate
+        // only needs it much later (at the first remote judgment call).
+        pipeline = createPipeline({ db: getDb(), llm, config, log, resolveSecret: (ref) => resolveEmbeddingSecret(ref) })
         scheduler = createScheduler({
           db: getDb(),
           everyN: config.extraction.everyN,
           idleMs: config.extraction.idleMs,
           onDue: (sessionId, reason) => pipeline?.schedule(sessionId, reason),
+        })
+        // Backlog left by sessions that ended before their idle timer fired.
+        // This only arms a timer; nothing on the startup path waits for it.
+        sweeper = createStartupSweeper({
+          db: getDb(),
+          pipeline,
+          sessions: config.extraction.sweepSessions,
+          // Periodic passes only touch turns older than this; fresh turns stay
+          // with the normal threshold/idle path.
+          minAgeMs: config.extraction.sweepMinAgeMs,
+          log,
         })
         log(
           'debug',
@@ -296,6 +313,20 @@ export function apply(ctx, rawConfig) {
       }
     }
   }, 'dsh-memory: pipeline')
+
+  // One bounded, off-path sweep per process: it schedules the oldest backlog
+  // into the serial extraction queue and returns immediately.
+  ctx.effect(() => {
+    if (sweeper === null || config.extraction.sweepOnStart !== true) return () => {}
+    const cancel = sweeper.schedule(config.extraction.sweepDelayMs, config.extraction.sweepIntervalMs)
+    return () => {
+      try {
+        cancel()
+      } catch {
+        /* ignore */
+      }
+    }
+  }, 'dsh-memory: startup sweep')
 
   // ── Vector model: the built-in lexical vector, or a configured endpoint ───
   // The client owns "which model, which width, which tag"; the worker owns
@@ -840,10 +871,24 @@ export function apply(ctx, rawConfig) {
                 (vector.tag === null ? '' : ` model=${vector.tag}`) +
                 (vector.lastError === null ? '' : ` semError=${JSON.stringify(String(vector.lastError).slice(0, 80))}`)
               : ''
+          // `l3` is the last persona decision (trigger reason / gate label / unchanged /
+          // written); in `jev` mode the gate hit ratio rides along, so a gate that
+          // never fires is visible instead of silent.
+          const gateStats = config.persona.enabled && config.persona.triggerMode === 'jev' ? readGateStats(getDb()) : null
+          // `patch=hits/edits`: how many of the model's proposed edits actually
+          // matched the stored body. Silent until the first patch is written.
+          const patchStats = config.persona.enabled === false ? null : readPatchStats(getDb())
+          const l3 =
+            config.persona.enabled === false
+              ? 'off'
+              : `${config.persona.triggerMode}:${getMeta(getDb(), 'l3-last-reason') ?? 'never'}` +
+                (gateStats === null ? '' : ` gate=${gateStats.hit}/${gateStats.called}`) +
+                (patchStats === null ? '' : ` patch=${patchStats.hits}/${patchStats.edits}`)
           return {
             text:
               `memories=${s.total} facts=${s.facts} episodes=${s.episodes} superseded=${s.superseded} ` +
               `kinds={${kinds}} l0=${s.l0Pending}/${s.l0Total} scenes=${s.scenes} personas=${s.personas} ` +
+              `l3=${l3} ` +
               `vec=${s.vectorized}/${s.total} feat=${s.featureIndexed}/${s.total}${sem} tokens=${s.tokensSpent} db=${(s.dbBytes / 1024 / 1024).toFixed(2)}MB path=${config.dbPath} settings=${settingsPath}`,
           }
         },
@@ -1062,6 +1107,10 @@ export function apply(ctx, rawConfig) {
       if (field !== undefined) deletePath(nextStored, field.path)
     }
     const next = resolveConfig(mergeRaw(loaderRaw, nextStored))
+    // Refuse to persist a gate that could never decide: upstream fails fast on
+    // the same shape, and a silently dead gate is the worse failure.
+    const jevError = validateJevConfig(next.persona)
+    if (jevError !== null) throw new MemoryApiError('bad-request', jevError)
     try {
       writeSettingsFile(settingsPath, nextStored)
     } catch (error) {

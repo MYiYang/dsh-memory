@@ -44,6 +44,14 @@ export function ensureEmbeddingSchema(db) {
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS memory_embeddings_model_idx ON memory_embeddings(model);
 
+    -- text_hash lives in the table b-tree, not in the (memory_id, model)
+    -- primary key, so every LEFT-JOIN staleness check used to jump into a
+    -- 16 KB row just to compare 32 characters (about 1.2 s on a 96 MB database).
+    -- Driving that check from this covering index keeps the count on the index
+    -- pages. Purely additive: an older build ignores it.
+    CREATE INDEX IF NOT EXISTS memory_embeddings_text_hash_idx
+      ON memory_embeddings(model, text_hash, memory_id);
+
     -- forgetMemories / the data browser delete from memory; the embedding rows
     -- must not outlive the memory they describe.
     CREATE TRIGGER IF NOT EXISTS memory_embeddings_ad AFTER DELETE ON memory BEGIN
@@ -123,6 +131,15 @@ export function deleteOtherModels(db, model) {
  * it keeps the visible "already embedded" number meaningful while a big corpus
  * backfills in the background.
  *
+ * Two driving directions on purpose (ANALYSIS-settings-latency.md §5.3). The
+ * original single LEFT JOIN read `e.text_hash` out of the table b-tree for
+ * every candidate row — 1.2 s on a 96 MB database, with a cost that grew with
+ * the corpus. Here the "never embedded" branch resolves through
+ * `memory_embeddings_model_idx` (an index-only anti-join) and the "stale"
+ * branch is driven from the `(model, text_hash, memory_id)` covering index, so
+ * neither branch touches the 16 KB vector blobs. `UNION` already deduplicates,
+ * and `memory_id` is unique, so the two branches are disjoint.
+ *
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {string} model
  * @param {number} [limit]
@@ -130,17 +147,33 @@ export function deleteOtherModels(db, model) {
  */
 export function pendingEmbeddingRows(db, model, limit = 256) {
   const capped = Math.max(1, Math.min(10_000, Math.floor(Number(limit) || 256)))
+  const tag = String(model ?? '')
+  // A database written before v5 has no embedding table: there is nothing to
+  // backfill, and the caller (the worker) already guards for this, but a direct
+  // caller must degrade instead of throwing.
+  if (!hasEmbeddingTable(db)) return []
+  // The ORDER BY lives outside the UNION because a compound select may only
+  // order by result columns; `updated_at` is carried in the inner rows so the
+  // caller still sees the newest memory first.
   const rows = db
     .prepare(
-      `SELECT m.id AS id, m.text AS text, m.hash AS hash
-         FROM memory m
-         LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-        WHERE m.superseded_by IS NULL
-          AND (e.memory_id IS NULL OR e.text_hash <> m.hash)
-        ORDER BY m.updated_at DESC, m.id DESC
+      `SELECT id, text, hash
+         FROM (
+           SELECT m.id AS id, m.text AS text, m.hash AS hash, m.updated_at AS updated_at
+             FROM memory m
+            WHERE m.superseded_by IS NULL
+              AND m.id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+           UNION
+           SELECT m.id AS id, m.text AS text, m.hash AS hash, m.updated_at AS updated_at
+             FROM memory m
+             JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
+            WHERE m.superseded_by IS NULL
+              AND e.text_hash <> m.hash
+         )
+        ORDER BY updated_at DESC, id DESC
         LIMIT ?`,
     )
-    .all(String(model ?? ''), capped)
+    .all(tag, tag, capped)
   return rows.map((row) => ({ id: Number(row.id), text: String(row.text ?? ''), hash: String(row.hash ?? '') }))
 }
 
@@ -226,6 +259,14 @@ export function semanticCandidates(db, input) {
  * Counters for the settings page: how much of the corpus the active model has
  * covered.
  *
+ * Four counts that each resolve on an index (ANALYSIS-settings-latency.md §5.2).
+ * The previous single LEFT JOIN compared `e.text_hash` — a column that only
+ * exists in the table b-tree — for every candidate row, which cost ~1.2 s on a
+ * 96 MB database and grew with the corpus. `missing` is now an index-only
+ * anti-join and `stale` is driven from the `(model, text_hash, memory_id)`
+ * covering index, so no branch reads a 16 KB vector blob. `pending` is exactly
+ * `missing + stale`, i.e. the same set the old predicate described.
+ *
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {string} model
  * @returns {{ total: number, embedded: number, pending: number, stale: number }}
@@ -241,12 +282,21 @@ export function embeddingCounts(db, model) {
   }
   const total = count('SELECT COUNT(*) AS n FROM memory WHERE superseded_by IS NULL')
   const embedded = count('SELECT COUNT(*) AS n FROM memory_embeddings WHERE model = ?', tag)
-  const pending = count(
+  const missing = count(
     `SELECT COUNT(*) AS n
-       FROM memory m
-       LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?
-      WHERE m.superseded_by IS NULL AND (e.memory_id IS NULL OR e.text_hash <> m.hash)`,
+       FROM memory
+      WHERE superseded_by IS NULL
+        AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)`,
     tag,
   )
-  return { total, embedded, pending, stale: Math.max(0, embedded - (total - pending)) }
+  const stale = count(
+    `SELECT COUNT(*) AS n
+       FROM memory_embeddings e
+       JOIN memory m ON m.id = e.memory_id
+      WHERE e.model = ?
+        AND m.superseded_by IS NULL
+        AND e.text_hash <> m.hash`,
+    tag,
+  )
+  return { total, embedded, pending: missing + stale, stale }
 }

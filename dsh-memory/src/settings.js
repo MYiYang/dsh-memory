@@ -18,6 +18,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { CORE_PRIORITY } from './store.js'
+import { parseDecisionEndpoint } from './decision.js'
 
 /** Format version written into settings.json. */
 export const SETTINGS_VERSION = 1
@@ -68,6 +69,7 @@ export function resolveConfig(raw) {
   const extraction = section(config.extraction)
   const scenes = section(config.scenes)
   const persona = section(config.persona)
+  const jev = section(persona.jev)
   const vector = section(config.vector)
   const text = (value, fallback = '') => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
   return {
@@ -102,6 +104,16 @@ export function resolveConfig(raw) {
       maxAttempts: number(extraction.maxAttempts, 3, 1, 10),
       timeoutMs: number(extraction.timeoutMs, 60_000, 1_000, 300_000),
       maxTokens: number(extraction.maxTokens, 2400, 64, 8192),
+      // The idle timer dies with the process, so a session's last turns can sit
+      // un-extracted for days. One bounded, non-blocking sweep at startup closes
+      // that hole; it is on by default because it only *schedules* work.
+      sweepOnStart: extraction.sweepOnStart !== false,
+      sweepSessions: number(extraction.sweepSessions, 20, 1, 200),
+      sweepDelayMs: number(extraction.sweepDelayMs, 8_000, 1_000, 120_000),
+      // Repeating passes: every few minutes, but only for turns older than
+      // `sweepMinAgeMs` so fresh ones stay with the threshold/idle path.
+      sweepIntervalMs: number(extraction.sweepIntervalMs, 300_000, 0, 3_600_000),
+      sweepMinAgeMs: number(extraction.sweepMinAgeMs, 1_800_000, 0, 86_400_000),
     },
     scenes: {
       enabled: scenes.enabled !== false,
@@ -111,6 +123,16 @@ export function resolveConfig(raw) {
     },
     persona: {
       enabled: persona.enabled !== false,
+      // How the L3 rewrite is scheduled. `current` (default) counts the facts
+      // written since the last real persona write and never calls the gate;
+      // `jev` lets the gate add a rewrite when that trigger does not fire;
+      // `legacy` keeps the old batch counter plus gate-on-facts path.
+      triggerMode:
+        persona.triggerMode === 'jev' || persona.triggerMode === 'legacy' ? persona.triggerMode : 'current',
+      // Facts written since the last real persona write before one is due
+      // (upstream `memories_since_last_persona`, default 50).
+      defaultThreshold: number(persona.defaultThreshold, 50, 1, 500),
+      // Only meaningful in `legacy` mode: L1 batches between gate checks.
       triggerEveryN: number(persona.triggerEveryN, 10, 1, 100),
       maxChars: number(persona.maxChars, 1200, 200, 8000),
       // What the generator aims at (maxChars stays the hard cap). A persona
@@ -129,6 +151,18 @@ export function resolveConfig(raw) {
       // L3 also maintains a cross-project profile built from global facts.
       // It has its own batch counter and gate, so it never starves the project one.
       global: persona.global !== false,
+      // Judgment backend used only when `triggerMode = "jev"`. `llm` asks the
+      // host model (nothing else to configure); `jev` posts the upstream System
+      // One wire format to an external service and needs endpoint + model + key.
+      jev: {
+        provider: jev.provider === 'jev' ? 'jev' : 'llm',
+        endpoint: text(jev.endpoint),
+        model: text(jev.model),
+        // Credential *reference* (env var name); non-identifiers are literals.
+        apiKeyRef: text(jev.apiKeyRef),
+        timeoutMs: number(jev.timeoutMs, 3_000, 100, 60_000),
+        diagnostics: jev.diagnostics === 'full' ? 'full' : jev.diagnostics === 'off' ? 'off' : 'metadata',
+      },
     },
     vector: {
       enabled: vector.enabled !== false,
@@ -213,6 +247,11 @@ export const FIELDS = [
   { key: 'extraction.maxAttempts', path: ['extraction', 'maxAttempts'], group: 'extraction', type: 'number', min: 1, max: 10, step: 1, live: true },
   { key: 'extraction.timeoutMs', path: ['extraction', 'timeoutMs'], group: 'extraction', type: 'number', min: 1000, max: 300000, step: 1000, live: true },
   { key: 'extraction.maxTokens', path: ['extraction', 'maxTokens'], group: 'extraction', type: 'number', min: 64, max: 8192, step: 64, live: true },
+  { key: 'extraction.sweepOnStart', path: ['extraction', 'sweepOnStart'], group: 'extraction', type: 'boolean', live: true },
+  { key: 'extraction.sweepSessions', path: ['extraction', 'sweepSessions'], group: 'extraction', type: 'number', min: 1, max: 200, step: 1, live: true },
+  { key: 'extraction.sweepDelayMs', path: ['extraction', 'sweepDelayMs'], group: 'extraction', type: 'number', min: 1000, max: 120000, step: 1000, live: true },
+  { key: 'extraction.sweepIntervalMs', path: ['extraction', 'sweepIntervalMs'], group: 'extraction', type: 'number', min: 0, max: 3600000, step: 30000, live: true },
+  { key: 'extraction.sweepMinAgeMs', path: ['extraction', 'sweepMinAgeMs'], group: 'extraction', type: 'number', min: 0, max: 86400000, step: 60000, live: true },
   { key: 'extraction.provider', path: ['extraction', 'provider'], group: 'extraction', type: 'text', live: false },
   { key: 'extraction.model', path: ['extraction', 'model'], group: 'extraction', type: 'text', live: false },
 
@@ -224,6 +263,14 @@ export const FIELDS = [
 
   // ── Persona (L3) ─────────────────────────────────────────────────────────
   { key: 'persona.enabled', path: ['persona', 'enabled'], group: 'persona', type: 'boolean', live: true },
+  { key: 'persona.triggerMode', path: ['persona', 'triggerMode'], group: 'persona', type: 'enum', options: ['current', 'jev', 'legacy'], live: true },
+  { key: 'persona.defaultThreshold', path: ['persona', 'defaultThreshold'], group: 'persona', type: 'number', min: 1, max: 500, step: 1, live: true },
+  { key: 'persona.jev.provider', path: ['persona', 'jev', 'provider'], group: 'persona', type: 'enum', options: ['llm', 'jev'], live: true },
+  { key: 'persona.jev.endpoint', path: ['persona', 'jev', 'endpoint'], group: 'persona', type: 'text', live: true },
+  { key: 'persona.jev.model', path: ['persona', 'jev', 'model'], group: 'persona', type: 'text', live: true },
+  { key: 'persona.jev.apiKeyRef', path: ['persona', 'jev', 'apiKeyRef'], group: 'persona', type: 'text', live: true },
+  { key: 'persona.jev.timeoutMs', path: ['persona', 'jev', 'timeoutMs'], group: 'persona', type: 'number', min: 100, max: 60000, step: 100, live: true },
+  { key: 'persona.jev.diagnostics', path: ['persona', 'jev', 'diagnostics'], group: 'persona', type: 'enum', options: ['off', 'metadata', 'full'], live: true },
   { key: 'persona.global', path: ['persona', 'global'], group: 'persona', type: 'boolean', live: true },
   { key: 'persona.triggerEveryN', path: ['persona', 'triggerEveryN'], group: 'persona', type: 'number', min: 1, max: 100, step: 1, live: true },
   { key: 'persona.maxChars', path: ['persona', 'maxChars'], group: 'persona', type: 'number', min: 200, max: 8000, step: 50, live: true },
@@ -489,6 +536,35 @@ export function validatePatch(patch) {
     else flat[key] = result.value
   }
   return { ok: errors.length === 0, errors, flat }
+}
+
+/**
+ * Cross-field check for the optional `jev` judgment backend.
+ *
+ * A remote provider missing an endpoint, model or key would never fire, and the
+ * user would only see "the gate never decides". Upstream refuses to start in
+ * that shape; here the settings save does, which is the earliest moment the
+ * plugin can still say no.
+ *
+ * @param {{ triggerMode?: string, jev?: Record<string, any> }} persona
+ * @returns {string|null} an error message, or null when usable
+ */
+export function validateJevConfig(persona) {
+  if (persona?.triggerMode !== 'jev') return null
+  const jev = persona.jev ?? {}
+  if (jev.provider !== 'jev') return null
+  const missing = []
+  const endpoint = String(jev.endpoint ?? '').trim()
+  if (endpoint === '') missing.push('persona.jev.endpoint')
+  if (String(jev.model ?? '').trim() === '') missing.push('persona.jev.model')
+  if (String(jev.apiKeyRef ?? '').trim() === '') missing.push('persona.jev.apiKeyRef')
+  if (missing.length > 0) {
+    return `${missing.join('、')} 必须填写：triggerMode=jev 且 provider=jev 时要接外部判定服务`
+  }
+  if (parseDecisionEndpoint(endpoint) === null) {
+    return 'persona.jev.endpoint 必须是 https 地址（仅回环地址允许 http，便于本地 mock）'
+  }
+  return null
 }
 
 /**

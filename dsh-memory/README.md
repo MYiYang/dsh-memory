@@ -7,7 +7,7 @@
 - **L0 原文**：每轮完整落库（用户/助手文本 + 工具名），不可变、可重放；
 - **L1 原子事实**：按 warm-up 阈值异步调用 LLM 抽取，带 kind / priority / version / 冲突消解（store / update / merge / skip）；
 - **L2 场景块**：把同类事实归并成 Markdown 场景（summary + heat + 热度衰减），生成「场景导航」；
-- **L3 画像**：项目画像 + 跨项目全局画像（偏好/约定/决策/环境），由 JEV-lite 判决门控，只在值得时重写；
+- **L3 画像**：项目画像 + 跨项目全局画像（偏好/约定/决策/环境），触发器五级（显式请求 / 冷启动 / 恢复 / 首个场景块 / 新增事实达阈值，默认 50 条）；写回分 `write` / `patch` / `none` 三种模式，`patch` 用 `old → new` 定点替换让旧结论物理消失；可选让 JEV-lite 判决器补位；
 - **召回**：稳定段（画像 + 场景导航，每会话一次）+ 动态段（本轮命中的 L1 事实）两段注入；检索是 **FTS5 + 向量** 的混合（倒排特征预筛 + 精确余弦）。向量默认是**本地 384 维词法向量**（无需 embedding 服务），也可以在设置里换成任意 OpenAI 兼容的嵌入模型（见 [向量模型](#向量模型可选)）；
 - **工具**：`memory_search` / `memory_save` / `memory_forget` / `memory_stats` / `memory_extract`。
 
@@ -20,7 +20,7 @@
 | --- | --- |
 | 每轮结束 | L0 落库一轮原文；调度器按 warm-up 阈值（1→2→4→8→everyN）+ idle 60s 决定是否入队抽取 |
 | 抽取（异步串行） | 一次 LLM 做「场景切分 + 事实抽取」→ 候选召回 → 二次 LLM 冲突消解 → 写 L1（含 version/history） |
-| L1 之后 | 按场景聚合事实 → LLM 归并场景块；每 `triggerEveryN` 批或 JEV 判决命中时重写画像 |
+| L1 之后 | 按场景聚合事实 → LLM 归并场景块；新增事实达阈值（默认 50 条）时增量重写画像，`triggerMode=jev` 时判决器可在未达阈值时补写一次 |
 | 每轮首次请求前 | 首轮注入稳定段（画像 + 场景导航）；每轮注入动态段（FTS + 向量混合召回的 L1 事实） |
 | 模型需要时 | 主动检索/固化/删除记忆；`memory_extract` 手动补跑一次抽取 |
 
@@ -86,6 +86,11 @@
       maxAttempts: 3
       timeoutMs: 60000
       maxTokens: 2400           # 推理模型的 reasoning 也吃这份预算，别再往下调
+      sweepOnStart: true        # 启动后后台补抽积压（不阻塞启动；关掉=只在会话内触发）
+      sweepSessions: 20         # 每次补抽最多处理多少个会话（最老积压优先）
+      sweepDelayMs: 8000        # 启动后延迟多久再开始补抽
+      sweepIntervalMs: 300000   # 之后每隔多久再扫一次（0 = 只在启动时扫一次）
+      sweepMinAgeMs: 1800000    # 只补抽超过这个时长的积压（0 = 不设门槛）
     scenes:
       enabled: true
       minFacts: 3
@@ -93,7 +98,9 @@
       halfLifeDays: 14
     persona:
       enabled: true
-      triggerEveryN: 10         # 每 N 个成功批次过一道 JEV-lite 门控
+      triggerMode: current      # current=按新增事实数触发（默认，不调判决器）/ jev=判决器补位 / legacy=旧批次门控
+      defaultThreshold: 50      # 自上次画像写入后累计多少条新事实才重写
+      triggerEveryN: 10         # 仅 legacy 模式：每 N 个成功批次过一道 JEV-lite 门控
       maxChars: 1200            # 硬上限（超出直接截断）
       targetChars: 700          # 生成目标长度；超过 1.4 倍即视为膨胀，当场重写压缩
       globalTargetChars: 240    # 全局画像的生成目标（它与长期约定重复，宜更短）
@@ -101,6 +108,13 @@
       personaTimeoutMs: 120000  # 画像重写超时（默认 2 分钟）
       personaReasoningEffort: low  # 画像重写用低推理档；空字符串 = 跟随模型默认
       global: true              # 额外维护跨项目全局画像（只吃 global 事实）
+      jev:                      # 仅 triggerMode=jev 时生效：判定后端
+        provider: llm           # llm = 本机模型当裁判（默认，无需其它配置）；jev = 外部判定服务
+        endpoint: ''            # 外部服务地址，必须 https（仅回环地址可用 http）
+        model: ''               # 外部服务的模型名，如 jev-latest
+        apiKeyRef: ''           # 密钥的环境变量名（经 DSH 凭据解析）
+        timeoutMs: 3000         # 单次判定超时，不重试
+        diagnostics: metadata   # off / metadata（默认）/ full（full 会把状态正文写进日志）
     vector:
       enabled: true             # 关掉就只用 FTS/LIKE
       provider: hash            # hash = 内置词法（默认，零依赖）；openai = 上面配的嵌入接口
@@ -147,7 +161,7 @@
 | `capture`（捕获） | `capture`、`layers.l0` `layers.l1` `layers.l2` `layers.l3` | 是否记原文/episode，四层各自开关 |
 | `extraction`（提炼） | `extraction.enabled` `extraction.everyN` `extraction.idleMs` `extraction.maxInputChars` `extraction.maxMemories` `extraction.maxAttempts` `extraction.timeoutMs` `extraction.maxTokens`、`extraction.provider` `extraction.model` | 抽取节奏、单批上限、LLM 预算与路由 |
 | `scenes`（场景） | `scenes.enabled` `scenes.minFacts` `scenes.maxScenes` `scenes.halfLifeDays` | L2 场景归并与热度淘汰 |
-| `persona`（人设） | `persona.enabled` `persona.global` `persona.triggerEveryN` `persona.maxChars` `persona.targetChars` `persona.globalTargetChars` `persona.personaMaxTokens` `persona.personaTimeoutMs` `persona.personaReasoningEffort` | L3 画像（项目 + 全局）的节奏与长度 |
+| `persona`（人设） | `persona.enabled` `persona.global` `persona.triggerMode` `persona.defaultThreshold` `persona.triggerEveryN` `persona.maxChars` `persona.targetChars` `persona.globalTargetChars` `persona.personaMaxTokens` `persona.personaTimeoutMs` `persona.personaReasoningEffort` `persona.jev.provider` `persona.jev.endpoint` `persona.jev.model` `persona.jev.apiKeyRef` `persona.jev.timeoutMs` `persona.jev.diagnostics` | L3 画像（项目 + 全局）的节奏、长度与可选判定后端 |
 | `vector`（向量） | `vector.enabled` `vector.provider` `vector.model` `vector.dims` `vector.baseUrl` `vector.apiKeyRef` `vector.minCosine` `vector.timeoutMs` `vector.weight` `vector.scanLimit` `vector.prefilter` `vector.featureLimit` | 向量模型（内置词法 / 外部嵌入）、语义阈值与混排权重 |
 | `storage`（存储） | `storage.dbPath` | 数据库路径（重启才生效） |
 | `advanced`（高级） | `debug`、`skills.enabled` `skills.dir` | 调试开关、包内技能注册 |
@@ -320,7 +334,7 @@ resolveConfig 内置默认值（53 个字段各一份）
 
 ### 它怎么跑起来
 
-- **写入不等待**：保存记忆仍然是同步的（照旧写 `memory.vec` 词法向量），外部模型的向量由后台 worker 分批补齐（32 条/请求、256 行/轮），失败按 5s→10s→…→5min 退避。刚保存的条目在几秒内即可被语义召回。
+- **写入不等待**：保存记忆仍然是同步的（照旧写 `memory.vec` 词法向量），外部模型的向量由后台 worker 分批补齐（32 条/请求、256 行/轮），失败按 5s→10s→…→5min 退避。刚保存的条目在几秒内即可被语义召回——`hasVectors()` 在计数缓存（3s TTL）为 0 时会回查一次表，刚写入的行不会被缓存挡在语义通道外。
 - **查询一次**：每轮 pre-step 把用户这句话嵌入一次（最多等 5 秒，最近 32 条文本有缓存）；失败就退回词法，日志 debug 一行，不打断回合。
 - **召回**：语义通道按 `vector.scanLimit`「从新到旧」有界扫一遍（无语义意义的字面预筛在这里会漏，所以不用倒排），`cos >= minCosine` 才算候选；分数归一为 `(cos - minCosine) / (1 - minCosine)`，再按 `vector.weight` 混进原打分。
 - **存储**：`memory_embeddings(memory_id, model, dims, text_hash, vec)`，`model` 是 tag（如 `openai:text-embedding-3-small@1536`）。换模型/改维度 ⇒ 新 tag ⇒ 旧行不再参与打分；**新模型跑通后**才清掉旧 tag 并重算（配错了不会毁掉原来那份），正文被改（`hash` 变）也会重算。
@@ -340,6 +354,38 @@ resolveConfig 内置默认值（53 个字段各一份）
 - 每次召回会临时读最多 `vector.scanLimit` 行向量（2000 × 1536 × 4B ≈ 12 MB 上限，打分后丢弃）；语料很大时把这个数调小。
 - `memory_stats` 的 `sem=x/y model=<tag>` 是覆盖率；`POST /memory/api/embeddingTest` 会真发一次请求，返回 `{ ok, dims, model, tag, endpoint, ms, error }`——用它区分「地址错、key 错、维度错」。
 - 详细设计取舍见 [ANALYSIS-vector-model.md](ANALYSIS-vector-model.md)。
+
+## JEV 判定（可选）
+
+默认的 `triggerMode: current` 不调用任何判决器：画像何时重写，只由「自上次写入后的新增事实条数」决定，成本可预测。想让「场景变化」也能补写一次，把 `persona.triggerMode` 设成 `jev`。
+
+- **判定语义（与上游 TencentDB-Agent-Memory 一致）**：触发器先判，命中就直接写、判决器不参与；只有触发器没命中时判决器才有机会补一次。判决器只做加法，**永远不会挡住触发器要写的那一次**。
+- **判定输入是场景差分**：现有画像 + 自上次写入后有变化的场景块（≤5 个），不是事实列表；总长超过 32k 字直接判 `not_applicable`，不发起调用。
+- **两个后端**：
+  - `persona.jev.provider: llm`（默认）——本机模型当裁判，除 `triggerMode` 外无需其它配置；
+  - `persona.jev.provider: jev`——接外部判定服务（System One 兼容报文：请求 `{model, state, questions:{<id>:{type,instructions,criteria}}}`，响应 `{answers:{<id>:{choice, confidence?}}}`），必须配齐 `endpoint`（https；仅回环地址允许 http，便于本地 mock）、`model`、`apiKeyRef`。
+- **缺配置不装作能用**：`triggerMode=jev` 且 `provider=jev` 时，缺 endpoint/model/apiKeyRef 或地址不是 https，**保存会被拒绝（HTTP 400）**；运行期后端不可用则该批判 `gate:invalid_config` / `gate:unavailable`，画像保持不动、基准不推进。
+- **五个标签与优先级**：`conflict > boundary_change > new_rule > reinforcement > none`，只有前三类会重写；对既有规则范围的收窄或扩张算 `boundary_change` 而非 `new_rule`，场景里的新旧更替叙述算 `reinforcement` 而非 `conflict`。
+- **诊断**：`persona.jev.diagnostics` 三级。`metadata`（默认）把每次判定摘要写进 `meta['l3-gate-log']`（环形 200 条）并累计 `meta['l3-gate-stats']`；`full` 另把状态正文写进 debug 日志，仅短期排障用。状态行显示 `l3=jev:<最近判定> gate=<命中>/<调用>`。
+- **成本**：只有「触发器没命中」的批次才付一次判定调用（默认 3s 超时、不重试）；命中后才是画像重写的那一两次调用。
+
+## 画像写回协议（write / patch / none）
+
+生成器不只「整篇重写」，它要按五类变化处置选一种写法：
+
+| 处置 | 含义 | 输出 |
+| --- | --- | --- |
+| 强化 | 新事实只是佐证已有结论 | `{"mode":"none"}`（或并入原句） |
+| 补充 | 出现新的长期结论 | `{"mode":"write","body":"…"}` |
+| 修正 | 旧结论被推翻或边界变了 | `{"mode":"patch","edits":[{"old":"…","new":"…"}]}` |
+| 重构 | 文档变散、变长 | `{"mode":"write","body":"…"}` |
+| 不改 | 只有一次性事件 | `{"mode":"none"}` |
+
+`patch` 的 `old` 必须**逐字存在**于现有画像：命中才替换（只替换第一处），未命中的条目直接丢弃、不猜。零命中记 `patch-miss`，画像与基准都不动，下批重试。这样「384 维」与「4096 维」不会同时留在画像里。
+
+- **触发器五级**（`triggerMode=current`/`jev` 生效，`legacy` 仍是批次计数）：P1 场景 agent 请求（输出 `requestPersona:true`）→ P2 冷启动 → P2.5 恢复（正文空）→ P3 首个场景块（一次性信号）→ P4 新增事实 ≥ `defaultThreshold`；膨胀超 1.4 倍仍直通。
+- **诊断**：`meta['l3-patch-stats']` 累计 `{writes, patches, edits, hits, misses}`；`meta['l3-last-detail']` 带 `mode` 与本次 `patch` 明细（命中几条、漏了哪条）。
+- **兼容**：旧的 `{"body":"…"}` 输出仍按 `write` 处理，老库不需要迁移。
 
 ## 工具
 
@@ -364,13 +410,16 @@ session/event(turn/end)
               ├─ 候选召回(FTS) → 二次 LLM 冲突消解 → 启发式兜底
               ├─ L1: store/update/merge/skip + version/history
               ├─ L2: 场景归并（事实 ≥ minFacts）→ summary/body/heat → 超 maxScenes 淘汰
-              └─ L3: JEV-lite 判决 → 重写项目画像 + 全局画像
+              │      批级护栏：最多 6 次模型调用、连续 3 次空返回即停、按事实欠账降序先写
+              └─ L3: 触发器五级（请求 / 冷启动 / 恢复 / 首个场景块 / 事实达阈值）→ 增量重写项目画像 + 全局画像（jev 模式另有判决器补位）
 
 agent/pre-step（每轮首 step）
   ├─ 稳定段（每会话一次）: 长期约定（pinned / 高优先 persona+instruction）+ 画像 + 场景导航
   └─ 动态段（每轮）: FTS/LIKE + 384 维词法向量混合召回（text/priority/kind/recency/vector 加权）
 ```
 
+- **L2 的批级护栏**：`CONSOLIDATE_LIMITS` 里 `sceneUpdates: 3`（每批最多成功写 3 个）之外，还有 `sceneAttempts: 6`（每批最多 6 次模型调用，失败也算）与 `sceneFailures: 3`（连续 3 次空返回或抛错即停）。场景按「事实欠账 = 实际事实数 − fact_count」降序处理：欠账最多的先写，避免每批 3 个名额被偶然顺序占掉、大欠账永远排不上。单场景调用抛错只记失败、不中止整批。输入侧 `factsByScene` 改成**每组配额**（每组最多 `sceneFacts` 条），不再用全局 `LIMIT 300`——后者在真实库上会让 22/148 个场景根本读不到。
+- **补抽（启动 + 周期）**：`extraction.sweepOnStart`（默认 true）在插件启动 `sweepDelayMs` 后扫一次，之后每隔 `sweepIntervalMs`（默认 5 分钟）再扫。每轮把最老的 `sweepSessions` 个会话的未提炼轮次交给抽取队列（`src/sweep.js`）；`sweepMinAgeMs`（默认 30 分钟）保证只碰「放了很久」的积压，新鲜轮次仍走阈值/idle。全程只排 `unref` 定时器、只入队不等待，失败只记 `warn`，结果写 `meta['l0-sweep-last']`；`sweepIntervalMs=0` 即回到只扫启动那一次。
 - **长期约定（core）**：召回是**词法**的，问候（「你好啊」）与偏好文本零重叠，pinned 偏好会永远进不了上下文——
   所以 `pinned=1` 或 `priority>=85` 的 persona/instruction 行改由 `coreMemories()` **按策略**取，
   放进 stable 段最前面（`### 长期约定（每轮都要遵守，优先级最高）`），与提问内容无关。
@@ -452,7 +501,7 @@ agent/pre-step（每轮首 step）
 | 本轮失败：`format v4 message requires a producer-owned source kind` | 注入消息用了旧 source 形状 | 本版已用 `{ kind: 'plugin:dsh-memory' }` |
 | `memory_stats` 里 `l0` 一直不降 | 没有 llm 服务/模型，或抽取一直失败；重启后旧会话不会自动重试 | 看日志 `[dsh-memory]`；`l1-last-reason` 会写 `llm_error/parse/timeout`；调 `memory_extract` 传 `{all:true}` 补抽积压 |
 | 抽取 `reason=parse` | 模型把 Windows 路径写成单反斜杠（`\U`/`\m` 非法转义），或前面带示例 JSON | 本版 `repairStringEscapes` 修非法转义与裸控制字符，并在多个 JSON 片段中选 `memories` 最多的一个；仍失败可用 `all:true` 重跑 |
-| 没有人格/场景 | 事实太少（`minFacts`）或还没到 `triggerEveryN` | 多聊几轮，或调小阈值 |
+| 没有人格/场景 | 事实太少（`minFacts`），或触发器未命中（P1 请求、P3 首个场景块、P4 新增事实未达 `persona.defaultThreshold` 默认 50）；`patch` 零命中也会记 `patch-miss` 而不写 | 多聊几轮，或调小 `defaultThreshold`；看 `l3-last-reason` 与 `l3-last-detail`；`legacy` 模式则看 `triggerEveryN` |
 | 召回为空 | 语料太少，或 2 字中文走 LIKE 兜底 | 用 `memory_save` 固化关键结论（`fact` 权重高） |
 | `memory_stats` 的 `vec=` 小于总数 | 旧行还没回填（每次 open 最多补 500 行）或写入路径没跑 v3 | 重启一次让它继续回填；或 `enabled: false` 临时关掉向量 |
 | `memory_stats` 的 `feat=` 小于总数 | 特征索引还在渐进补建（每次 open 最多 500 行） | 重启一次继续；不影响召回，未索引行仍走有界兜底 |
@@ -490,7 +539,7 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 - `src/llm.js` — `ctx.get('llm')` 封装（超时/usage/降级）
 - `src/pipeline.js` — 串行队列、失败重试/丢弃、L2/L3 串接（项目 + 全局画像）
 - `src/profile.js` — L2 场景、maxScenes 淘汰、L3 画像、heat 衰减/导航
-- `src/consolidate.js` — 场景归并、画像重写（项目/全局）、JEV-lite 判决
+- `src/consolidate.js` — 场景归并、画像触发与增量重写（项目/全局）、JEV-lite 判决器（可选补位）
 - `src/recall.js` — 查询词、FTS/LIKE + 倒排预筛 + 向量混合打分、稳定/动态注入块
 - `src/capture.js` — v1 episode 捕获（兼容保留）
 - `src/settings.js` — 字段目录（53 个 key）、`resolveConfig` 归一化、校验/深合并/来源、原地应用
@@ -513,7 +562,7 @@ CI（`.github/workflows/release.yml`）用同样的「逐个文件跑」策略�
 - L2 场景超过 `maxScenes` 会按**衰减热度**淘汰（persona 正文引用的场景保留）；被淘汰场景用 `l2-evicted:<project>` 记录，
   在没有更新事实前不会重建，避免「淘汰→重建→再淘汰」反复烧 LLM。引用保护是子串匹配，2 字常用词可能过度保护。
 - L3 现在同时维护**项目画像**与**全局画像**（`persona.global`，默认 true）：全局画像只吃 `scope='global'` 的事实，
-  有独立的批次计数 `l3-batches:@global` 与 JEV-lite 门控；与 core 长期约定层互补（core 管「每轮必须遵守的规则」，
+  有独立的重写基准 `l3-persona-time:@global` 与触发判定；与 core 长期约定层互补（core 管「每轮必须遵守的规则」，
   全局画像管跨项目的背景与决策摘要）。只想要项目画像可设 `persona.global: false`。
 - 抽取/场景/画像共用会话模型；想更省可配便宜模型（`extraction.model`）。
 - 重启后旧会话的 L0 待抽取**不会自动重试**（idle timer 是进程内的）；用 `memory_extract {all:true}` 按最老积压补抽，最多 20 个会话。

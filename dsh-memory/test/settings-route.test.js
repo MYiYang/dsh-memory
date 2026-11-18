@@ -308,6 +308,52 @@ test('save 一个动态字段：立即生效、只落盘改过的 key、来源�
   }
 })
 
+test('选中外部判定服务却缺配置：save 返回 400 且不落盘', async () => {
+  const harness = createHarness()
+  try {
+    // triggerMode=jev + provider=jev 但没有 endpoint/model/key：判定门永远决定不了，
+    // 与其让用户以为「开了」，不如在保存时拒绝（上游是启动即抛）。
+    const rejected = await harness.request('POST', '/memory/api/save', {
+      patch: { 'persona.triggerMode': 'jev', 'persona.jev.provider': 'jev' },
+    })
+    assert.equal(rejected.status, 400)
+    assert.equal(rejected.json.error.code, 'bad-request')
+    assert.match(String(rejected.json.error.message), /persona\.jev\.endpoint/)
+    assert.equal(existsSync(harness.settingsPath), false)
+
+    // 换成外部 provider 但地址是明文 http（非回环）：同样拒绝。
+    const insecure = await harness.request('POST', '/memory/api/save', {
+      patch: {
+        'persona.triggerMode': 'jev',
+        'persona.jev.provider': 'jev',
+        'persona.jev.endpoint': 'http://api.example.com/judge',
+        'persona.jev.model': 'jev-latest',
+        'persona.jev.apiKeyRef': 'MY_JEV_KEY',
+      },
+    })
+    assert.equal(insecure.status, 400)
+    assert.match(String(insecure.json.error.message), /https/)
+
+    // 配齐之后放行，并且落盘。
+    const ok = await harness.request('POST', '/memory/api/save', {
+      patch: {
+        'persona.triggerMode': 'jev',
+        'persona.jev.provider': 'jev',
+        'persona.jev.endpoint': 'https://api.example.com/judge',
+        'persona.jev.model': 'jev-latest',
+        'persona.jev.apiKeyRef': 'MY_JEV_KEY',
+      },
+    })
+    assert.equal(ok.status, 200)
+    assert.equal(ok.json.ok, true)
+    const stored = JSON.parse(readFileSync(harness.settingsPath, 'utf8'))
+    assert.equal(stored.settings.persona.triggerMode, 'jev')
+    assert.equal(stored.settings.persona.jev.provider, 'jev')
+  } finally {
+    cleanup(harness.dir)
+  }
+})
+
 test('save 的 live 语义：关掉 capture 后运行中的捕获立即停止（无需重启）', async () => {
   const harness = createHarness()
   try {

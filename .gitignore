@@ -31,3 +31,12 @@
 
 # 青灯表情包：本地聊天贴图，不属于插件产物 —— 只在本地，不入库
 /stickers/
+
+# dsh-memory 的本地分析稿与内部设计稿：含本机测量、真名路径与内部称呼，只在本地留档
+/dsh-memory/ANALYSIS-jev-alignment.md
+/dsh-memory/ANALYSIS-settings-latency.md
+/dsh-memory/DESIGN-runscenes-guard.md
+/dsh-memory/DESIGN-startup-sweep.md
+/dsh-memory/HANDOFF.md
+/dsh-memory/IMPLEMENTATION-persona-patch.md
+/dsh-memory/RESEARCH-*.md

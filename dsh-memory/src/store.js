@@ -290,6 +290,21 @@ export function migrate(db) {
   ensureColumn(db, 'memory', 'vec', 'BLOB')
   ensureColumn(db, 'memory', 'vec_model', 'TEXT')
 
+  // The settings page counts rows whose vector column is not null on every state
+  // read. That column holds a blob, so a full scan reads the vector pages of
+  // every row; a partial index over just that predicate keeps the count on the
+  // index. Created here, after the column is guaranteed to exist. Additive and
+  // idempotent: an older build ignores it and a failed create only costs the
+  // scan again (ANALYSIS-settings-latency.md §5.4).
+  try {
+    db.exec('CREATE INDEX IF NOT EXISTS memory_vec_idx ON memory(vec) WHERE vec IS NOT NULL')
+  } catch (error) {
+    // Never let an index stand between the caller and an open database.
+    if (process.env.DSH_MEMORY_DEBUG === '1') {
+      console.warn('[dsh-memory] memory_vec_idx not created:', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION))
 }
 

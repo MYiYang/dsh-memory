@@ -16,7 +16,7 @@
 - **L0**：原始轮次落库（用户/助手全文 + 工具名 + 游标），不可变追加。
 - **L1**：按阈值批量调用 LLM，抽取「原子事实」；与既有事实做冲突消解（store / update / merge / skip）；带 priority、version、superseded 审计。
 - **L2**：按场景归并 L1 事实成 Markdown 场景块（summary + heat），提供「场景导航」注入。
-- **L3**：项目/全局画像（persona）重写，由 JEV-lite 判决门控。
+- **L3**：项目/全局画像（persona）重写，由「自上次写入后新增事实数」触发；JEV-lite 为可选补位判决器。
 - **召回**：稳定段（persona + 场景导航）+ 动态段（本轮命中的 L1 事实）两段注入。
 - **工具**：`memory_search` 支持层过滤；新增 `memory_extract`（手动触发）与 `memory_scene`（读场景正文）。
 
@@ -60,7 +60,7 @@ session/event
               ├─ 解析容错 → 候选召回(FTS) → 二次 LLM 冲突消解
               ├─ 落 L1：store/update/merge/skip + version + history
               ├─ L2：新事实按 scene 聚合 → LLM 归并场景块 + heat
-              └─ L3：JEV-lite 判决 → 触发时重写 persona.md
+              └─ L3：新增事实达阈值 → 增量重写 persona.md（jev 模式另有判决器补位）
 
 agent/pre-step（每轮首 step）
   ├─ 稳定段（每会话一次）：persona（global+project）+ 场景导航
@@ -316,18 +316,36 @@ const model    = config.extraction.model    || selection?.model
 ## 9. L3 画像
 
 - 内容：Markdown，固定小标题（用户偏好 / 项目约定 / 关键决策 / 环境与工具）。
-- 触发：
-  - 首次有 ≥ 5 条有效事实 → 生成；
-  - 之后每 `triggerEveryN(10)` 个 L1 批次，或 JEV-lite 判定为 `conflict|boundary_change|new_rule`。
-- JEV-lite（一次小调用）：输入「当前 persona + 最近 10 条事实变化」，
+- 触发（`persona.triggerMode`，默认 `current`；对齐上游 `PersonaTrigger` 的做法，见 `ANALYSIS-jev-alignment.md`）：
+  - **基准**：`meta['l3-persona-time:<bucket>']`，**只在画像真正写入时更新**；`deferred` / `unchanged` / `failed`
+    一律不动它，所以下一批判的是同一份差异，天然幂等。
+  - `current`（默认）：无画像 → 冷启动生成；有画像 → 自基准之后新增事实数 ≥ `persona.defaultThreshold(50)` 才重写。
+    `l3-batches:*` 仍维护，但只作统计，不再参与判定。
+  - `jev`：先按上面判；**判不中时**才让判决器补一次（输入是「变化场景」）。判决器只会加一次重写，
+    永远不会挡住触发器要写的那一次（上游 `triggerMode: "jev"` 的「或」语义）。判定后端是一层可插拔
+    provider（`src/decision.js`）：`llm` 用本机模型、`jev` 走外部 System One 兼容 HTTP，业务侧只认
+    「state + ChoiceQuestion → choice」这个契约，不认具体厂商。
+  - `legacy`：旧行为，`l3-batches ≥ triggerEveryN(10)` 才问一次判决器，输入是事实列表。
+- 生成是**增量**的：prompt = 现有画像 + **自基准之后有变化的场景块全文**（≤6 个）+ 新增事实，
+  并明令「以变化场景为准——新结论覆盖旧结论、删掉被推翻的条目，同一件事只留最新版本，不要新旧并列」。
+- **短路与去重**：已有画像且场景没有任何变化 → 直接 `unchanged`（连模型都不调）；模型产出与现有正文逐字相同
+  → `unchanged`（不写、不推基准、不升版本）。
+- **膨胀线**：正文 > `targetChars × 1.4` 时跳过触发与短路，当场重写压缩（安全阀，仍保留）。
+- JEV-lite（仅 `jev` 模式，一次小调用）：输入「当前 persona + 变化场景（≤5 个，state > 32k 字则不调用）」，
   输出五分类之一：`conflict | boundary_change | new_rule | reinforcement | none`。
-  只有前三类才真正重写；`reinforcement/none` → 记录 deferred，省一次大调用。
+  只有前三类才真正重写；`reinforcement/none/解析失败/无可判输入` → `deferred`。
 - 长度上限 `maxChars=1200`；超限截断并保留小标题结构。
 - 两个 scope（§22 复核时曾以「core 层已覆盖」为由否决，v0.5.0 按用户要求落地）：
-  - **project**：事实池 `(scope='global' OR project=?)`，批次键 `l3-batches:<project>`，写 `scope='project'`；
-  - **global**：事实池只取 `scope='global'`，独立批次键 `l3-batches:@global`，写 `scope='global'/project=NULL`；
+  - **project**：事实池 `(scope='global' OR project=?)`，基准 `l3-persona-time:<project>`，写 `scope='project'`；
+  - **global**：事实池只取 `scope='global'`，独立基准 `l3-persona-time:@global`，写 `scope='global'/project=NULL`；
     `persona.global:false` 可关闭。两者各自 gate，互不清零；`ctx.project` 为空时项目画像直接返回 `no-project`（不写幽灵行）。
 - 注入：稳定段（项目画像 + 全局画像各一段，`renderStableBlock` 按 scope 标标题）。
+- 判定后端（`triggerMode=jev` 时才用）：`src/decision.js` 提供 `registerDecisionProvider(name, factory)`
+  与 `createDecisionProvider(name, params, deps)`；内置 `llm`（`llm.complete`，prompt 里列 criteria）与
+  `jev`（POST `{model,state,questions}`，解析 `answers[qid].choice`，只允许 https/回环）。
+  provider 失败一律 throw（`DecisionProviderError.reason` 分类），调用方按 `gate:unavailable` 处理、
+  不推进基准；每次判定写 `meta['l3-gate-log']`（环形 200）与 `meta['l3-gate-stats']`（called/hit/deferred/unavailable）。
+  缺配置时不假装可用：保存期 `validateJevConfig` 直接拒绝，运行期 `isUsable()=false` 判 `gate:invalid_config`。
 
 ---
 
@@ -397,7 +415,16 @@ const model    = config.extraction.model    || selection?.model
       halfLifeDays: 14
     persona:
       enabled: true
-      triggerEveryN: 10
+      triggerMode: current  # current | jev | legacy
+      defaultThreshold: 50  # 自上次画像写入后累计多少条新事实才重写
+      triggerEveryN: 10     # 仅 legacy：每 N 个成功批次过一道判决器
+      jev:                  # 仅 triggerMode=jev 生效
+        provider: llm       # llm（本机模型，默认）| jev（外部判定服务）
+        endpoint: ''        # 外部服务地址，必须 https（回环 http 仅测试用）
+        model: ''           # 如 jev-latest
+        apiKeyRef: ''       # 环境变量名，经 ctx.credentials → env 解析
+        timeoutMs: 3000
+        diagnostics: metadata  # off | metadata | full
       maxChars: 1200
       global: true        # 额外维护全局画像（只吃 global 事实）
     vector:
@@ -834,7 +861,7 @@ v2（891 字）按现存事实重写为「项目定位 / 架构 / 操作约定 /
 
 **问题**：§23.6 的手工压缩是一次性的。`maxChars` 只是硬上限，而 prompt 原话是「目标长度：不超过 1200 字」——
 模型会老老实实写满 1200（最早的 menm / novel-ai 两张项目画像都恰好 1200 字，就是这么来的）。同时
-`triggerEveryN=10` 管的是「多久重写一次」，不是「写多长」：只要门控通过一次重写，手工压缩的结果立刻被推翻，
+`defaultThreshold`/`triggerEveryN` 管的是「多久重写一次」，不是「写多长」：只要门控通过一次重写，手工压缩的结果立刻被推翻，
 场景导航又要被挤掉。也就是说「达到阈值自己压缩」在旧代码里并不成立。
 
 **改法**：
@@ -1247,3 +1274,28 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:<port>/memory/api/reset -Co
 | 设置层 | `test/settings.test.js` / `test/settings-route.test.js`：新字段默认值/钳位/枚举、热更新、落盘、`runtime.vector`、`embeddingTest` | pass |
 | 页面渲染 | `test/client-render.test.js`：用 ~40 行 hook runtime + `vm` 跑**真实** `client.js`，断言向量模型行（tag/维度/已嵌入 x/y/错误红字）与内置模式下不渲染该行 | pass |
 | 全量回归 | `node --test --test-isolation=none test/*.test.js` | **265/265 pass** |
+
+---
+
+## 27. v0.9.0：画像触发默认模式 + JEV 进配置（2026-11-18）
+
+**问题**（实测，2026-11-18 11:03 只读查库）：18 份项目画像里 8 份停在 v1；14 个项目的 `l3-batches < 10`
+永远够不到门槛；越过门槛的 4 个项目共问 47 次判决器、0 命中；画像写成后新增/更新的事实合计 **1294 条**
+从未被吸收。根因是三件：旧门控拿「恒定事实快照」问「要不要改」（没有基准）、阈值计量的是批次数而非信息量、
+诊断只有三个覆盖式 meta。
+
+**改法**（细节见 `ANALYSIS-jev-alignment.md` §10/§11）：
+
+- 基准 `meta['l3-persona-time:<bucket>']`，只在画像真正写入时推进；`deferred`/`unchanged`/`failed` 都不动。
+- `persona.triggerMode` 三态：`current`（默认，新增事实数 ≥ `defaultThreshold(50)` 才重写，不调判决器）/
+  `jev`（触发器优先，判不中才让判决器补一次）/ `legacy`（旧批次计数＋门控，供回滚）。
+- 生成改增量：输入 = 现有画像 + 自基准后变化的场景块 + 新增事实，并明令以新代旧；场景无变化直接 `unchanged`；
+  模型产出与现正文逐字相同也 `unchanged`（不写、不升版本、不推基准）。
+- 新增 `src/decision.js`：可插拔判定后端（`llm` 本机 / `jev` 外部 System One 兼容 HTTP），
+  `persona.jev.{provider,endpoint,model,apiKeyRef,timeoutMs,diagnostics}` 进设置页；
+  缺配置时保存即拒绝（400），运行期 `gate:invalid_config` 且画像不动。
+- 观测：`meta['l3-gate-log']` 环形 200 条 + `meta['l3-gate-stats']`，状态行 `l3=<mode>:<最近判定> gate=<命中>/<调用>`。
+
+**验证**：`test/decision.test.js` 11 例、`test/consolidate.test.js` +12、`test/settings.test.js` +2、
+`test/settings-route.test.js` +1（缺配置 400 不落盘）；全量 296 例；插件级 E2E 用本地 mock 判官跑通
+`POST /v1/systemone` → `{choice:"conflict"}` → 画像 v1→v2、`l3-gate-stats={called:1,hit:1}`。

@@ -36,7 +36,7 @@
 
 1. 打开 dsh Web，左侧边栏 →「**插件**」；
 2. 页头按钮「**添加插件**」（或箭头「选择添加插件方式」→「安装第三方插件」），打开安装对话框；
-3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.8.0`），回车；
+3. 输入包名 `dsh-memory-layered`（要指定版本写 `dsh-memory-layered@0.9.0`），回车；
    - 对话框也接受 **Git 地址、压缩包 URL、本地绝对路径**；
    - 安装进度对话框里可以「查看安装任务」「取消安装」；
 4. 等它跑完 → **重启 DSH**。
@@ -57,7 +57,7 @@ dsh plugin --profile web add dsh-memory-layered
 
 | spec 形式 | 例子 |
 | --- | --- |
-| registry 包名（可带版本/标签） | `dsh-memory-layered@0.8.0` |
+| registry 包名（可带版本/标签） | `dsh-memory-layered@0.9.0` |
 | git https 地址 | `https://github.com/<you>/<repo>` |
 | tarball URL | `https://github.com/<you>/<repo>/releases/download/v<ver>/dsh-memory-layered-<ver>.tgz` |
 | 本地目录 | `file:F:\path\to\dsh-memory` 或 `link:F:\path\to\dsh-memory` |
@@ -76,7 +76,7 @@ npx -y @deepseek-ai/dsh --profile web --dump-config    # 可选：确认这一�
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "dsh-memory-layered": "^0.8.0"
+    "dsh-memory-layered": "^0.9.0"
   },
   "dsh": {
     "profile": {

@@ -31,6 +31,7 @@ import {
   readPath,
   resolveConfig,
   toNested,
+  validateJevConfig,
   validatePatch,
   validateUnset,
 } from '../src/settings.js'
@@ -435,7 +436,14 @@ test('buildGroups 输出 8 组、字段元数据齐全、重启项带 active', (
     }
     // enum 字段带 options，且默认值是合法选项
     const enums = fields.filter((field) => field.type === 'enum')
-    assert.deepEqual(enums.map((field) => field.key).sort(), ['persona.personaReasoningEffort', 'recall.scope', 'vector.provider'])
+    assert.deepEqual(enums.map((field) => field.key).sort(), [
+      'persona.jev.diagnostics',
+      'persona.jev.provider',
+      'persona.personaReasoningEffort',
+      'persona.triggerMode',
+      'recall.scope',
+      'vector.provider',
+    ])
     for (const field of enums) {
       assert.ok(Array.isArray(field.options) && field.options.length > 0)
       assert.ok(field.options.includes(field.default), `${field.key} 的默认值不在 options 里`)
@@ -686,4 +694,65 @@ test('revealDirectory 按平台选择文件管理器，失败只降级不抛', (
   assert.equal(typeof handlers.error, 'function', '必须挂 error 监听，否则子进程错误会变成未捕获异常')
   handlers.error(new Error('spawn explorer.exe ENOENT'))
   assert.ok(logs.some(([, message]) => /ENOENT/.test(message)))
+})
+
+
+test('the jev backend defaults to the host model and is configurable', () => {
+  const config = resolveConfig({})
+  assert.equal(config.persona.triggerMode, 'current')
+  assert.equal(config.persona.jev.provider, 'llm')
+  assert.equal(config.persona.jev.endpoint, '')
+  assert.equal(config.persona.jev.model, '')
+  assert.equal(config.persona.jev.apiKeyRef, '')
+  assert.equal(config.persona.jev.timeoutMs, 3000)
+  assert.equal(config.persona.jev.diagnostics, 'metadata')
+
+  const remote = resolveConfig({
+    persona: {
+      triggerMode: 'jev',
+      jev: {
+        provider: 'jev',
+        endpoint: 'https://api.example.com/v1/systemone',
+        model: 'jev-latest',
+        apiKeyRef: 'MY_JEV_KEY',
+        timeoutMs: 5000,
+        diagnostics: 'full',
+      },
+    },
+  })
+  assert.equal(remote.persona.triggerMode, 'jev')
+  assert.deepEqual(remote.persona.jev, {
+    provider: 'jev',
+    endpoint: 'https://api.example.com/v1/systemone',
+    model: 'jev-latest',
+    apiKeyRef: 'MY_JEV_KEY',
+    timeoutMs: 5000,
+    diagnostics: 'full',
+  })
+  // An unknown provider name falls back to the local judge instead of breaking.
+  assert.equal(resolveConfig({ persona: { jev: { provider: 'nope' } } }).persona.jev.provider, 'llm')
+})
+
+test('validateJevConfig only insists on the wire fields when a remote judge is selected', () => {
+  assert.equal(validateJevConfig({ triggerMode: 'current' }), null)
+  assert.equal(validateJevConfig({ triggerMode: 'jev', jev: { provider: 'llm' } }), null)
+  assert.equal(validateJevConfig({ triggerMode: 'legacy', jev: { provider: 'jev' } }), null)
+
+  const missing = validateJevConfig({ triggerMode: 'jev', jev: { provider: 'jev' } })
+  assert.match(missing, /persona.jev.endpoint/)
+  assert.match(missing, /persona.jev.model/)
+  assert.match(missing, /persona.jev.apiKeyRef/)
+
+  const insecure = validateJevConfig({
+    triggerMode: 'jev',
+    jev: { provider: 'jev', endpoint: 'http://api.example.com/x', model: 'm', apiKeyRef: 'K' },
+  })
+  assert.match(insecure, /https/)
+
+  const ok = { triggerMode: 'jev', jev: { provider: 'jev', endpoint: 'https://api.example.com/x', model: 'm', apiKeyRef: 'K' } }
+  assert.equal(validateJevConfig(ok), null)
+  assert.equal(
+    validateJevConfig({ triggerMode: 'jev', jev: { provider: 'jev', endpoint: 'http://127.0.0.1:8123/x', model: 'm', apiKeyRef: 'K' } }),
+    null,
+  )
 })
