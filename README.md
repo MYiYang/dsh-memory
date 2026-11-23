@@ -78,4 +78,4 @@ install.ps1          # 安装器：源码 / -From <tgz|zip|目录> 离线安装�
 
 ## 许可
 
-MIT，见 [dsh-memory/LICENSE](dsh-memory/LICENSE)。
+MIT，见 [LICENSE](LICENSE)（npm 包内副本：[dsh-memory/LICENSE](dsh-memory/LICENSE)）。
