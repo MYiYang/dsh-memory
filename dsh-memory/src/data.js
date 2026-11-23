@@ -271,28 +271,239 @@ function likePattern(value) {
  * and how large each bucket is. Computed over the whole table (not the current
  * page) so a filter never disappears while it is active.
  *
+ * Counts follow the list's own visibility rule: superseded rows are excluded
+ * unless the caller is including them. Counting the whole table made an option
+ * say `工作方法 (863)` while the same filter matched 862 rows — the one
+ * superseded row the list hides by default.
+ *
  * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{ includeSuperseded?: boolean }} [options]
  * @returns {{ kinds: Array<{kind: string, count: number}>, scopes: Array<{scope: string, count: number}>, projects: Array<{project: string, count: number}>, total: number }}
  */
-export function facets(db) {
+export function facets(db, options = {}) {
+  const includeSuperseded = options.includeSuperseded === true
+  /** `WHERE` for the plain aggregates; project adds its own predicates. */
+  const where = includeSuperseded ? '' : 'WHERE superseded_by IS NULL'
+  /** The same rule when a query already has a `WHERE`. */
+  const and = includeSuperseded ? '' : 'AND superseded_by IS NULL'
   const kinds = db
-    .prepare('SELECT kind, COUNT(*) AS n FROM memory GROUP BY kind ORDER BY n DESC, kind ASC')
+    .prepare(`SELECT kind, COUNT(*) AS n FROM memory ${where} GROUP BY kind ORDER BY n DESC, kind ASC`)
     .all()
     .map((row) => ({ kind: String(row.kind), count: Number(row.n) }))
   const scopes = db
-    .prepare('SELECT scope, COUNT(*) AS n FROM memory GROUP BY scope ORDER BY n DESC, scope ASC')
+    .prepare(`SELECT scope, COUNT(*) AS n FROM memory ${where} GROUP BY scope ORDER BY n DESC, scope ASC`)
     .all()
     .map((row) => ({ scope: String(row.scope), count: Number(row.n) }))
   const projects = db
     .prepare(
       `SELECT project, COUNT(*) AS n FROM memory
-        WHERE scope = 'project' AND project IS NOT NULL AND project <> ''
+        WHERE scope = 'project' AND project IS NOT NULL AND project <> '' ${and}
         GROUP BY project ORDER BY n DESC, project ASC`,
     )
     .all()
     .map((row) => ({ project: String(row.project), count: Number(row.n) }))
-  const total = Number(db.prepare('SELECT COUNT(*) AS n FROM memory').get()?.n ?? 0)
+  const total = Number(db.prepare(`SELECT COUNT(*) AS n FROM memory ${where}`).get()?.n ?? 0)
   return { kinds, scopes, projects, total }
+}
+
+/** Layers the browse view can show, in display order. */
+export const BROWSE_LAYERS = /** @type {const} */ (['fact', 'turn', 'scene', 'persona'])
+
+/** Orderings the browse view accepts (`priority` is fact-only, so it is left out). */
+export const BROWSE_SORTS = /** @type {const} */ (['updated', 'created'])
+
+/** ORDER BY fragments for the browse union; nothing from the caller is interpolated. */
+const BROWSE_ORDER_BY = {
+  updated: 'updatedAt DESC, layer ASC, id DESC',
+  created: 'createdAt DESC, layer ASC, id DESC',
+}
+
+/**
+ * Every layer the plugin stores, in one list.
+ *
+ * The panel used to show `memory` only, so the raw turns (L0), scenes (L2) and
+ * personas (L3) were invisible even though they are searchable by recall. This
+ * unions all four with a `layer` discriminator; the text columns of each layer
+ * are what the search matches.
+ *
+ * Filters (`kind` / `scope` / `project`) narrow the same union. Only the fact
+ * layer has a real `kind` column, so the fixed-kind layers answer the filter
+ * with their own discriminator (`turn` / `scene` / `persona`); the same trick
+ * gives L0 turns a scope (a turn with a project key is `project`, else
+ * `global`). Facets are computed over the whole store with only the text query
+ * applied, so a dropdown never loses the option it is currently filtering on.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {{
+ *   layer?: unknown, query?: unknown, kind?: unknown, scope?: unknown,
+ *   project?: unknown, sort?: unknown, page?: unknown, pageSize?: unknown,
+ * }} [payload]
+ * @returns {Record<string, any>}
+ */
+export function browseMemories(db, payload = {}) {
+  const wanted = BROWSE_LAYERS.includes(/** @type {any} */ (payload.layer)) ? String(payload.layer) : 'all'
+  const page = clampInt(payload.page, 1, 1, 1_000_000)
+  const pageSize = clampInt(payload.pageSize, 50, 1, PAGE_SIZE_MAX)
+  const query = typeof payload.query === 'string' ? payload.query.trim() : ''
+  if (query.length > 200) throw new MemoryApiError('bad-request', 'query may have at most 200 characters')
+  const pattern = query === '' ? null : likePattern(query)
+
+  const kind = typeof payload.kind === 'string' ? payload.kind.trim() : ''
+  if (kind.length > 40) throw new MemoryApiError('bad-request', 'kind may have at most 40 characters')
+  const scope = typeof payload.scope === 'string' ? payload.scope.trim() : ''
+  if (scope !== '' && scope !== 'global' && scope !== 'project') {
+    throw new MemoryApiError('bad-request', 'scope must be "global" or "project"')
+  }
+  const project = typeof payload.project === 'string' ? payload.project.trim() : ''
+  if (project.length > 200) throw new MemoryApiError('bad-request', 'project may have at most 200 characters')
+  const sort = BROWSE_SORTS.includes(/** @type {any} */ (payload.sort)) ? String(payload.sort) : 'updated'
+
+  /** `kindColumn` null = the layer is its own kind; `scopeExpr` is what `scope = ?` compares. */
+  const SPEC = {
+    fact: {
+      sql: `SELECT 'fact' AS layer, id, title, text, kind, project, scope, source,
+              tags, pinned, use_count AS useCount,
+              created_at AS createdAt, updated_at AS updatedAt
+              FROM memory WHERE superseded_by IS NULL`,
+      search: ['title', 'text', 'tags', 'project', 'kind'],
+      kindColumn: 'kind',
+      scopeExpr: 'scope',
+    },
+    turn: {
+      sql: `SELECT 'turn' AS layer, id, '第 ' || turn || ' 轮' AS title,
+              user_text || CASE WHEN assistant_text <> '' THEN char(10) || assistant_text ELSE '' END AS text,
+              'turn' AS kind, project,
+              CASE WHEN project IS NOT NULL AND project <> '' THEN 'project' ELSE 'global' END AS scope,
+              '' AS source, '' AS tags, 0 AS pinned, 0 AS useCount,
+              created_at AS createdAt, created_at AS updatedAt
+              FROM l0_turns WHERE 1 = 1`,
+      search: ['user_text', 'assistant_text', 'project'],
+      kindColumn: null,
+      scopeExpr: `CASE WHEN project IS NOT NULL AND project <> '' THEN 'project' ELSE 'global' END`,
+    },
+    scene: {
+      sql: `SELECT 'scene' AS layer, id, name AS title, body AS text, 'scene' AS kind, project, scope,
+              '' AS source, '' AS tags, 0 AS pinned, 0 AS useCount,
+              created_at AS createdAt, updated_at AS updatedAt
+              FROM l2_scenes WHERE 1 = 1`,
+      search: ['name', 'body', 'summary', 'project'],
+      kindColumn: null,
+      scopeExpr: 'scope',
+    },
+    persona: {
+      sql: `SELECT 'persona' AS layer, id, scope || ' 画像' AS title, body AS text, 'persona' AS kind, project, scope,
+              '' AS source, '' AS tags, 0 AS pinned, 0 AS useCount,
+              updated_at AS createdAt, updated_at AS updatedAt
+              FROM l3_persona WHERE 1 = 1`,
+      search: ['body', 'project'],
+      kindColumn: null,
+      scopeExpr: 'scope',
+    },
+  }
+
+  /** `column LIKE ?` OR-chain for the columns a layer searches. */
+  const searchClause = (spec) => spec.search.map((column) => `${column} LIKE ? ESCAPE '\\'`).join(' OR ')
+  /** @param {string} layer @returns {{ sql: string, params: any[] }} */
+  const facetBranch = (layer) => {
+    const spec = SPEC[layer]
+    return {
+      sql: pattern === null ? spec.sql : `${spec.sql} AND (${searchClause(spec)})`,
+      params: pattern === null ? [] : spec.search.map(() => pattern),
+    }
+  }
+
+  /** @type {Array<{ layer: string, sql: string, params: any[] }>} */
+  const branches = []
+  /** @type {Record<string, number>} */
+  const counts = {}
+  for (const layer of BROWSE_LAYERS) {
+    const spec = SPEC[layer]
+    let sql = spec.sql
+    const params = pattern === null ? [] : spec.search.map(() => pattern)
+    if (pattern !== null) sql += ` AND (${searchClause(spec)})`
+    if (kind !== '') {
+      if (spec.kindColumn !== null) {
+        sql += ` AND ${spec.kindColumn} = ?`
+        params.push(kind)
+      } else if (kind !== layer) {
+        // A fixed-kind layer that the filter excludes contributes nothing.
+        counts[layer] = 0
+        continue
+      }
+    }
+    if (scope !== '') {
+      sql += ` AND ${spec.scopeExpr} = ?`
+      params.push(scope)
+    }
+    if (project !== '') {
+      sql += ' AND project = ?'
+      params.push(project)
+    }
+    // Counts are per layer and ignore the layer filter, so the pills stay live
+    // while a filter is active (a standard faceted-search expectation).
+    counts[layer] = Number(db.prepare(`SELECT COUNT(*) AS n FROM (${sql})`).get(...params)?.n ?? 0)
+    if (wanted === 'all' || wanted === layer) branches.push({ layer, sql, params })
+  }
+
+  const union = branches.map((branch) => branch.sql).join(' UNION ALL ')
+  const params = branches.flatMap((branch) => branch.params)
+  const total = branches.reduce((sum, branch) => sum + counts[branch.layer], 0)
+  const pages = Math.max(1, Math.ceil(total / pageSize))
+  const safePage = Math.min(page, pages)
+  const offset = (safePage - 1) * pageSize
+  const rows = branches.length === 0
+    ? []
+    : db
+        .prepare(`SELECT * FROM (${union}) ORDER BY ${BROWSE_ORDER_BY[sort]} LIMIT ? OFFSET ?`)
+        .all(...params, pageSize, offset)
+
+  // Facets: query-only union (no kind/scope/project) so an active dropdown can
+  // always show — and keep — the option it is filtering on.
+  const facetBranches = BROWSE_LAYERS.map(facetBranch)
+  const facetUnion = facetBranches.map((branch) => branch.sql).join(' UNION ALL ')
+  const facetParams = facetBranches.flatMap((branch) => branch.params)
+  const facetRows = (column, where) =>
+    db
+      .prepare(`SELECT ${column} AS value, COUNT(*) AS n FROM (${facetUnion}) ${where} GROUP BY ${column} ORDER BY n DESC, ${column} ASC`)
+      .all(...facetParams)
+  const faceted = (column, where, label) =>
+    facetRows(column, where).map((row) => ({ [label]: String(row.value), count: Number(row.n) }))
+
+  const facets = {
+    kinds: faceted('kind', '', 'kind'),
+    scopes: faceted('scope', "WHERE scope IS NOT NULL AND scope <> ''", 'scope'),
+    projects: faceted('project', "WHERE project IS NOT NULL AND project <> ''", 'project'),
+  }
+
+  return {
+    items: rows.map((row) => ({
+      layer: String(row.layer),
+      id: Number(row.id),
+      title: String(row.title ?? ''),
+      text: String(row.text ?? ''),
+      kind: String(row.kind ?? ''),
+      project: row.project === null || row.project === undefined || row.project === '' ? null : String(row.project),
+      scope: String(row.scope ?? ''),
+      source: String(row.source ?? ''),
+      tags: parseTags(row.tags),
+      pinned: Number(row.pinned) === 1,
+      useCount: Number(row.useCount ?? 0),
+      createdAt: Number(row.createdAt ?? 0),
+      updatedAt: Number(row.updatedAt ?? 0),
+    })),
+    total,
+    counts,
+    facets,
+    page: safePage,
+    pageSize,
+    pages,
+    layer: wanted,
+    query,
+    kind,
+    scope,
+    project,
+    sort,
+  }
 }
 
 /**
@@ -322,8 +533,16 @@ export function listMemories(db, payload = {}) {
     // Substring search: FTS trigram cannot match 1–2 character CJK queries and
     // the management view must find exactly what the user typed.
     const pattern = likePattern(query)
-    where.push("(title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')")
-    params.push(pattern, pattern, pattern)
+    // Search every column a user might remember: the body, the derived title,
+    // the tags, the project key, the scene name, the source label and the kind.
+    // Restricting it to three columns made the management view miss rows the
+    // user could see with their own eyes in the list.
+    where.push(
+      "(title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\'" +
+      " OR project LIKE ? ESCAPE '\\' OR scene LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\'" +
+      " OR kind LIKE ? ESCAPE '\\')",
+    )
+    params.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern)
   }
 
   if (payload.kind !== undefined && payload.kind !== null && payload.kind !== '') {
@@ -364,7 +583,7 @@ export function listMemories(db, payload = {}) {
     pages,
     sort,
     includeSuperseded,
-    facets: facets(db),
+    facets: facets(db, { includeSuperseded }),
   }
 }
 
@@ -509,12 +728,7 @@ export function updateMemory(db, payload = {}, now = Date.now()) {
   const priority = normalizePriority(payload.priority, Number(row.priority ?? PRIORITY_DEFAULT))
   const version = Number.isFinite(Number(row.version)) ? Number(row.version) : 1
 
-  if (textChanged) {
-    db.prepare(
-      `INSERT INTO memory_history(memory_id, version, op, text, created_at)
-       VALUES (?, ?, 'edit', ?, ?)`,
-    ).run(id, version, String(row.text ?? ''), timestamp)
-  }
+  const previousText = String(row.text ?? '')
 
   db.prepare(
     `UPDATE memory
@@ -538,6 +752,16 @@ export function updateMemory(db, payload = {}, now = Date.now()) {
     timestamp,
     id,
   )
+  // Inserted *after* the UPDATE on purpose: the sync trigger keys a history row
+  // by the memory's current hash, and the hash just changed with the text. Doing
+  // it before would publish the edit under the retired key, where no peer can
+  // attach it.
+  if (textChanged) {
+    db.prepare(
+      `INSERT INTO memory_history(memory_id, version, op, text, created_at)
+       VALUES (?, ?, 'edit', ?, ?)`,
+    ).run(id, version, previousText, timestamp)
+  }
   // The FTS triggers follow the UPDATE; the inverted feature index is a plain
   // table, so a rewritten body has to re-index explicitly.
   if (textChanged) indexMemoryFeatures(db, id, nextText)

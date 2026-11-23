@@ -111,10 +111,10 @@ test('textHash normalizes whitespace and case', () => {
   assert.equal(textHash('Hello   World'), textHash(' hello world '))
 })
 
-test('schema v5 adds the feature index and embedding tables and stays idempotent', () => {
+test('schema v6 adds the feature index, embedding and sync tables and stays idempotent', () => {
   const db = freshDb()
-  assert.equal(SCHEMA_VERSION, 5)
-  assert.equal(getMeta(db, 'schema_version'), '5')
+  assert.equal(SCHEMA_VERSION, 6)
+  assert.equal(getMeta(db, 'schema_version'), '6')
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name)
   assert.ok(tables.includes('memory_features'), 'missing memory_features table')
   assert.ok(tables.includes('memory_embeddings'), 'missing memory_embeddings table')
@@ -130,7 +130,7 @@ test('schema v5 adds the feature index and embedding tables and stays idempotent
 
   // A second migration pass must not clear, duplicate or downgrade anything.
   migrate(db)
-  assert.equal(getMeta(db, 'schema_version'), '5')
+  assert.equal(getMeta(db, 'schema_version'), '6')
   assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM memory_features').get().n), before)
   db.close()
 })

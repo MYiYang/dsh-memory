@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDatabase, saveMemory, stats as statsOf, backfillVectors } from '../src/store.js'
 import {
+  activeEmbeddedCount,
   deleteModelEmbeddings,
   deleteOtherModels,
   embeddingCounts,
@@ -146,6 +147,24 @@ test('deleting a memory removes its embedding row through the trigger', () => {
   const id = seed(db, '要被删掉的事实')
   db.prepare('DELETE FROM memory WHERE id = ?').run(id)
   assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM memory_embeddings').get().n), 0)
+  db.close()
+})
+
+test('activeEmbeddedCount keeps the panel numerator inside the live corpus', () => {
+  const db = freshDb()
+  const kept = seed(db, '还在用的部署事实')
+  const retired = seed(db, '已经被取代的部署事实')
+  // Superseding does not delete the vector: the retired row keeps its embedding.
+  db.prepare('UPDATE memory SET superseded_by = ? WHERE id = ?').run(kept, retired)
+  const counts = embeddingCounts(db, MODEL)
+  assert.equal(counts.embedded, 2, 'the retired vector still occupies a row')
+  assert.equal(counts.total, 1, 'but only one memory is live')
+  assert.equal(activeEmbeddedCount(counts), 1, 'the panel counts live rows only')
+  // Shapes the worker can report, including the one that used to print 102%.
+  assert.equal(activeEmbeddedCount(null), 0)
+  assert.equal(activeEmbeddedCount({ total: 3, pending: 1, stale: 0 }), 2)
+  assert.equal(activeEmbeddedCount({ total: 3, pending: 1, stale: 1 }), 3, 'a stale row still carries a vector')
+  assert.equal(activeEmbeddedCount({ total: 0, embedded: 5, pending: 0, stale: 0 }), 0)
   db.close()
 })
 

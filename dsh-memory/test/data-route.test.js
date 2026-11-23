@@ -269,11 +269,53 @@ test('data endpoints: 信任闸门拒绝时数据接口也是 403（不泄露方
     connection: { requestRejection: () => 'not a trusted page' },
   })
   try {
-    for (const method of ['memories', 'memory', 'memoryCreate', 'memoryUpdate', 'memoryDelete']) {
+    for (const method of ['memories', 'browse', 'memory', 'memoryCreate', 'memoryUpdate', 'memoryDelete']) {
       const response = await harness.call(method, { text: 'x', id: 1 })
       assert.equal(response.status, 403, method)
       assert.equal(response.json.error.code, 'forbidden', method)
     }
+  } finally {
+    cleanup(harness.dir)
+  }
+})
+
+test('data endpoints: browse 收条件筛选并回 facets（面板的四个下拉）', async () => {
+  const harness = createHarness()
+  try {
+    await seed(harness, { text: '部署流程用 pnpm', kind: 'work_fact', scope: 'project', project: 'demo' })
+    await seed(harness, { text: '所有命令都用 pwsh', kind: 'instruction', scope: 'global' })
+
+    const all = await harness.call('browse', {
+      page: 1,
+      pageSize: 50,
+      query: '',
+      layer: 'all',
+      kind: '',
+      scope: '',
+      project: '',
+      sort: 'updated',
+    })
+    assert.equal(all.status, 200, all.body)
+    assert.equal(all.json.value.total, 2)
+    assert.deepEqual(all.json.value.items.map((item) => item.layer).sort(), ['fact', 'fact'])
+    assert.deepEqual(all.json.value.counts, { fact: 2, turn: 0, scene: 0, persona: 0 })
+    assert.ok(all.json.value.facets.kinds.some((entry) => entry.kind === 'work_fact'))
+    assert.ok(all.json.value.facets.projects.some((entry) => entry.project === 'demo'))
+
+    const filtered = await harness.call('browse', { kind: 'instruction', scope: 'global' })
+    assert.equal(filtered.status, 200, filtered.body)
+    assert.equal(filtered.json.value.total, 1)
+    assert.equal(filtered.json.value.items[0].kind, 'instruction')
+    assert.deepEqual(filtered.json.value.items[0].tags, [])
+    assert.equal(filtered.json.value.kind, 'instruction')
+    assert.equal(filtered.json.value.scope, 'global')
+
+    const created = await harness.call('browse', { sort: 'created' })
+    assert.equal(created.json.value.sort, 'created')
+
+    const bad = await harness.call('browse', { scope: 'everywhere' })
+    assert.equal(bad.status, 400)
+    assert.equal(bad.json.error.code, 'bad-request')
   } finally {
     cleanup(harness.dir)
   }

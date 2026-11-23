@@ -132,8 +132,14 @@ function pageState(runtimeVector) {
   }
 }
 
-/** Evaluate the real bundle and render the settings section for one state. */
-async function renderPage(runtimeVector) {
+/**
+ * Evaluate the real bundle, let it register its slots, and render one of them.
+ *
+ * `wanted` names the registration: `settings.section:memory` is the settings
+ * page, `main:memory` the sidebar panel. Both come out of the same bundle, so a
+ * change meant for one and leaking into the other shows up here.
+ */
+async function renderSlot(runtimeVector, wanted) {
   let loaded
   const document = {
     baseURI: 'http://127.0.0.1:64427/',
@@ -178,7 +184,8 @@ async function renderPage(runtimeVector) {
       return () => {}
     },
   }
-  let component = null
+  /** Registration key → component, so a test can render any slot the bundle offers. */
+  const registered = new Map()
   const ctx = {
     effect: (factory) => {
       const disposer = factory()
@@ -188,17 +195,23 @@ async function renderPage(runtimeVector) {
     slots: {
       inject: (name, callback) => callback(),
       register: (definition, candidate) => {
-        assert.equal(definition.name, 'settings.section')
-        assert.equal(definition.id, 'memory')
-        component = candidate
+        const id = definition.id ?? definition.key ?? ''
+        registered.set(`${definition.name}:${id}`, candidate)
         return () => {}
       },
     },
   }
   plugin.apply(ctx)
-  assert.equal(typeof component, 'function')
+  const component = registered.get(wanted)
+  assert.equal(typeof component, 'function', `the bundle registers ${wanted}`)
   return runtime.render(component)
 }
+
+/** The settings page (设置 → 记忆). */
+const renderPage = (runtimeVector) => renderSlot(runtimeVector, 'settings.section:memory')
+
+/** The sidebar panel (记忆 → 统计). */
+const renderPanel = (runtimeVector) => renderSlot(runtimeVector, 'main:memory')
 
 test('the page renders a configured vector model with its width and coverage', async () => {
   const html = await renderPage({
@@ -249,4 +262,50 @@ test('the built-in provider shows no vector-model status line', async () => {
   const html = await renderPage({ enabled: true, provider: 'hash', model: null, dims: 384, dimsSource: 'builtin', tag: 'hash-ngram-v1-384', endpoint: null, available: true, keyRef: null, embedded: 0, pending: 0, total: 0, lastError: null })
   assert.match(html, /向量模型/, 'the settings group itself still renders')
   assert.ok(!html.includes('已嵌入'), 'no status line for the built-in algorithm')
+})
+
+/** A vector runtime where retired vectors outnumber the live corpus. */
+function retiredVector(overrides = {}) {
+  return {
+    enabled: true,
+    provider: 'openai',
+    model: 'toy-embed',
+    dims: 8,
+    dimsSource: 'config',
+    tag: 'openai:toy-embed@8',
+    endpoint: 'http://127.0.0.1:11434/v1/embeddings',
+    available: true,
+    keyRef: 'MY_KEY',
+    // 40 live rows, 52 vector rows: 12 of them belong to superseded memories.
+    embedded: 52,
+    embeddedActive: 40,
+    pending: 0,
+    stale: 0,
+    total: 40,
+    lastError: null,
+    ...overrides,
+  }
+}
+
+test('the sidebar panel counts live rows only, so the ratio never passes 100%', async () => {
+  const html = await renderPanel(retiredVector())
+  assert.match(html, /已嵌入40\/40/, 'the numerator follows the live corpus')
+  assert.ok(!html.includes('52'), 'retired vectors are not counted')
+  assert.match(html, /openai:toy-embed@8|toy-embed/, 'the model line is still there')
+})
+
+test('the sidebar panel derives the live count from pending/stale when the host is older', async () => {
+  const html = await renderPanel((({ embeddedActive, ...rest }) => rest)(retiredVector()))
+  assert.match(html, /已嵌入40\/40/, 'derived from total - missing, not from the raw 52')
+
+  const partial = await renderPanel((({ embeddedActive, ...rest }) => rest)(retiredVector({ pending: 28, stale: 0 })))
+  assert.match(partial, /已嵌入12\/40/, 'live rows without a vector are subtracted (40 - 28)')
+})
+
+test('the settings page keeps reporting the raw vector count', async () => {
+  // Deliberate split: Settings answers "how many vectors does the model hold",
+  // the panel answers "how much of what I can see is covered". Only the second
+  // one was wrong, so only the second one changed.
+  const html = await renderPage(retiredVector())
+  assert.match(html, /已嵌入 52\/40/, 'the settings card is untouched')
 })

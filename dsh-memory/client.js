@@ -122,6 +122,28 @@ window.__ModuleLoader__.load({
       statsScenes: '场景',
       statsPersonas: '人设',
       statsTokens: '词元消耗',
+      statsTurns: '原文轮次',
+      statsProjects: '项目',
+      statsSuperseded: '已取代',
+
+      // ── statistics dashboard ────────────────────────────────────────────
+      statsLayers: '四层记忆',
+      statsLayersNote: '各一张表',
+      statsLayerL0: 'L0 原文',
+      statsLayerL1: 'L1 记忆',
+      statsLayerL2: 'L2 场景',
+      statsLayerL3: 'L3 画像',
+      statsKindTitle: '记忆构成',
+      statsKindNote: '按类型，取前八',
+      statsKindOther: '其他',
+      statsVectorTitle: '向量覆盖',
+      statsVectorDims: '维度',
+      statsVectorModel: '模型',
+      statsStorageTitle: '存储占用',
+      statsStorageVector: '向量索引',
+      statsStorageOther: '其余数据',
+      statsDetailTitle: '明细',
+      statsEmpty: '还没有记忆条目。',
 
       // ── memory data manager (记忆数据) ──────────────────────────────────
       dataTitle: '记忆数据',
@@ -227,6 +249,24 @@ window.__ModuleLoader__.load({
       'group.vector.description': '向量模型（内置词法或外部嵌入）、召回与混排权重。',
       'group.storage.description': '数据库文件位置，改动需要重启。',
       'group.advanced.description': '调试开关与技能注册。',
+      'group.sync.description': '把记忆同步到自建 MinIO / S3 兼容存储，首次启用即上云。',
+      // ── cloud sync field labels ────────────────────────────────────────
+      'sync.enabled': '云同步',
+      'sync.mode': '同步节奏',
+      'sync.everySeconds': '同步间隔（秒）',
+      'sync.remote': '远端类型',
+      'sync.workspace': '工作区',
+      'sync.local.dir': '本地目录',
+      'sync.s3.endpoint': 'S3 端点',
+      'sync.s3.bucket': '桶名',
+      'sync.s3.region': '区域',
+      'sync.s3.pathStyle': 'path-style 寻址',
+      'sync.s3.prefix': '对象前缀',
+      'sync.s3.accessKeyRef': 'Access Key（或环境变量名）',
+      'sync.s3.secretKeyRef': 'Secret Key（或环境变量名）',
+      'sync.encrypt': '端到端加密',
+      'sync.encryptKey': '加密密钥（Base64，32 字节；留空即明文）',
+
 
       // ── field labels (keyed by the host's field key) ────────────────────
       'recall.scope': '召回范围',
@@ -468,6 +508,28 @@ window.__ModuleLoader__.load({
       statsScenes: 'Scenes',
       statsPersonas: 'Personas',
       statsTokens: 'Tokens',
+      statsTurns: 'Turns',
+      statsProjects: 'Projects',
+      statsSuperseded: 'Superseded',
+
+      // ── statistics dashboard ────────────────────────────────────────────
+      statsLayers: 'Memory layers',
+      statsLayersNote: 'one table each',
+      statsLayerL0: 'L0 turns',
+      statsLayerL1: 'L1 memories',
+      statsLayerL2: 'L2 scenes',
+      statsLayerL3: 'L3 personas',
+      statsKindTitle: 'By kind',
+      statsKindNote: 'top eight',
+      statsKindOther: 'Other',
+      statsVectorTitle: 'Vector coverage',
+      statsVectorDims: 'Width',
+      statsVectorModel: 'Model',
+      statsStorageTitle: 'Storage',
+      statsStorageVector: 'Vector index',
+      statsStorageOther: 'Everything else',
+      statsDetailTitle: 'Details',
+      statsEmpty: 'No memories stored yet.',
 
       // ── memory data manager (记忆数据) ──────────────────────────────────
       dataTitle: 'Memory data',
@@ -573,6 +635,23 @@ window.__ModuleLoader__.load({
       'group.vector.description': 'Vector model (built-in lexical or an embedding endpoint), recall, and blended weight.',
       'group.storage.description': 'Database file location; changes need a restart.',
       'group.advanced.description': 'Debug logging and skill registration.',
+      'group.sync.description': 'Sync memories to a self-hosted MinIO / S3-compatible store; the first run seeds the bucket.',
+      'sync.enabled': 'Cloud sync',
+      'sync.mode': 'Cadence',
+      'sync.everySeconds': 'Interval (seconds)',
+      'sync.remote': 'Remote type',
+      'sync.workspace': 'Workspace',
+      'sync.local.dir': 'Local directory',
+      'sync.s3.endpoint': 'S3 endpoint',
+      'sync.s3.bucket': 'Bucket',
+      'sync.s3.region': 'Region',
+      'sync.s3.pathStyle': 'Path-style addressing',
+      'sync.s3.prefix': 'Object prefix',
+      'sync.s3.accessKeyRef': 'Access key (or env var name)',
+      'sync.s3.secretKeyRef': 'Secret key (or env var name)',
+      'sync.encrypt': 'End-to-end encryption',
+      'sync.encryptKey': 'Encryption key (base64, 32 bytes; empty means plaintext)',
+
 
       // ── field labels (keyed by the host's field key) ────────────────────
       'recall.scope': 'Recall scope',
@@ -1327,6 +1406,19 @@ window.__ModuleLoader__.load({
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.36);
   overflow: hidden;
 }
+/* The same window rendered inside the sidebar panel: no backdrop and no
+   viewport cap — it fills the panel body and keeps its own scroll area. */
+.dm_modalInline {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
 .dm_modalHead {
   display: flex;
   align-items: center;
@@ -1934,6 +2026,38 @@ body[data-ds-dark-theme] .dm_stat {
       )
     }
 
+    /**
+     * Live rows carrying a vector, for the sidebar panel's 已嵌入 X/Y line.
+     *
+     * The host's raw `vector.embedded` counts every `memory_embeddings` row for
+     * the model, retired vectors included: superseding a memory does not delete
+     * its vector, and `vector.total` counts live rows only, so the pair can read
+     * as "5,737/5,623". The host sends `embeddedActive`; an older host is covered
+     * by the same arithmetic (live rows without a vector = pending - stale).
+     * Clamped below `total`, so the panel can never print a ratio past 100%.
+     */
+    function vectorCovered(vector) {
+      if (vector === null || typeof vector !== 'object') return 0
+      const total = Number(vector.total)
+      /** Clamp into [0, total]: no numerator may pass the live corpus. */
+      const bounded = (value) => {
+        const ceiling = Number.isFinite(total) && total > 0 ? total : Number.POSITIVE_INFINITY
+        return Math.max(0, Math.min(ceiling, value))
+      }
+      const reported = Number(vector.embeddedActive)
+      if (Number.isFinite(reported)) return bounded(reported)
+      // Older host: live rows with no vector at all are pending - stale, so the
+      // live-and-covered count is total minus that. Never derived from `embedded`,
+      // which carries the retired rows this line is about.
+      const pending = Number(vector.pending)
+      if (Number.isFinite(total) && Number.isFinite(pending)) {
+        const stale = Number(vector.stale)
+        return bounded(total - Math.max(0, pending - (Number.isFinite(stale) ? stale : 0)))
+      }
+      const raw = Number(vector.embedded)
+      return Number.isFinite(raw) ? bounded(raw) : 0
+    }
+
     /** Grouped integer for the statistics tiles. */
     function formatCount(value) {
       if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
@@ -1942,6 +2066,33 @@ body[data-ds-dark-theme] .dm_stat {
       } catch {
         return String(value)
       }
+    }
+
+    /**
+     * One labelled proportional bar for the statistics dashboard.
+     *
+     * Nine equal tiles could not show that L1 holds 5.8k rows while L3 holds 20:
+     * every number was the same size. A bar normalised to the largest value keeps
+     * the small ones visible (2% floor) instead of collapsing them to a hairline,
+     * and the exact count stays beside it.
+     */
+    function panelBar(label, value, max, tone, key) {
+      const ratio = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0
+      return h(
+        'div',
+        { className: 'dm_pnRow', key: key },
+        h(
+          'div',
+          { className: 'dm_pnRowHead' },
+          h('span', { className: 'dm_pnRowLabel' }, label),
+          h('strong', { className: 'dm_pnRowValue' }, formatCount(value)),
+        ),
+        h(
+          'div',
+          { className: 'dm_pnTrack' },
+          h('div', { className: 'dm_pnFill ' + tone, style: { width: (ratio > 0 ? Math.max(ratio * 100, 2) : 0) + '%' } }),
+        ),
+      )
     }
 
     /** An enum option may arrive as a bare string (host catalog) or an object. */
@@ -2155,6 +2306,12 @@ body[data-ds-dark-theme] .dm_stat {
       return function MemoryDataBrowser(props) {
         const onClose = typeof props?.onClose === 'function' ? props.onClose : () => {}
         const onChanged = typeof props?.onChanged === 'function' ? props.onChanged : null
+        /**
+         * `inline` reuses the very same window inside the sidebar panel: no
+         * backdrop, no viewport portal and no Escape handler, but the list,
+         * the filters, the create/edit form and the pager are identical.
+         */
+        const inline = props?.inline === true
 
         const [list, setList] = React.useState(null)
         const [loading, setLoading] = React.useState(false)
@@ -2232,8 +2389,10 @@ body[data-ds-dark-theme] .dm_stat {
           fetchPage(1)
         }, [])
 
-        // Escape closes the window, like the settings shell's own dialogs.
+        // Escape closes the window, like the settings shell's own dialogs. The
+        // inline copy lives inside the panel, where Escape belongs to the host.
         React.useEffect(() => {
+          if (inline) return undefined
           if (typeof document === 'undefined' || document === null || typeof document.addEventListener !== 'function') {
             return undefined
           }
@@ -2248,7 +2407,7 @@ body[data-ds-dark-theme] .dm_stat {
               /* a detached document cannot remove the listener; harmless */
             }
           }
-        }, [onClose])
+        }, [onClose, inline])
 
         // ── filter actions ─────────────────────────────────────────────────
 
@@ -2849,6 +3008,47 @@ body[data-ds-dark-theme] .dm_stat {
 
         const headText = view === 'form' && draft !== null && draft.id !== null ? fill(tr('dataFormEdit', 'Edit memory #{id}'), { id: draft.id }) : view === 'form' ? tr('dataFormNew', 'New memory') : tr('dataModalTitle', 'Memory data')
 
+        const shell = h(
+          'div',
+          {
+            className: inline ? 'dm_modal dm_modalInline' : 'dm_modal',
+            role: inline ? undefined : 'dialog',
+            'aria-modal': inline ? undefined : 'true',
+            'aria-label': tr('dataModalTitle', 'Memory data'),
+          },
+          h(
+            'div',
+            { className: 'dm_modalHead' },
+            h(
+              'div',
+              { className: 'dm_modalTitleWrap' },
+              h('h3', { className: 'dm_modalTitle' }, headText),
+              view === 'form' ? null : h('span', { className: 'dm_modalSub' }, totalText),
+            ),
+            inline
+              ? null
+              : h(
+                  'button',
+                  { type: 'button', className: 'dm_iconBtn', 'aria-label': tr('dataClose', 'Close'), title: tr('dataClose', 'Close'), onClick: onClose },
+                  '×',
+                ),
+          ),
+          view === 'form'
+            ? h('div', { className: 'dm_modalBody' }, renderForm())
+            : h(
+                'div',
+                { className: 'dm_modalBody dm_modalBodyList' },
+                renderToolbar(),
+                error !== null ? h('div', { className: 'dm_modalAlert' }, renderDataAlert(error)) : null,
+                notice !== '' ? h('div', { className: 'dm_modalAlert' }, h('div', { className: 'dm_status dm_statusOk' }, notice)) : null,
+                h('div', { className: 'dm_dataScroll' }, renderList()),
+                renderFooter(),
+              ),
+        )
+
+        // The panel copy renders in place; only the settings window needs a
+        // backdrop and a viewport portal.
+        if (inline) return shell
         const overlay = h(
           'div',
           {
@@ -2858,41 +3058,7 @@ body[data-ds-dark-theme] .dm_stat {
               if (event.target === event.currentTarget) onClose()
             },
           },
-          h(
-            'div',
-            {
-              className: 'dm_modal',
-              role: 'dialog',
-              'aria-modal': 'true',
-              'aria-label': tr('dataModalTitle', 'Memory data'),
-            },
-            h(
-              'div',
-              { className: 'dm_modalHead' },
-              h(
-                'div',
-                { className: 'dm_modalTitleWrap' },
-                h('h3', { className: 'dm_modalTitle' }, headText),
-                view === 'form' ? null : h('span', { className: 'dm_modalSub' }, totalText),
-              ),
-              h(
-                'button',
-                { type: 'button', className: 'dm_iconBtn', 'aria-label': tr('dataClose', 'Close'), title: tr('dataClose', 'Close'), onClick: onClose },
-                '×',
-              ),
-            ),
-            view === 'form'
-              ? h('div', { className: 'dm_modalBody' }, renderForm())
-              : h(
-                  'div',
-                  { className: 'dm_modalBody dm_modalBodyList' },
-                  renderToolbar(),
-                  error !== null ? h('div', { className: 'dm_modalAlert' }, renderDataAlert(error)) : null,
-                  notice !== '' ? h('div', { className: 'dm_modalAlert' }, h('div', { className: 'dm_status dm_statusOk' }, notice)) : null,
-                  h('div', { className: 'dm_dataScroll' }, renderList()),
-                  renderFooter(),
-                ),
-          ),
+          shell,
         )
 
         // Portal when react-dom is available: the settings shell may sit inside a
@@ -2915,14 +3081,12 @@ body[data-ds-dark-theme] .dm_stat {
      *
      * @param {any} locale - the locale service (live re-render on locale switch)
      * @param {(key: string) => string} t - translate bound to this namespace
+     * @param {any} MemoryDataBrowser - the shared data window (also used inline by the panel)
      * @returns {() => any}
      */
-    function createSection(locale, t) {
+    function createSection(locale, t, MemoryDataBrowser) {
       /** Localize one key with a fallback that never renders an empty row. */
       const tr = (key, fallback) => translate(t, key, fallback)
-
-      /** The data window is built once so its component identity is stable. */
-      const MemoryDataBrowser = createDataBrowser({ t, tr })
 
       return function MemorySection() {
         useLocaleRefresh(locale)
@@ -3698,6 +3862,531 @@ body[data-ds-dark-theme] .dm_stat {
       }
     }
 
+    /**
+     * Sidebar panel: statistics, the memory manager and cloud sync, in one place.
+     *
+     * The 记忆 tab is the very same `MemoryDataBrowser` the settings page opens
+     * as a modal, rendered inline (`inline: true`): search, the kind/scope/
+     * project filters, paging, create, edit, delete and version history are one
+     * implementation, so the two surfaces cannot drift. Settings → 记忆数据
+     * keeps its own window unchanged. The 统计 tab reads the same `state`
+     * endpoint the settings page's summary card uses.
+     */
+    function createMemoryPanel(tRaw, MemoryDataBrowser) {
+      const t = (key, fallback) => translate(tRaw, key, fallback)
+      return function MemoryPanel(props) {
+        const [tab, setTab] = React.useState(
+          props?.defaultTab === 'sync' ? 'sync' : props?.defaultTab === 'memories' ? 'memories' : 'stats',
+        )
+        /** Bumped by the header refresh: remounts the inline browser at page 1. */
+        const [browserKey, setBrowserKey] = React.useState(0)
+        const [stat, setStat] = React.useState(null)
+        const [statError, setStatError] = React.useState(null)
+        const [sync, setSync] = React.useState(null)
+        const [message, setMessage] = React.useState('')
+        const [busy, setBusy] = React.useState('')
+
+        /** The whole `state` answer: statistics, storage and the vector runtime. */
+        const loadStats = React.useCallback(async () => {
+          setStatError(null)
+          const answer = await callHost('state', {}, t)
+          if (answer.ok !== true) {
+            setStatError(answer.error ?? { code: 'internal', message: t('requestFailed', 'Request failed') })
+            return
+          }
+          setStat(answer.value !== null && typeof answer.value === 'object' ? answer.value : null)
+        }, [t])
+
+        const loadSync = React.useCallback(async () => {
+          const answer = await callHost('syncStatus', {}, t)
+          setSync(answer.ok === true ? answer.value : { available: false, error: answer.error })
+        }, [t])
+
+        // Fetch per tab: statistics once (until refresh), sync counters on entry.
+        React.useEffect(() => {
+          if (tab === 'stats' && stat === null) void loadStats()
+          if (tab === 'sync') void loadSync()
+        }, [tab, stat, loadStats, loadSync])
+
+        /** Header refresh: re-read the visible tab. */
+        const refresh = () => {
+          if (tab === 'stats') void loadStats()
+          else if (tab === 'memories') setBrowserKey(previous => previous + 1)
+          else void loadSync()
+        }
+
+        /**
+         * Turn a sync result into one honest line. "同步完成" alone hides the
+         * difference between "moved nothing because there was nothing" and
+         * "seeded the bucket with the first snapshot", which is exactly the
+         * confusion that made an empty bucket look like a success.
+         */
+        const describeSync = (value) => {
+          if (value === null || typeof value !== 'object') return t('panelSyncDone', '同步完成')
+          if (value.error !== undefined) return t('panelSyncFailed', '同步失败') + '：' + String(value.error)
+          if (value.incompatible === true) return t('panelSyncIncompatible', '远端快照版本高于本机，已拒收')
+          if (value.seedError !== undefined) return t('panelSyncFailed', '同步失败') + '：' + String(value.seedError)
+          const parts = []
+          if (value.seeded !== undefined) parts.push(t('panelSyncSeeded', '已发布首份快照') + ' ' + Number(value.seeded.ops ?? 0) + ' 条')
+          if (value.bootstrap !== undefined) parts.push(t('panelSyncBootstrap', '已应用远端快照') + ' ' + Number(value.bootstrap.applied ?? 0) + ' 条')
+          if (value.mergedBack !== undefined) parts.push(t('panelSyncMergedBack', '已回发合并快照') + ' ' + Number(value.mergedBack.ops ?? 0) + ' 条')
+          if (value.republished !== undefined) parts.push(t('panelSyncRepublished', '已重发快照') + ' ' + Number(value.republished.ops ?? 0) + ' 条')
+          if (Number(value.pushed ?? 0) > 0) parts.push(t('panelSyncPushed', '推送') + ' ' + Number(value.pushed) + ' 段')
+          if (Number(value.pulled ?? 0) > 0) parts.push(t('panelSyncPulled', '拉取') + ' ' + Number(value.pulled) + ' 段')
+          if (parts.length === 0) return t('panelSyncNothing', '同步完成：本轮没有新内容')
+          return t('panelSyncDone', '同步完成') + '：' + parts.join(' · ')
+        }
+
+        const runSync = async () => {
+          setBusy('sync')
+          setMessage('')
+          const answer = await callHost('syncNow', { direction: 'both' }, t)
+          setMessage(answer.ok === true ? describeSync(answer.value) : answer.error?.message ?? '')
+          await loadSync()
+          setBusy('')
+        }
+
+        const testSync = async () => {
+          setBusy('test')
+          setMessage('')
+          const answer = await callHost('syncTest', {}, t)
+          const value = answer.ok === true ? answer.value : null
+          setMessage(
+            value === null
+              ? answer.error?.message ?? ''
+              : value.ok === true
+                ? t('panelSyncReachable', '连接正常') + ' · ' + value.ms + ' ms'
+                : value.error ?? t('panelSyncUnreachable', '连接失败'),
+          )
+          setBusy('')
+        }
+
+        /** Statistics tab: the same counters, drawn instead of listed. */
+        const renderStats = () => {
+          if (statError !== null) {
+            return h('p', { className: 'dm_panelHint dm_panelHintError' }, statError.message ?? t('requestFailed', 'Request failed'))
+          }
+          if (stat === null) return h('p', { className: 'dm_panelEmpty' }, t('loading', '加载中…'))
+          const stats = stat.stats !== null && typeof stat.stats === 'object' ? stat.stats : {}
+          const vector = stat.runtime !== null && typeof stat.runtime === 'object' ? stat.runtime.vector : null
+          const count = (value) => (Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0)
+
+          // Four tables, one scale. They differ by two orders of magnitude, so each
+          // bar is relative to the largest row rather than to the sum: an area chart
+          // of 5.8k against 20 would leave three of the four invisible.
+          const layers = [
+            [t('statsLayerL0', 'L0 原文'), count(stats.l0Total), 'dm_pnTone1'],
+            [t('statsLayerL1', 'L1 记忆'), count(stats.total), 'dm_pnTone2'],
+            [t('statsLayerL2', 'L2 场景'), count(stats.scenes), 'dm_pnTone3'],
+            [t('statsLayerL3', 'L3 画像'), count(stats.personas), 'dm_pnTone4'],
+          ]
+          const layerMax = Math.max(1, ...layers.map((row) => row[1]))
+
+          // Composition by kind: the eight biggest, the tail folded into 「其他」.
+          const kinds = []
+          if (stats.byKind !== null && typeof stats.byKind === 'object') {
+            for (const kind of Object.keys(stats.byKind)) {
+              const value = count(stats.byKind[kind])
+              if (value > 0) kinds.push([String(kind), value])
+            }
+          }
+          kinds.sort((a, b) => b[1] - a[1])
+          const kindBars = kinds.slice(0, 8).map((row) => [t('kind.' + row[0], row[0]), row[1]])
+          const tail = kinds.slice(8).reduce((sum, row) => sum + row[1], 0)
+          if (tail > 0) kindBars.push([t('statsKindOther', '其他'), tail])
+          const kindMax = Math.max(1, ...kindBars.map((row) => row[1]))
+
+          // Coverage ring. `vectorCovered` is the live-row numerator, so this ratio
+          // cannot pass 100% (see the comment on that function).
+          const covered = vectorCovered(vector)
+          const vectorTotal = vector === null ? 0 : count(vector.total)
+          const ratio = vectorTotal > 0 ? Math.min(1, covered / vectorTotal) : 0
+          const ring = 2 * Math.PI * 26
+
+          // Storage: one float32 per dimension per embedded row; everything else is
+          // the text corpus, the FTS index and SQLite's page overhead.
+          const dims = vector === null ? 0 : count(vector.dims)
+          const vectorBytes = vector === null ? 0 : count(vector.embedded) * dims * 4
+          const dbBytes = count(stats.dbBytes)
+          const otherBytes = Math.max(0, dbBytes - vectorBytes)
+          const bytesTotal = Math.max(1, dbBytes)
+
+          return h(
+            'div',
+            { className: 'dm_panelStats' },
+            h(
+              'div',
+              { className: 'dm_pnGrid' },
+              h(
+                'div',
+                { className: 'dm_pnCard' },
+                h(
+                  'div',
+                  { className: 'dm_pnCardHead' },
+                  h('h2', { className: 'dm_pnCardTitle' }, t('statsLayers', '四层记忆')),
+                  h('span', { className: 'dm_pnCardNote' }, t('statsLayersNote', '各一张表')),
+                ),
+                h(
+                  'div',
+                  { className: 'dm_pnBars' },
+                  layers.map((row, index) => panelBar(row[0], row[1], layerMax, row[2], 'layer-' + index)),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'dm_pnCard' },
+                h(
+                  'div',
+                  { className: 'dm_pnCardHead' },
+                  h('h2', { className: 'dm_pnCardTitle' }, t('statsVectorTitle', '向量覆盖')),
+                  h('span', { className: 'dm_pnCardNote' }, vector === null ? '—' : String(vector.provider ?? '—')),
+                ),
+                h(
+                  'div',
+                  { className: 'dm_pnRingRow' },
+                  h(
+                    'div',
+                    { className: 'dm_pnRingBox' },
+                    h(
+                      'svg',
+                      { viewBox: '0 0 72 72', className: 'dm_pnRing', role: 'img', 'aria-label': t('statsVectorTitle', '向量覆盖') },
+                      h('circle', { cx: 36, cy: 36, r: 26, fill: 'none', strokeWidth: 7, className: 'dm_pnRingTrack' }),
+                      h('circle', {
+                        cx: 36,
+                        cy: 36,
+                        r: 26,
+                        fill: 'none',
+                        strokeWidth: 7,
+                        strokeLinecap: 'round',
+                        className: 'dm_pnRingFill',
+                        strokeDasharray: ring * ratio + ' ' + ring,
+                        transform: 'rotate(-90 36 36)',
+                      }),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dm_pnRingCenter' },
+                      h('strong', { className: 'dm_pnRingPct' }, vectorTotal > 0 ? Math.round(ratio * 100) + '%' : '—'),
+                      h('span', { className: 'dm_pnRingSub' }, t('panelEmbedded', '已嵌入')),
+                    ),
+                  ),
+                  h(
+                    'div',
+                    { className: 'dm_pnKv' },
+                    h(
+                      'div',
+                      { className: 'dm_pnKvRow' },
+                      h('span', null, t('panelEmbedded', '已嵌入')),
+                      h('strong', null, formatCount(covered) + '/' + formatCount(vectorTotal)),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dm_pnKvRow' },
+                      h('span', null, t('vectorPendingLabel', '待回填')),
+                      h('strong', null, formatCount(vector === null ? 0 : count(vector.pending))),
+                    ),
+                    h('div', { className: 'dm_pnKvRow' }, h('span', null, t('statsVectorDims', '维度')), h('strong', null, dims > 0 ? String(dims) : '—')),
+                    h(
+                      'div',
+                      { className: 'dm_pnKvRow' },
+                      h('span', null, t('statsVectorModel', '模型')),
+                      h('strong', { className: 'dm_pnKvWide' }, vector !== null && vector.model ? String(vector.model) : '—'),
+                    ),
+                  ),
+                ),
+                vector !== null && vector.lastError
+                  ? h('p', { className: 'dm_panelHint dm_panelHintError' }, String(vector.lastError))
+                  : null,
+              ),
+              h(
+                'div',
+                { className: 'dm_pnCard dm_pnCardWide' },
+                h(
+                  'div',
+                  { className: 'dm_pnCardHead' },
+                  h('h2', { className: 'dm_pnCardTitle' }, t('statsKindTitle', '记忆构成')),
+                  h('span', { className: 'dm_pnCardNote' }, t('statsKindNote', '按类型，取前八') + ' · ' + formatCount(count(stats.total))),
+                ),
+                kindBars.length === 0
+                  ? h('p', { className: 'dm_panelHint' }, t('statsEmpty', '还没有记忆条目。'))
+                  : h(
+                      'div',
+                      { className: 'dm_pnBars dm_pnBarsTwo' },
+                      kindBars.map((row, index) => panelBar(row[0], row[1], kindMax, 'dm_pnTone5', 'kind-' + index)),
+                    ),
+              ),
+              h(
+                'div',
+                { className: 'dm_pnCard' },
+                h(
+                  'div',
+                  { className: 'dm_pnCardHead' },
+                  h('h2', { className: 'dm_pnCardTitle' }, t('statsStorageTitle', '存储占用')),
+                  h('span', { className: 'dm_pnCardNote' }, formatBytes(dbBytes)),
+                ),
+                h(
+                  'div',
+                  { className: 'dm_pnStack' },
+                  h('div', { className: 'dm_pnStackSeg dm_pnTone2', style: { width: (vectorBytes / bytesTotal) * 100 + '%' } }),
+                  h('div', { className: 'dm_pnStackSeg dm_pnTone3', style: { width: (otherBytes / bytesTotal) * 100 + '%' } }),
+                ),
+                h(
+                  'div',
+                  { className: 'dm_pnLegend' },
+                  h(
+                    'span',
+                    { className: 'dm_pnLegendItem' },
+                    h('i', { className: 'dm_pnDot dm_pnTone2' }),
+                    t('statsStorageVector', '向量索引') + ' ' + formatBytes(vectorBytes),
+                  ),
+                  h(
+                    'span',
+                    { className: 'dm_pnLegendItem' },
+                    h('i', { className: 'dm_pnDot dm_pnTone3' }),
+                    t('statsStorageOther', '其余数据') + ' ' + formatBytes(otherBytes),
+                  ),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'dm_pnCard' },
+                h(
+                  'div',
+                  { className: 'dm_pnCardHead' },
+                  h('h2', { className: 'dm_pnCardTitle' }, t('statsDetailTitle', '明细')),
+                  h('span', { className: 'dm_pnCardNote' }, t('statsTurns', '原文轮次') + ' ' + formatCount(count(stats.l0Total))),
+                ),
+                h(
+                  'div',
+                  { className: 'dm_pnKv' },
+                  h('div', { className: 'dm_pnKvRow' }, h('span', null, t('statsProjects', '项目')), h('strong', null, formatCount(count(stats.projects)))),
+                  h('div', { className: 'dm_pnKvRow' }, h('span', null, t('statsSuperseded', '已取代')), h('strong', null, formatCount(count(stats.superseded)))),
+                  h('div', { className: 'dm_pnKvRow' }, h('span', null, t('statsPending', '待提炼')), h('strong', null, formatCount(count(stats.l0Pending)))),
+                  h('div', { className: 'dm_pnKvRow' }, h('span', null, t('statsTokens', '词元消耗')), h('strong', null, formatCount(count(stats.tokensSpent)))),
+                ),
+              ),
+            ),
+          )
+        }
+
+        const syncState =
+          sync === null
+            ? '…'
+            : sync.available === false || sync.enabled === false
+              ? t('panelSyncOff', '未启用')
+              : { closed: '正常', 'half-open': '恢复中', open: '熔断中' }[sync.state] ?? String(sync.state ?? '—')
+        const syncHint =
+          sync === null || sync.available === false || sync.enabled === false
+            ? t('panelSyncHintOff', '在「设置 → 记忆 → 云同步」里开启并填写 S3 配置后可用。')
+            : (sync.endpoint || '') + ' · ' + (sync.bucket || '') + ' · ' + t('panelSyncBacklog', '待推送') + ' ' + (sync.backlog?.ops ?? 0)
+
+        return h(
+          'section',
+          { className: 'dm_panel' },
+          h(
+            'header',
+            { className: 'dm_panelHead' },
+            h('h1', { className: 'dm_panelTitle' }, t('panelTitle', '记忆')),
+            h('button', { type: 'button', className: 'dm_panelBtn', onClick: refresh }, t('refresh', '刷新')),
+          ),
+          h(
+            'div',
+            { className: 'dm_panelTabs', role: 'tablist' },
+            h('button', { type: 'button', role: 'tab', className: tab === 'stats' ? 'dm_panelTab dm_panelTabOn' : 'dm_panelTab', 'aria-selected': tab === 'stats', onClick: () => setTab('stats') }, t('panelTabStats', '统计')),
+            h('button', { type: 'button', role: 'tab', className: tab === 'memories' ? 'dm_panelTab dm_panelTabOn' : 'dm_panelTab', 'aria-selected': tab === 'memories', onClick: () => setTab('memories') }, t('panelTabMemories', '记忆')),
+            h('button', { type: 'button', role: 'tab', className: tab === 'sync' ? 'dm_panelTab dm_panelTabOn' : 'dm_panelTab', 'aria-selected': tab === 'sync', onClick: () => setTab('sync') }, t('panelTabSync', '同步')),
+          ),
+          message === '' ? null : h('div', { className: 'dm_panelMsg' }, message),
+          tab === 'stats'
+            ? h('div', { className: 'dm_panelBody' }, renderStats())
+            : tab === 'memories'
+              ? h(
+                  'div',
+                  { className: 'dm_panelBody' },
+                  h(
+                    'div',
+                    { className: 'dm_panelBrowser' },
+                    h(MemoryDataBrowser, {
+                      key: 'browser-' + browserKey,
+                      inline: true,
+                      onClose: () => {},
+                      onChanged: () => {},
+                    }),
+                  ),
+                )
+              : h(
+                  'div',
+                  { className: 'dm_panelBody' },
+                  h(
+                    'div',
+                    { className: 'dm_panelSync' },
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncState', '状态')), h('strong', null, String(syncState))),
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncLastPush', '上次推送')), h('span', null, formatStamp(sync?.lastPushAt, t))),
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncLastPull', '上次拉取')), h('span', null, formatStamp(sync?.lastPullAt, t))),
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncPeers', '对端设备')), h('span', null, String(sync?.peers?.length ?? 0))),
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncBacklog', '待推送')), h('span', null, String(sync?.backlog?.ops ?? 0))),
+                    h('div', { className: 'dm_panelSyncRow' }, h('span', null, t('panelSyncVectors', '向量')), h('span', null, syncVectorLabel(sync, t))),
+                    h('p', { className: 'dm_panelHint' }, syncHint),
+                    h(
+                      'div',
+                      { className: 'dm_panelActions' },
+                      h('button', { type: 'button', className: 'dm_panelBtn dm_panelPrimary', disabled: busy !== '' || sync?.enabled !== true, onClick: () => { void runSync() } }, t('panelSyncNow', '立即同步')),
+                      h('button', { type: 'button', className: 'dm_panelBtn', disabled: busy !== '' || sync?.enabled !== true, onClick: () => { void testSync() } }, t('panelSyncTest', '测试连接')),
+                    ),
+                    h('p', { className: 'dm_panelHint' }, t('panelSyncWhere', 'S3 地址、桶与密钥在「设置 → 记忆 → 云同步」中填写；密钥只存环境变量名。')),
+                  ),
+                ),
+        )
+      }
+    }
+
+    /**
+     * One line describing vector sync: codec, how many rows the cloud holds and
+     * how much they weigh. `off` is a legitimate state, not an error.
+     */
+    function syncVectorLabel(sync, t) {
+      const vectors = sync?.vectors
+      if (vectors === null || vectors === undefined || vectors.codec === 'off') {
+        return t('panelSyncVectorsOff', '未上云（本地重建）')
+      }
+      const mb = (Number(vectors.bytes ?? 0) / 1048576).toFixed(1)
+      const pending = Number(vectors.pending ?? 0)
+      return String(vectors.codec) + ' · ' + String(vectors.rows ?? 0) + ' 条 · ' + mb + ' MB' + (pending > 0 ? ' · 待推 ' + pending : '')
+    }
+
+    /** `12:03` for a millisecond timestamp; used by the sync rows. */
+    function formatStamp(value, t) {      const stamp = Number(value)
+      if (!Number.isFinite(stamp) || stamp <= 0) return t('never', '—')
+      try {
+        const date = new Date(stamp)
+        const pad = (n) => String(n).padStart(2, '0')
+        return pad(date.getHours()) + ':' + pad(date.getMinutes())
+      } catch {
+        return t('never', '—')
+      }
+    }
+
+    /**
+     * Keep a render error inside the panel: without this, one thrown component
+     * unmounts the whole client tree and the page goes blank.
+     */
+    function withPanelBoundary(Inner) {
+      if (typeof React.Component !== 'function') return Inner
+      return class PanelBoundary extends React.Component {
+        constructor(props) {
+          super(props)
+          this.state = { error: null }
+        }
+        static getDerivedStateFromError(error) {
+          return { error }
+        }
+        render() {
+          if (this.state.error !== null) {
+            return h('div', { className: 'dm_panelMsg' }, '记忆面板出错：' + String(this.state.error?.message ?? this.state.error))
+          }
+          return h(Inner, this.props)
+        }
+      }
+    }
+
+    /** Console warning without throwing when console is absent. */
+    function warnClient(message) {
+      try {
+        console.warn('[dsh-memory] ' + message)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    /** @param {unknown} error */
+    function messageOfClient(error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+
+    /** 20×20 sidebar glyph: a card with three text lines. */
+    function MemoryPanelIcon(props) {
+      const size = Number(props?.size ?? 20)
+      return h(
+        'svg',
+        { width: size, height: size, viewBox: '0 0 20 20', fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+        h('rect', { x: 3, y: 2.5, width: 14, height: 15, rx: 2.5, stroke: 'currentColor', strokeWidth: 1.4 }),
+        h('path', { d: 'M6.5 7h7M6.5 10h7M6.5 13h4', stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round' }),
+      )
+    }
+
+    /** Panel-only stylesheet, keyed separately from the settings section. */
+    function installPanelStyle() {
+      if (typeof document === 'undefined' || document === null) return
+      try {
+        if (document.querySelector('style[data-plugin-css="dsh-memory/panel"]') !== null) return
+        const tag = document.createElement('style')
+        tag.dataset.plugin = 'dsh-memory-layered'
+        tag.dataset.pluginCss = 'dsh-memory/panel'
+        tag.textContent = [
+          '.dm_panel{display:flex;flex-direction:column;height:100%;min-height:0;padding:16px 18px;gap:10px;color:var(--dsh-text-primary,inherit);font:inherit}',
+          '.dm_panelHead{display:flex;align-items:center;justify-content:space-between;gap:10px}',
+          '.dm_panelTitle{font-size:16px;font-weight:600;margin:0}',
+          '.dm_panelTabs{display:flex;gap:6px;border-bottom:1px solid var(--dsh-border-subtle,rgba(128,128,128,.25));padding-bottom:6px}',
+          '.dm_panelTab{background:none;border:0;padding:4px 10px;border-radius:6px;cursor:pointer;color:inherit;opacity:.7;font:inherit}',
+          '.dm_panelTabOn{background:var(--dsh-surface-raised,rgba(128,128,128,.16));opacity:1;font-weight:600}',
+          '.dm_panelMsg{font-size:12px;padding:6px 8px;border-radius:6px;background:var(--dsh-surface-raised,rgba(128,128,128,.12));word-break:break-word}',
+          '.dm_panelBody{display:flex;flex-direction:column;gap:10px;min-height:0;flex:1}',
+          '.dm_panelStats{display:flex;flex-direction:column;gap:12px;overflow:auto;min-height:0;padding-bottom:4px}',
+          '.dm_pnGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}',
+          '@media (max-width:760px){.dm_pnGrid{grid-template-columns:minmax(0,1fr)}}',
+          '.dm_pnCard{display:flex;flex-direction:column;gap:10px;padding:12px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.08));border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.18))}',
+          '.dm_pnCardWide{grid-column:1/-1}',
+          '.dm_pnCardHead{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}',
+          '.dm_pnCardTitle{margin:0;font-size:12px;font-weight:600;letter-spacing:.01em;color:var(--dsw-alias-label-primary,inherit)}',
+          '.dm_pnCardNote{font-size:11px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:58%}',
+          '.dm_pnBars{display:flex;flex-direction:column;gap:9px}',
+          '.dm_pnBarsTwo{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 30px}',
+          '@media (max-width:760px){.dm_pnBarsTwo{grid-template-columns:minmax(0,1fr)}}',
+          '.dm_pnRow{display:flex;flex-direction:column;gap:4px}',
+          '.dm_pnRowHead{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;color:var(--dsw-alias-label-secondary,inherit)}',
+          '.dm_pnRowLabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+          '.dm_pnRowValue{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit)}',
+          '.dm_pnTrack{height:6px;border-radius:3px;background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.2));overflow:hidden}',
+          '.dm_pnFill{height:100%;border-radius:3px;transition:width .25s ease}',
+          '.dm_pnTone1{background:var(--dsw-static-blue-500,#4c7dff)}',
+          '.dm_pnTone2{background:var(--dsw-static-deepseek-500,#5b5bd6)}',
+          '.dm_pnTone3{background:var(--dsw-static-amber-500,#e0a23a)}',
+          '.dm_pnTone4{background:var(--dsw-static-green-500,#2f9e6e)}',
+          '.dm_pnTone5{background:var(--dsw-static-blue-500,#4c7dff)}',
+          '.dm_pnRingRow{display:flex;align-items:center;gap:14px;min-width:0}',
+          '.dm_pnRingBox{position:relative;width:76px;height:76px;flex:0 0 auto}',
+          '.dm_pnRing{display:block;width:76px;height:76px}',
+          '.dm_pnRingTrack{stroke:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.22))}',
+          '.dm_pnRingFill{stroke:var(--dsw-static-green-500,#2f9e6e)}',
+          '.dm_pnRingCenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none}',
+          '.dm_pnRingPct{font-size:15px;font-weight:600;line-height:18px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit)}',
+          '.dm_pnRingSub{font-size:10px;line-height:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+          '.dm_pnKv{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1 1 auto}',
+          '.dm_pnKvRow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;font-size:11px;color:var(--dsw-alias-label-tertiary,inherit);min-width:0}',
+          '.dm_pnKvRow>strong{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:64%}',
+          '.dm_pnKvRow>span{white-space:nowrap}',
+          '.dm_pnKvWide{white-space:normal !important;overflow-wrap:anywhere;text-align:right;max-width:72% !important}',
+          '.dm_pnStack{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--dsw-alias-bg-layer-4,rgba(128,128,128,.2))}',
+          '.dm_pnStackSeg{height:100%;transition:width .25s ease}',
+          '.dm_pnLegend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--dsw-alias-label-tertiary,inherit)}',
+          '.dm_pnLegendItem{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}',
+          '.dm_pnDot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}',
+          '.dm_panelBrowser{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}',
+          '.dm_panelBtn{border:1px solid var(--dsh-border-subtle,rgba(128,128,128,.35));background:var(--dsh-surface-raised,rgba(128,128,128,.1));color:inherit;border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}',
+          '.dm_panelBtn[disabled]{opacity:.45;cursor:not-allowed}',
+          '.dm_panelPrimary{border-color:transparent;background:var(--dsh-accent,rgba(80,120,255,.9));color:var(--dsh-accent-contrast,#fff)}',
+          '.dm_panelSync{display:flex;flex-direction:column;gap:8px;max-width:520px}',
+          '.dm_panelSyncRow{display:flex;justify-content:space-between;font-size:13px;padding:4px 0;border-bottom:1px dashed var(--dsh-border-subtle,rgba(128,128,128,.2))}',
+          '.dm_panelHint{font-size:12px;opacity:.6;margin:2px 0}',
+          '.dm_panelHintError{color:var(--dsh-danger,#d4534a);opacity:1}',
+          '.dm_panelActions{display:flex;gap:8px;margin-top:6px}',
+        ].join('')
+        document.head.appendChild(tag)
+      } catch {
+        /* styling is cosmetic */
+      }
+    }
+
     // The page owns one stylesheet for the bundle's whole lifetime: inject it
     // when the factory materializes so the client module system can inventory
     // the tag against this package (and HMR keeps a single copy).
@@ -3708,7 +4397,9 @@ body[data-ds-dark-theme] .dm_stat {
       apply(ctx) {
         ctx.effect(() => registerDictionaries(ctx.locale), 'dsh-memory: zh/en dictionaries')
         const t = ctx.locale.bind(NS)
-        const MemorySection = createSection(ctx.locale, t)
+        /** Built once, shared by Settings → 记忆数据 and the sidebar panel. */
+        const MemoryDataBrowser = createDataBrowser({ t, tr: (key, fallback) => translate(t, key, fallback) })
+        const MemorySection = createSection(ctx.locale, t, MemoryDataBrowser)
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(
             {
@@ -3720,6 +4411,34 @@ body[data-ds-dark-theme] .dm_stat {
             MemorySection,
           ),
         )
+
+        // Sidebar panel: one icon in the rail, one main panel keyed by the same
+        // id. Both registrations are individually guarded — a host without the
+        // sidebar slots must keep the settings page working.
+        installPanelStyle()
+        const MemoryPanel = createMemoryPanel(t, MemoryDataBrowser)
+        try {
+          ctx.slots.inject('sidebar.panellist', () =>
+            ctx.slots.register(
+              {
+                name: 'sidebar.panellist',
+                id: 'memory',
+                order: 30,
+                label: () => translate(t, 'panelTitle', '记忆'),
+              },
+              MemoryPanelIcon,
+            ),
+          )
+        } catch (error) {
+          warnClient(`sidebar entry not registered: ${messageOfClient(error)}`)
+        }
+        try {
+          ctx.slots.inject('main', () =>
+            ctx.slots.register({ name: 'main', key: 'memory' }, withPanelBoundary(MemoryPanel)),
+          )
+        } catch (error) {
+          warnClient(`memory panel not registered: ${messageOfClient(error)}`)
+        }
       },
     }
   },

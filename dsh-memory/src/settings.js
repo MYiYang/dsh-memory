@@ -71,6 +71,7 @@ export function resolveConfig(raw) {
   const persona = section(config.persona)
   const jev = section(persona.jev)
   const vector = section(config.vector)
+  const syncRaw = section(config.sync)
   const text = (value, fallback = '') => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
   return {
     dbPath: resolveDbPath(config),
@@ -196,6 +197,37 @@ export function resolveConfig(raw) {
       enabled: section(config.skills).enabled !== false,
       dir: text(section(config.skills).dir),
     },
+    // Cloud sync (opt-in, off by default). Nothing here touches the network
+    // until sync.enabled is true and a remote is configured; sync.mode decides
+    // whether the engine runs on a timer or only on an explicit "sync now".
+    sync: {
+      enabled: syncRaw.enabled === true,
+      mode: syncRaw.mode === 'auto' ? 'auto' : 'manual',
+      everySeconds: number(syncRaw.everySeconds, 300, 10, 3600),
+      workspace: text(syncRaw.workspace, 'default'),
+      encrypt: syncRaw.encrypt !== false,
+      conditionalPut: syncRaw.conditionalPut === true,
+      // `off` keeps the bucket at truth-only size. The other values put the
+      // embedding vectors in the cloud too, so a restored device never has to
+      // pay for them again; the codec is the precision/bytes trade.
+      vectors: ['f32', 'f16', 'i8'].includes(String(syncRaw.vectors ?? '')) ? String(syncRaw.vectors) : 'off',
+      vectorsPerSegment: number(syncRaw.vectorsPerSegment, 40, 1, 400),
+      remote: syncRaw.remote === 's3' ? 's3' : 'local',
+      local: { dir: text(section(syncRaw.local).dir) },
+      s3: {
+        endpoint: text(section(syncRaw.s3).endpoint),
+        bucket: text(section(syncRaw.s3).bucket),
+        region: text(section(syncRaw.s3).region, 'us-east-1'),
+        pathStyle: section(syncRaw.s3).pathStyle !== false,
+        prefix: text(section(syncRaw.s3).prefix, 'v1'),
+        accessKeyRef: text(section(syncRaw.s3).accessKeyRef),
+        secretKeyRef: text(section(syncRaw.s3).secretKeyRef),
+        caFile: text(section(syncRaw.s3).caFile),
+      },
+      // End-to-end encryption key (base64, 32 bytes). Shown in the settings page
+      // on purpose: the same key has to be copied to every device.
+      encryptKey: text(syncRaw.encryptKey),
+    },
   }
 }
 
@@ -208,6 +240,7 @@ export const GROUPS = [
   { id: 'persona' },
   { id: 'vector' },
   { id: 'storage' },
+  { id: 'sync' },
   { id: 'advanced' },
 ]
 
@@ -300,6 +333,25 @@ export const FIELDS = [
 
   // ── Storage (restart-only) ───────────────────────────────────────────────
   { key: 'storage.dbPath', path: ['dbPath'], group: 'storage', type: 'text', live: false },
+
+  // ── Cloud sync ───────────────────────────────────────────────────────────
+  { key: 'sync.enabled', path: ['sync', 'enabled'], group: 'sync', type: 'boolean', live: true },
+  { key: 'sync.mode', path: ['sync', 'mode'], group: 'sync', type: 'enum', options: ['manual', 'auto'], live: true },
+  { key: 'sync.everySeconds', path: ['sync', 'everySeconds'], group: 'sync', type: 'number', min: 10, max: 3600, step: 10, live: true },
+  { key: 'sync.workspace', path: ['sync', 'workspace'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.remote', path: ['sync', 'remote'], group: 'sync', type: 'enum', options: ['local', 's3'], live: false },
+  { key: 'sync.local.dir', path: ['sync', 'local', 'dir'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.endpoint', path: ['sync', 's3', 'endpoint'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.bucket', path: ['sync', 's3', 'bucket'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.region', path: ['sync', 's3', 'region'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.pathStyle', path: ['sync', 's3', 'pathStyle'], group: 'sync', type: 'boolean', live: false },
+  { key: 'sync.s3.prefix', path: ['sync', 's3', 'prefix'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.accessKeyRef', path: ['sync', 's3', 'accessKeyRef'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.s3.secretKeyRef', path: ['sync', 's3', 'secretKeyRef'], group: 'sync', type: 'text', live: false },
+  { key: 'sync.encrypt', path: ['sync', 'encrypt'], group: 'sync', type: 'boolean', live: false },
+  { key: 'sync.vectors', path: ['sync', 'vectors'], group: 'sync', type: 'enum', options: ['off', 'f32', 'f16', 'i8'], live: false },
+  { key: 'sync.vectorsPerSegment', path: ['sync', 'vectorsPerSegment'], group: 'sync', type: 'number', min: 1, max: 400, step: 1, live: false },
+  { key: 'sync.encryptKey', path: ['sync', 'encryptKey'], group: 'sync', type: 'text', live: false },
 
   // ── Advanced ─────────────────────────────────────────────────────────────
   { key: 'debug', path: ['debug'], group: 'advanced', type: 'boolean', live: true },

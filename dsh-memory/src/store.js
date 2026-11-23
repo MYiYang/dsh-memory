@@ -15,9 +15,10 @@ import { dirname } from 'node:path'
 import { VECTOR_MODEL, embed, packVector } from './vector.js'
 import { backfillFeatureIndex, ensureFeatureIndexModel, indexMemoryFeatures } from './feature-index.js'
 import { ensureEmbeddingSchema } from './embedding-store.js'
+import { ensureSyncSchema } from './sync/schema.js'
 
 /** Schema version; bump when the layout changes and add a migration step. */
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 
 /**
  * Kinds of memory rows.
@@ -302,6 +303,16 @@ export function migrate(db) {
     // Never let an index stand between the caller and an open database.
     if (process.env.DSH_MEMORY_DEBUG === '1') {
       console.warn('[dsh-memory] memory_vec_idx not created:', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  // v6: sync tables + capture triggers. Additive and isolated: a failure here
+  // must never stop the plugin from opening (sync would simply stay unavailable).
+  try {
+    ensureSyncSchema(db)
+  } catch (error) {
+    if (process.env.DSH_MEMORY_DEBUG === '1') {
+      console.warn('[dsh-memory] sync schema not created:', error instanceof Error ? error.message : String(error))
     }
   }
 

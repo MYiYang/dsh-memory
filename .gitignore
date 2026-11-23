@@ -40,3 +40,16 @@
 /dsh-memory/HANDOFF.md
 /dsh-memory/IMPLEMENTATION-persona-patch.md
 /dsh-memory/RESEARCH-*.md
+
+# 云同步那一轮的内部设计稿与实测记录：只在本地留档，仓里只留代码、测试与 README
+/dsh-memory/DESIGN-cloud-memory.md
+/dsh-memory/DESIGN-cloud-sync.md
+/dsh-memory/DESIGN-cloud-sync-safety.md
+/dsh-memory/DESIGN-hot-warm-cold.md
+/dsh-memory/DESIGN-sidebar-panel-and-sync.md
+/dsh-memory/DESIGN-sync-encryption.md
+/dsh-memory/DESIGN-sync-integrity.md
+/dsh-memory/DESIGN-sync-vectors.md
+/dsh-memory/IMPLEMENTATION-cloud-sync.md
+/dsh-memory/IMPLEMENTATION-cloud-sync-s3.md
+/dsh-memory/ANALYSIS-sqlite-scale.md

@@ -95,7 +95,13 @@ test('字段目录本身自洽：key 唯一、分组存在、类型元数据完�
   assert.equal(fieldByKey('no.such.key'), undefined)
   // 契约 §3.2：只有这些字段不能热更新
   const restartOnly = FIELDS.filter((field) => field.live === false).map((field) => field.key).sort()
-  assert.deepEqual(restartOnly, ['extraction.model', 'extraction.provider', 'skills.dir', 'skills.enabled', 'storage.dbPath'])
+  assert.deepEqual(restartOnly, [
+    'extraction.model', 'extraction.provider', 'skills.dir', 'skills.enabled', 'storage.dbPath',
+    'sync.encrypt', 'sync.encryptKey', 'sync.local.dir', 'sync.remote',
+    'sync.s3.accessKeyRef', 'sync.s3.bucket',
+    'sync.s3.endpoint', 'sync.s3.pathStyle', 'sync.s3.prefix', 'sync.s3.region',
+    'sync.s3.secretKeyRef', 'sync.vectors', 'sync.vectorsPerSegment', 'sync.workspace',
+  ])
 })
 
 // ── 校验 ────────────────────────────────────────────────────────────────────
@@ -413,7 +419,7 @@ test('buildGroups 输出 8 组、字段元数据齐全、重启项带 active', (
     const groups = buildGroups(effective, active, loaderRaw, storedSettings)
     assert.deepEqual(
       groups.map((group) => group.id),
-      ['recall', 'capture', 'extraction', 'scenes', 'persona', 'vector', 'storage', 'advanced'],
+      ['recall', 'capture', 'extraction', 'scenes', 'persona', 'vector', 'storage', 'sync', 'advanced'],
     )
     const fields = groups.flatMap((group) => group.fields)
     // 每个字段恰好出现一次（分组过滤不能丢字段或重复字段）
@@ -442,6 +448,9 @@ test('buildGroups 输出 8 组、字段元数据齐全、重启项带 active', (
       'persona.personaReasoningEffort',
       'persona.triggerMode',
       'recall.scope',
+      'sync.mode',
+      'sync.remote',
+      'sync.vectors',
       'vector.provider',
     ])
     for (const field of enums) {

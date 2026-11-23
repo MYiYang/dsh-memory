@@ -255,6 +255,7 @@ resolveConfig 内置默认值（53 个字段各一份）
 | `POST /memory/api/embeddingTest` | `{}` | `{ok,provider,model,dims,dimsSource,tag,endpoint,ms,error}`：**真发一次嵌入请求**，用来区分「地址错 / key 错 / 维度错」；`provider=hash` 时不联网，直接回 384 |
 | `POST /memory/api/reveal` | `{}` | `{opened,dir,error?}`：在系统文件管理器里打开**数据库所在目录**（Windows `explorer.exe`、macOS `open`、其他 `xdg-open`）；spawn 本身失败才回 `opened:false`，文件管理器异步启动失败只记日志 |
 | `POST /memory/api/memories` | `{query?,kind?,scope?,project?,includeSuperseded?,sort?,page?,pageSize?}` | 一页记忆 + 下拉筛选数据：`{items[],total,page,pageSize,pages,sort,includeSuperseded,facets{kinds[],scopes[],projects[],total}}`；`query` 是子串搜索（LIKE，2 字中文也能命中）；默认隐藏 `superseded_by` 非空的行，`includeSuperseded:true` 才带出来；`sort ∈ updated\|created\|priority\|id`，`pageSize` 上限 100 |
+| `POST /memory/api/browse` | `{layer?,query?,kind?,scope?,project?,sort?,page?,pageSize?}` | 四层统一查询（面板当前不调用，保留给四层浏览）：`{items[{layer,id,title,text,kind,project,scope,source,tags,pinned,useCount,createdAt,updatedAt}],total,counts{fact,turn,scene,persona},facets{kinds[],scopes[],projects[]},page,pageSize,pages,layer,query,kind,scope,project,sort}`；`layer ∈ all\|fact\|turn\|scene\|persona`；只有事实层有真正的 `kind` 列，原文/场景/画像用自身判别值回答，L0 轮次按 `project` 是否有值推导 `scope`；`sort ∈ updated\|created`；`facets` 只受 `query` 影响（选中项不会从下拉里消失） |
 | `POST /memory/api/memory` | `{id}` | `{item,history[]}`：单行 + 最近 10 条旧正文（`version/op/text/createdAt`） |
 | `POST /memory/api/memoryCreate` | `{text,title?,kind?,scope?,project?,tags?,pinned?,priority?}` | `{item,inserted}`；`text` 必填（≤ 20000 字）；**同文本幂等**：已存在时更新属性并回 `inserted:false`（`hash` 唯一索引决定一行只存一份正文）；`scope:'project'` 必须带 `project` |
 | `POST /memory/api/memoryUpdate` | `{id,text?,title?,kind?,scope?,project?,tags?,pinned?,priority?}` | `{item,version}`；只改传入的字段；**改正文**才 `version+1` 并写 `memory_history`，改标签/置顶/优先级只更新 `updated_at`；改正文会重算 `hash`/向量/特征索引；撞上另一行正文回 409 `conflict` |
@@ -305,6 +306,46 @@ resolveConfig 内置默认值（53 个字段各一份）
 - **弹窗用 portal 挂到 `<body>`**：设置面板可能处于滚动/变换容器里，`react-dom` 可用时用 `createPortal`，不可用时退化为 `position:fixed`。
 
 > 改完一条，页面顶部的统计卡会重新拉 `state`，计数立刻更新；弹窗自己的列表也会按当前筛选/页码重读。
+
+### 侧边栏记忆面板
+
+侧边栏的「记忆」图标打开一个主面板（`sidebar.panellist` + `main`，key `memory`），三个页签：**统计 / 记忆 / 同步**。其中「记忆」页签**直接复用「设置 → 记忆 → 记忆数据 → 管理数据」那个窗口**：同一个 `MemoryDataBrowser` 组件，面板里以 `inline` 形态内嵌（去掉遮罩与视口 portal，其余一模一样），设置里的弹窗入口与行为原样保留。
+
+| 能力 | 怎么做 | 背后 |
+| --- | --- | --- |
+| 统计 | 打开面板先看图：四层记忆（L0/L1/L2/L3 各一根横条）、向量覆盖环（活跃行分子，永不越过 100%）、记忆构成（按类型取前八 + 其他）、存储占用（向量 vs 其余）、明细（项目/已取代/待提炼/词元）；两列栅格，760px 以下塌成单列；刷新按钮重读 | `state` |
+| 查 | 搜索框（标题/正文/标签子串，2 字中文也命中）+ 类型/范围/项目下拉 + 「含已取代」开关 + 翻页（每页 20） | `memories` |
+| 增 | 「新增记忆」→ 填正文（必填）、标题、类型、范围、项目、标签、优先级、常驻 | `memoryCreate` |
+| 改 | 行上「编辑」→ 同一表单，带最近 10 条旧正文（历史版本） | `memory` + `memoryUpdate` |
+| 删 | 行上「删除」→ 二次确认 | `memoryDelete` |
+| 同步 | 「同步」页签：状态、上次推送/拉取、待推送、对端设备、向量上云状态，手动同步与测试连接 | `syncStatus` / `syncNow` / `syncTest` |
+
+面板头的「刷新」会重挂载内嵌窗口、回到第一页；两处共用一份实现，功能不会各走各的。主机端的 `browse`（四层统一查询）仍在，面板暂不调用。
+
+### 云同步的首次启用与快照
+
+> 一句话：**第一次同步不是「推增量」，而是「谁有数据谁先发一份全量快照」**——否则两台机器各守各的记忆，永远合不到一处。
+
+- **远端无快照时自愈**：`sync` 打开后第一次跑，若桶里还没有任何 `*.manifest.json`，本机就把四层（事实 `memory`、历史 `memory_history`、原文 `l0_turns`、场景 `l2_scenes`、画像 `l3_persona`）连同墓碑打成一份快照推上去，并把 `sync_meta.bootstrapped` 置 1；空库不发空快照。每台设备只做一次。
+- **对端首拉即对齐**：另一台设备首启时拉最新快照，逐分片校验 sha256 后整批应用，条数与 manifest 里的 `counts` 逐层对账，不符就记日志而不是静默通过。
+- **合流**：带着自有数据去拉别人快照的设备，应用完会立刻回发一份自己的快照；此后每次拉取还会顺带合并「别人新发布的快照」，所以两机各自在空桶首启也能互相拿到对方的事实。
+- **lamport 单调**：快照内所有 op 取发布时的 `lamport`，发布成功后本地计数器抬到其上加一；收到别人的段或快照时按 Lamport 规则 `max(本地, 收到)+1`。这条保证「快照之后的真改动」不会被判成旧值丢掉。
+- **墓碑**：`sync_tombstone` 记下删除的跨设备键，快照携带它们，删除因此能追上「oplog 早已清理」的老设备；`sync.tombstoneDays`（默认 90）过期清理，但只要有对端沉默超过这个窗口就暂不清 —— 它回来时还得靠这些墓碑。
+- **自查**：`syncVerify` 会把最新快照整份下下来逐分片校验、逐键比对，回答「云端有没有我缺的记忆」——`remoteMissing > 0` 才算真落后，`localOnly` 只是本机更新还没发布，`remoteStale` 是桶里那份过时了。
+- **回收**：本机每发一份快照，只留最近三份（`sync.snapshotKeep`），更旧的连分片一起删；别台设备的快照不碰。
+- **端到端加密**：默认开启，AES-256-GCM；密钥是 32 字节 Base64，写在设置层 `sync.encryptKey` 里（设置页直接可见、可复制到其它设备），首次启用自动生成，密钥不会进桶。没有钥匙的设备遇到密文快照会**硬拒**，绝不回退去吃旧明文。老明文对象照旧可读，混桶无碍。
+- **向量（`sync.vectors`，默认 `off`）**：外部模型算的 embedding 才是「重算要花钱」的那一层——4096 维 float32 一条 16 KB。设成 `f32` / `f16` / `i8` 后向量随真相一起上云：快照携带 `embParts`，增量走 `v1/<ws>/emb/<device>/` 独立段，恢复端零重算、零 API 调用。本库实测 5905 条 f32：真相 2.4 MB + 向量 67.7 MB = 70.1 MB。词法向量（`memory.vec`，384 维本地算）、特征索引与 FTS 仍不上云——前两者秒级重算，FTS 绑 rowid、跨库搬不了，只能由文本重建。
+
+- **宿主改动怎么生效**：本插件以 `link:` 装进 profile（`dsh-memory` → 工作区），宿主又加载了 HMR，所以「改代码 → 重启」并非唯一路：把 `include:memory` 停用再启用一次，就是重新加载本插件——实测 schema 3→4 当场迁移、75 MB 首推在新进程外完成，DSH 本身没重启。
+- **换纪元**：`rotate` 把 `epoch` 加一并**立刻发一份新纪元快照**；读取侧按纪元过滤，比本机旧的段与快照一律不应用（旧对象留在桶里，不替别台设备做主删除）。
+- **可见性**：分片先写、manifest 最后写，manifest 缺席的快照对所有人不可见；任一分片校验和不过则整份拒收，一条都不落地。
+- **旧格式**：早先的单对象快照（`snapshot/<stamp>.jsonl.br`，lamport 按行号编）一律忽略，`bootstrap` 只认 manifest。
+
+### 云同步自检
+
+改过配置、换过桶、或只是想确认「云端那份还作数」时，值得跑一遍：连接测试 → 拿源库一致性快照发布到隔离工作区 → 另起空库引导 → 逐层对账（**比活动条数**，死行按设计不随快照走）→ 双向增量一趟 → 逐键自查，最后清场。全通退出码 0，且全程不碰生产命名空间。
+
+这套自检以仓库内脚本形态存在，npm 包不带（它要读写你本机的 `settings.json` 与真实存储，属于维护者工具，不适合随包分发）。
 
 ## 向量模型（可选）
 

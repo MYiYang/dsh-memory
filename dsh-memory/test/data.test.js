@@ -236,12 +236,20 @@ test('listMemories 默认隐藏被取代的行，includeSuperseded 才展示', (
     const visible = listMemories(h.db, {})
     assert.deepEqual(visible.items.map((item) => item.id), [fresh.item.id])
     assert.equal(visible.total, 1)
+    // A dropdown option must never promise one more row than the list shows:
+    // facets follow the same default visibility as the rows.
+    assert.equal(visible.facets.total, 1, 'facets follow the default visibility')
+    assert.equal(
+      visible.facets.kinds.find((entry) => entry.kind === 'work_fact' || entry.kind === 'fact').count,
+      1,
+      'the superseded row is not counted in the kind facet',
+    )
 
     const everything = listMemories(h.db, { includeSuperseded: true })
     assert.equal(everything.total, 2)
     const superseded = everything.items.find((item) => item.id === old.item.id)
     assert.equal(superseded.supersededBy, fresh.item.id)
-    assert.equal(everything.facets.total, 2, 'facets always describe the whole table')
+    assert.equal(everything.facets.total, 2, 'includeSuperseded counts them again')
   } finally {
     h.cleanup()
   }

@@ -205,7 +205,7 @@ test('apply 注册 /memory/api 前缀路由，state 返回设置页需要的全�
 
     assert.deepEqual(
       state.groups.map((group) => group.id),
-      ['recall', 'capture', 'extraction', 'scenes', 'persona', 'vector', 'storage', 'advanced'],
+      ['recall', 'capture', 'extraction', 'scenes', 'persona', 'vector', 'storage', 'sync', 'advanced'],
     )
     const fields = flattenFields(state)
     const maxItems = fields.find((field) => field.key === 'recall.maxItems')

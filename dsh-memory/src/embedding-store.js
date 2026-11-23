@@ -300,3 +300,31 @@ export function embeddingCounts(db, model) {
   )
   return { total, embedded, pending: missing + stale, stale }
 }
+
+/**
+ * Live rows that carry a vector, i.e. the numerator the sidebar panel shows.
+ *
+ * `embedded` above counts every row in `memory_embeddings` for the tag. A
+ * superseded memory keeps its vector (only *other models* are pruned, see
+ * `deleteOtherModels`), yet every semantic query filters `superseded_by IS NULL`
+ * — so those vectors are never read again while still inflating the count. On
+ * this corpus that is enough to print "已嵌入 5,745 / 5,631", a ratio no reader
+ * can believe.
+ *
+ * No extra COUNT is needed: live rows with no vector are `missing = pending -
+ * stale`, so live rows with one are `total - missing`. Settings keeps reporting
+ * the raw `embedded`; only the panel asks for this number.
+ *
+ * @param {{ total?: number, embedded?: number, pending?: number, stale?: number }|null} counts
+ * @returns {number}
+ */
+export function activeEmbeddedCount(counts) {
+  if (counts === null || typeof counts !== 'object') return 0
+  const asCount = (value) => {
+    const number = Number(value ?? 0)
+    return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0
+  }
+  const total = asCount(counts.total)
+  const missing = Math.max(0, asCount(counts.pending) - asCount(counts.stale))
+  return Math.max(0, total - missing)
+}

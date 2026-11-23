@@ -31,6 +31,7 @@ import { createStartupSweeper } from './src/sweep.js'
 import { createLlmClient, safeService } from './src/llm.js'
 import { createEmbeddingClient } from './src/embedding.js'
 import { createEmbeddingWorker } from './src/embed-worker.js'
+import { activeEmbeddedCount } from './src/embedding-store.js'
 import { readGateStats, readPatchStats, runPersona } from './src/consolidate.js'
 import { registerBundledSkills } from './src/skills.js'
 import {
@@ -49,8 +50,10 @@ import {
   validateUnset,
 } from './src/settings.js'
 import { clearSettingsFile, describeStorage, messageOf, readSettingsFile, revealDirectory, writeSettingsFile } from './src/settings-store.js'
+import { generateKey } from './src/sync/crypto.js'
 import { createApiRoute, MemoryApiError } from './src/api.js'
-import { createMemory, deleteMemories, getMemory, listMemories, updateMemory } from './src/data.js'
+import { createSyncEngine } from './src/sync/engine.js'
+import { browseMemories, createMemory, deleteMemories, getMemory, listMemories, updateMemory } from './src/data.js'
 
 export const name = 'memory'
 export const inject = ['tools', 'agents', 'sessions']
@@ -207,6 +210,30 @@ export function apply(ctx, rawConfig) {
   /** Read/write problem of the settings file, surfaced in the settings page. */
   let settingsError = initialSettings.error
 
+  // End-to-end encryption is on by default: mint a key on first run and keep it in
+  // the settings layer, so the panel shows it and the operator can copy it to the
+  // other devices. A key the user already set is never replaced.
+  /** @type {{ level: string, message: string } | null} */
+  let bootNotice = null
+  try {
+    const resolvedBeforeKey = resolveConfig(mergeRaw(loaderRaw, storedSettings))
+    const storedSync = storedSettings !== null && typeof storedSettings === 'object' ? (storedSettings.sync ?? {}) : {}
+    // Only a machine that actually syncs needs a key: minting one for every
+    // install would touch settings.json for people who never turned sync on.
+    if (
+      resolvedBeforeKey.sync.enabled === true &&
+      resolvedBeforeKey.sync.encrypt !== false &&
+      String(storedSync.encryptKey ?? '').trim() === ''
+    ) {
+      const withKey = deepMerge(storedSettings, { sync: { encrypt: true, encryptKey: generateKey() } })
+      writeSettingsFile(settingsPath, withKey)
+      storedSettings = withKey
+      bootNotice = { level: 'info', message: 'sync: 已生成端到端加密密钥，可在设置页 sync.encryptKey 查看并复制到其它设备' }
+    }
+  } catch (error) {
+    bootNotice = { level: 'warn', message: `sync: 生成加密密钥失败（${messageOf(error)}），本次将以明文同步` }
+  }
+
   const config = resolveConfig(mergeRaw(loaderRaw, storedSettings))
   const log = (level, message) => {
     try {
@@ -218,6 +245,7 @@ export function apply(ctx, rawConfig) {
     }
   }
   if (settingsError !== null) log('warn', `settings file ignored (${settingsPath}): ${settingsError}`)
+  if (bootNotice !== null) log(bootNotice.level, bootNotice.message)
 
   /** Database handle; opened eagerly but failures only disable the plugin. */
   let db
@@ -234,6 +262,34 @@ export function apply(ctx, rawConfig) {
     dbReady = true
   } catch (error) {
     log('error', `cannot open memory db (${config.dbPath}): ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  // ── Cloud sync: opt-in, off by default ──────────────────────────────────
+  // The engine is constructed eagerly but does nothing until sync.enabled is
+  // true. Every failure path here only disables sync; the plugin keeps working.
+  /** @type {ReturnType<typeof createSyncEngine>|null} */
+  let syncEngine = null
+  if (dbReady) {
+    try {
+      syncEngine = createSyncEngine({ db: getDb(), config, log })
+      ctx.effect(() => {
+        try {
+          syncEngine?.start()
+        } catch (error) {
+          log('warn', `cloud sync not started: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        return () => {
+          try {
+            syncEngine?.stop()
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 'dsh-memory: cloud sync')
+    } catch (error) {
+      syncEngine = null
+      log('warn', `cloud sync unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   // ── Bundled skills: expose ./skills through the host skill registry ───────
@@ -473,7 +529,11 @@ export function apply(ctx, rawConfig) {
       available: client?.available === true,
       keyRef: described?.keyRef ?? null,
       embedded: worker?.counts?.embedded ?? 0,
+      // Panel only: `embedded` counts retired vectors too (a superseded memory
+      // keeps its row), so it can exceed `total`. See activeEmbeddedCount.
+      embeddedActive: activeEmbeddedCount(worker?.counts ?? null),
       pending: worker?.counts?.pending ?? 0,
+      stale: worker?.counts?.stale ?? 0,
       total: worker?.counts?.total ?? 0,
       lastError: worker?.lastError ?? (client?.available === false ? client?.error : null),
     }
@@ -1076,6 +1136,7 @@ export function apply(ctx, rawConfig) {
           scheduled: pipeline !== null,
         },
         skills: { enabled: config.skills.enabled, dir: config.skills.dir },
+        sync: syncEngine === null ? { available: false } : syncEngine.status(),
         vector: embeddingState(),
       },
       groups: buildGroups(effective, config, loaderRaw, storedSettings),
@@ -1127,6 +1188,11 @@ export function apply(ctx, rawConfig) {
     pipeline?.refresh()
     scheduler?.configure({ everyN: config.extraction.everyN, idleMs: config.extraction.idleMs })
     buildEmbeddingRuntime()
+    try {
+      syncEngine?.reconfigure(config.sync)
+    } catch (error) {
+      log('warn', `cloud sync reconfigure failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
     return { state: createState(), applied, unset: unset.keys, restartRequired }
   }
 
@@ -1218,6 +1284,8 @@ export function apply(ctx, rawConfig) {
       },
       // Settings → Memory → 记忆数据: the row-level CRUD surface.
       memories: (payload) => listMemories(requireDb(), payload),
+      // Sidebar panel: every layer (facts, raw turns, scenes, personas) in one list.
+      browse: (payload) => browseMemories(requireDb(), payload),
       memory: (payload) => getMemory(requireDb(), payload?.id),
       memoryCreate: (payload) => {
         const created = createMemory(requireDb(), payload)
@@ -1230,6 +1298,33 @@ export function apply(ctx, rawConfig) {
         return updated
       },
       memoryDelete: (payload) => deleteMemories(requireDb(), payload),
+      // Cloud sync: the sidebar panel and the settings page both read `syncStatus`.
+      syncStatus: () => {
+        if (syncEngine === null) throw new MemoryApiError('not-ready', 'cloud sync is unavailable')
+        return syncEngine.status()
+      },
+      syncNow: async (payload) => {
+        if (syncEngine === null) throw new MemoryApiError('not-ready', 'cloud sync is unavailable')
+        const direction = payload?.direction === 'push' || payload?.direction === 'pull' ? payload.direction : 'both'
+        const result = direction === 'push' ? await syncEngine.pushNow() : direction === 'pull' ? await syncEngine.pullNow() : await syncEngine.syncNow()
+        if (result?.skipped === 'disabled') throw new MemoryApiError('bad-request', 'cloud sync is disabled')
+        return { direction, ...result, status: syncEngine.status() }
+      },
+      syncTest: async () => {
+        if (syncEngine === null) throw new MemoryApiError('not-ready', 'cloud sync is unavailable')
+        return syncEngine.testConnection()
+      },
+      // Key-by-key comparison against the newest snapshot: answers "does the
+      // cloud hold anything I am missing", which no counter alone can prove.
+      syncVerify: async () => {
+        if (syncEngine === null) throw new MemoryApiError('not-ready', 'cloud sync is unavailable')
+        return syncEngine.verify()
+      },
+      syncRotate: (payload) => {
+        if (syncEngine === null) throw new MemoryApiError('not-ready', 'cloud sync is unavailable')
+        if (payload?.confirm !== 'rotate') throw new MemoryApiError('bad-request', 'rotate needs confirm:"rotate"')
+        return syncEngine.rotate()
+      },
     },
     admits: (req) => {
       try {
